@@ -1,0 +1,63 @@
+README
+======
+
+This is librxe version 0.9, a library to enumerate sets described by
+regular expressions. It comes with a demo program called 'rxenum'.
+
+INSTALLATION INSTRUCTIONS
+=========================
+
+1. Dependencies:
+
+   You need the GNU MP multiprecision arithmetic library.
+   Under Debian/Ubuntu, you can easily have it by doing (as root):
+
+       apt-get install libgmp3-dev
+       
+   You you also need gcc, ar and make. You can have them by doing (as root):
+   
+       apt-get install build-essential make
+
+2. In the top-level directory, type:
+
+       make
+
+3. If you get no errors, test with:
+
+       ./rxenum '[A-Z]{8}'
+
+   The program should respond with:
+   
+        208.827.064.576
+        ~ 10^11.3198
+        ~  2^37.6035
+        
+   Which means there are about 208 billion strings composed of eight
+   characters from A to Z.
+
+4. Install the program and its manual page, running (as root):
+
+        make install
+
+5. Read the fine manual:
+
+        man rxenum
+
+LICENSE
+=======
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+http://www.gnu.org/licenses/gpl-2.0.html for details.
+
+AUTHOR
+======
+
+Marco "Kiko" Carnut <kiko at postcogito dot org>
+

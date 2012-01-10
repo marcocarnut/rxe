@@ -1,0 +1,216 @@
+.TH RXENUM 1 "Jan 2011" Linux "User Manuals"
+.SH NAME
+rxenum \- Enumerate or count the size of sets specified by regular expressions
+.SH SYNOPSIS
+.B rxenum
+[\fIoptions\fR]
+[\fIregex\fR]
+
+.SH DESCRIPTION
+.B rxenum
+looks at the (mostly Perl-compatible) regular expression specified in
+.B regex
+as the specification of a set of elements. By default, it counts the
+number of elements in this set and displays it to the user as an exact
+decimal number with as many digits as needed (it is easy to generate
+very large numbers).
+
+For example, let's compute how many eight alphanumeric character passwords
+there are:
+
+.RS
+rxenum '[0-9A-Za-z]{8}'
+.br
+218.340.105.584.896
+.br
+~ 10^14.3391
+.br
+~  2^47.6336
+.RE
+
+As regular expressions often contain characters with special meaning for the
+shell, it is recommended to enclose them in single quotes.
+
+If invoked with \fB-n\fR, \fBrxenum\fR will explicitly generate and print every
+single element in the set, numbering them along the way. If you add \fB-z\fR,
+the numbering starts from zero instead of one.
+
+For example, let's enumerate roman numerals:
+
+.RS
+rxenum -zn 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)'\\
+.br
+           '(X{0,3}|XL|LX{0,3}|XC)(I{0,3}|IV|VI{0,3}|IX)'
+.br
+    0
+.br
+    1 I
+.br
+    2 II
+.br
+    3 III
+.br
+    4 IV
+.br
+    ( ... thousands of lines omitted for brevity ... )
+.br
+3.998 MMMCMXCVIII
+.br
+3.999 MMMCMXCIX
+.RE
+
+As the example above shows, enumerations establish a mapping from the integers
+to the elements of the set. We can use this to jump directly to some nth
+element without having to enumerate all the previous ones. The example below
+shows how this can be used to convert a number from decimal to hexadecimal:
+
+.RS
+rxenum -z -f 3735928559 '([0-9A-F]{4} ){2}'
+.br
+DEAD BEEF
+.RE
+
+We can also have the element chosen at random. For instance, let's choose
+a sort-of-pronounceable random password using the koremutake method:
+
+.RS
+rxenum -r '(([bdfghjklmnprstv]|[bdfgp]r|st)[aeiouy]|tra|tre){4}'
+.br
+supustytra
+.RE
+
+.SH OPTIONS
+If no switches are specified,
+.B rxenum
+will count the number of elements in the set specified by
+.B regex
+and display the count in three forms: as an arbitrary precision
+exact integer, as an truncated approximate power of ten and a truncated
+approximated power of two. When the approximations turn out to be exact,
+the powers are preceded by an equal sign; otherwise, they will be preceded
+by a tilde.
+.TP
+.B
+\-i
+Case insensitive. "a" stands for "[Aa]", "b" for "[Bb]" and so on.
+Corresponds to the /i flag in Perl regexes.
+.TP
+.B
+\-s
+Makes the dot quantifier really match all characters instead of "all but
+newline". Corresponds to the /s "single line" flag in Perl regexes.
+.TP
+.B
+\-e
+Enumerate the set, generating and printing the element instead of just
+counting them.
+.TP
+.B
+\-n
+Number the elements of the set. Implies \fB-e\fR.
+.TP
+.B
+\-z
+("zero-offset") Start numbering from zero instead of 1.
+.TP
+.B
+\-c number
+("count") Stop the enumeration after
+.B
+number
+\, items have been displayed.
+.B
+number
+may be an arbitrarily large integer.  Implies \fB-e\fR.
+.TP
+.B
+\-f number
+("from") Start the enumeration from the element specified in
+.B
+number
+\, which may be an arbitrarily large integer limited only by the set size.
+If
+.B
+number
+is larger than the number of elements in the set, a "seek past end" error
+will be displayed. The first element is zero if
+.B
+\-z
+is also specified or 1 otherwise. If
+.B
+-f
+is not specified, it will default to the first element.  Implies \fB-e\fR.
+.TP
+.B
+\-t number
+("to") Specifies the final element of the enumeration. More precisely,
+computes the element count (see option 
+.B
+-c
+\) as number minus the starting point (see option
+-f
+\) plus one.  Implies \fB-e\fR.
+.TP
+.B
+\-r
+Randomly choose an element of the set. You can get several random choices
+by setting
+.B
+-c
+as well.
+
+.SH OTHER EXAMPLES
+.TP
+((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2))
+Generates all 4,294,967,296 possible IPv4 addresses. Notice the usage of the
+(?2) construct to reuse the second parenthesized subexpression as a kind of
+"subroutine".
+.TP
+(([01]\d\d|2[0-4]\d|25[0-5]|\d{1,2})\.){3}(?2)
+Alternative formulation that also handles zero-padded numbers. Because of
+that, there are 17,944,209,936 items in this set instead of 4,294,967,296.
+
+.SH CAVEATS
+All regular expressions are assumed to be anchored, as if they were
+preceded by ^ and terminated by $. In fact, a ^ in the beginning is ignored,
+as is a dollar sign at the end. Anywhere else, they are treated as literals.
+
+Absolute backreferences are supported, but relative ones are not.
+
+To emulate Perl behavior, two sucessive quantifiers (say, "a?{2}") gives
+an error. And again just like Perl, you can easily work around it by using
+subexpressions, say, "(a?){2}".
+
+.SH LIMITATIONS
+Works only in 8-bit characters and ASCII. No Unicode support.
+
+Does not handle infinite sets, even when they are enumerable. This also
+means that the universal quantifiers (the star and plus metacharacters)
+will cause the program to croak 'infinite'. Same for open-ended repetitions
+such as "a{1,}".
+
+Neither detects nor skips duplicates:
+
+.RS
+rxenum -n '(a?){2}'
+.br
+1
+.br
+2 a
+.br
+3 a
+.br
+4 aa
+.RE
+
+POSIX character classes are currently unimplemented, as are many backslash
+special characters. Named backreferences are also currently unimplemented.
+
+.SH AUTHOR
+Marco "Kiko" Carnut <kiko at tempest dot com dot br>
+
+.SH LICENSE
+This is free software, distributed under the GPLv2.
+.I http://www.gnu.org/licenses/gpl-2.0.html
+
+

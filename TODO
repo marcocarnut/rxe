@@ -1,0 +1,22 @@
+SHORT TERM TO-DOs
+=================
+
+- Make an unit test
+- Write API documentation
+- Implement missing things: POSIX character classes, \o, \g with negative
+  and named backreferences, \k, etc.
+- Add flag to change associativity direction
+- Code refactoring
+  > split handle_repeats in two functions: the first parses/validates
+    the paramaters, the second does the actual work
+  > simplify the ? quantifier using the above function as a special case {0,1}
+- Performance
+  > add binary tree to speed up regexes with large number of alternations
+  > Clean up error handling code
+  > More descriptive error messages pointing to the probable location
+
+LONG-TERM TO-DOs
+================
+
+> JIT compiler
+
