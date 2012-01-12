@@ -3,6 +3,16 @@
  *  rxenum - Count size and enumerate sets specified as regular expressions
  *           Version 0.9 by kiko at postcogito dot org on 2011-12-23
  *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * http://www.gnu.org/licenses/gpl-2.0.html for details.
+ *
  * []-----------------------------------------------------------------------[]
  */
 
@@ -23,9 +33,9 @@
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix);
+void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep);
 void die(int code, char *msg, ...);
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt);
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep);
 int mpz_len(mpz_t x);
 
 /* ------------------------------ Main Program ---------------------------- */
@@ -42,12 +52,13 @@ int main(int argc, char **argv)
     int have_from = 0;
     int have_to = 0;
     int have_random = 0;
+    char sep = ',';
     mpz_t from,to,count;
     mpz_init(from);
     mpz_init(to);
     mpz_init(count);
     for (;;) {
-        int o = getopt(argc,argv,"isenzf:t:c:r");
+        int o = getopt(argc,argv,"isenzf:t:c:r.,_~");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -73,6 +84,12 @@ int main(int argc, char **argv)
                       do_enumerate = 1;
                       break;
             case 'r': have_random = 1;
+                      break;
+            case ',':
+            case '_':
+            case '.': sep = o;
+                      break;
+            case '~': sep = 0;
                       break;
              default: die(1,"Unknown option '%c'\n",o);
                       exit(1);
@@ -105,7 +122,7 @@ int main(int argc, char **argv)
         mpz_init(zero);
         for (;;) {
             mpz_urandomm(from,state,rxe->nitems);
-            enumerate(rxe,options|ENUM_ONCE,offset,from,zero);
+            enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep);
             mpz_sub_ui(count,count,1);
             if (!mpz_sgn(count)) return 0;
         }
@@ -122,9 +139,9 @@ int main(int argc, char **argv)
     }
     
     if (do_enumerate) {
-        enumerate(rxe,options,offset,from,count);
+        enumerate(rxe,options,offset,from,count,sep);
     } else {
-        print_grouped(stdout,NULL,rxe->nitems,"\n");
+        print_grouped(stdout,NULL,rxe->nitems,"\n",sep);
         double log_d = log(mpz_get_d(rxe->nitems));
         int n, base[] = { 10, 2 };
         int nbases = sizeof(base)/sizeof(base[0]);
@@ -143,7 +160,7 @@ int main(int argc, char **argv)
     return 0;
 }
 
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt)
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep)
 {
     mpz_t final;
     mpz_init(final);
@@ -177,7 +194,7 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt)
          rxe_current(str,MAXSTRLEN,rxe);
          if (flags & ENUM_NUMBER) {
             printf("%*s",nd,"");
-            print_grouped(stdout,NULL,count," ");
+            print_grouped(stdout,NULL,count," ",sep);
             mpz_add_ui(count,count,1);
             if (!mpz_cmp(count,step1)) {
                 nd--; mpz_mul_ui(step1,step1,10);
@@ -196,7 +213,7 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt)
     }
 }
 
-void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix)
+void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep)
 {
     int size = mpz_size(x)*21;
     char str[size+1];
@@ -208,7 +225,7 @@ void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix)
         int   f = 0;
         for (;*p;p++) {
             if (++i==3) {
-                i=0; if (f) putc('.',fp);
+                i=0; if (f && sep) putc(sep,fp);
             }
             if (*p > '0') f=1;
             if (f) putc(*p,fp);

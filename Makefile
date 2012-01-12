@@ -23,5 +23,5 @@ clean:
 
 install: rxenum
 	install -m 755 rxenum /usr/bin
-	install -m 755 rxenum.1 /usr/share/man/man1
+	install -m 644 rxenum.1 /usr/share/man/man1
 

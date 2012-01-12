@@ -1,4 +1,4 @@
-.TH RXENUM 1 "Jan 2011" Linux "User Manuals"
+.TH RXENUM 1 "Jan 2012" Linux "User Manuals"
 .SH NAME
 rxenum \- Enumerate or count the size of sets specified by regular expressions
 .SH SYNOPSIS
@@ -21,7 +21,7 @@ there are:
 .RS
 rxenum '[0-9A-Za-z]{8}'
 .br
-218.340.105.584.896
+218,340,105,584,896
 .br
 ~ 10^14.3391
 .br
@@ -54,9 +54,9 @@ rxenum -zn 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)'\\
 .br
     ( ... thousands of lines omitted for brevity ... )
 .br
-3.998 MMMCMXCVIII
+3,998 MMMCMXCVIII
 .br
-3.999 MMMCMXCIX
+3,999 MMMCMXCIX
 .RE
 
 As the example above shows, enumerations establish a mapping from the integers
@@ -158,6 +158,22 @@ by setting
 .B
 -c
 as well.
+.TP
+.B
+\-,
+Uses the 'comma' character as the thousands separator.
+.TP
+.B
+\-.
+Uses the 'dot' character as the thousands separator.
+.TP
+.B
+\-_
+Uses the 'underscore' character as the thousands separator.
+.TP
+.B
+\-~
+Use no thousands separator at all.
 
 .SH OTHER EXAMPLES
 .TP

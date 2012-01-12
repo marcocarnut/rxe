@@ -1,7 +1,7 @@
 README
 ======
 
-This is librxe version 0.9, a library to enumerate sets described by
+This is librxe version 0.9.1, a library to enumerate sets described by
 regular expressions. It comes with a demo program called 'rxenum'.
 
 INSTALLATION INSTRUCTIONS
@@ -28,7 +28,7 @@ INSTALLATION INSTRUCTIONS
 
    The program should respond with:
    
-        208.827.064.576
+        208,827,064,576
         ~ 10^11.3198
         ~  2^37.6035
         
