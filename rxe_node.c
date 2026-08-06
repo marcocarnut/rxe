@@ -37,8 +37,11 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
 
 void rxe_free_node_data(struct rxe_node *node)
 {
+    // A backreference node only aliases the subexpression it refers to; the
+    // node that parsed that subexpression owns it and will free it. Freeing
+    // it here too would be a double free.
     if (node->rxe) {
-        rxe_free(node->rxe);
+        if (!node->is_backref) rxe_free(node->rxe);
         node->rxe = NULL;
     }
     if (node->len) {
