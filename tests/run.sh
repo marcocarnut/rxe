@@ -1,0 +1,267 @@
+#!/bin/sh
+#
+# librxe regression suite.
+#
+# Every case here corresponds either to documented behaviour or to a bug that
+# was once real, so a failure means something regressed rather than that a
+# check is merely strict.
+#
+#   sh tests/run.sh            run against ./rxenum
+#   RXENUM=/path/to/rxenum ...  run against another build
+#
+# The suite runs under MALLOC_PERTURB_ so that freshly allocated memory is not
+# zero. rxe_new() once left rxe->status uninitialised, which every operation
+# read; on a zeroed heap that happens to be RXE_OK, so the bug was invisible
+# until malloc started recycling dirty memory. Do not remove this.
+
+: "${RXENUM:=./rxenum}"
+: "${MALLOC_PERTURB_:=42}"
+export MALLOC_PERTURB_
+
+pass=0 fail=0 xfail=0 xpass=0
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+# check <description> <expected> <actual>
+check() {
+    if [ "$2" = "$3" ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        printf 'FAIL  %s\n        expected: %s\n        got:      %s\n' "$1" "$2" "$3"
+    fi
+}
+
+# xcheck <task> <description> <expected-once-fixed> <actual>
+# A known-wrong behaviour we have not fixed yet. Does not fail the suite, but
+# shouts if it starts passing so the case can be promoted to a real check.
+xcheck() {
+    if [ "$3" = "$4" ]; then
+        xpass=$((xpass + 1))
+        printf 'XPASS %s now behaves correctly -- promote it to check() (%s)\n' "$2" "$1"
+    else
+        xfail=$((xfail + 1))
+    fi
+}
+
+# Cardinality, as printed on the first line.
+t_count() { check "count $1" "$2" "$("$RXENUM" "$1" 2>&1 | head -1)"; }
+
+# Full enumeration, newline-joined with '/' so empty members stay visible.
+t_enum() { check "enum $1" "$2" "$("$RXENUM" -e "$1" 2>&1 | tr '\n' '/')"; }
+
+# Parse error message.
+t_error() { check "error $1" "$2" "$("$RXENUM" "$1" 2>&1 | head -1)"; }
+
+# t_opts <expected> <args...> -- arbitrary invocation, output '/'-joined.
+t_opts() {
+    exp=$1
+    shift
+    check "rxenum $*" "$exp" "$("$RXENUM" "$@" 2>&1 | tr '\n' '/')"
+}
+
+# t_first <expected> <args...> -- first line only, for invocations that also
+# print the logarithm lines.
+t_first() {
+    exp=$1
+    shift
+    check "rxenum $* (first line)" "$exp" "$("$RXENUM" "$@" 2>&1 | head -1)"
+}
+
+# t_rc <expected-status> <args...>
+t_rc() {
+    exp=$1
+    shift
+    "$RXENUM" "$@" >/dev/null 2>&1
+    check "exit status of rxenum $*" "$exp" "$?"
+}
+
+# The two independent ways of reaching an element must agree: counting
+# (combinatorial), sequential iteration (rxe_iterate) and random access
+# (rxe_seek) are three separate code paths over the same mapping.
+t_selfcheck() {
+    rx=$1
+    "$RXENUM" -e "$rx" >"$tmp/seq" 2>/dev/null
+    lines=$(wc -l <"$tmp/seq" | tr -d ' ')
+    check "cardinality equals number enumerated: $rx" \
+          "$("$RXENUM" -~ "$rx" 2>&1 | head -1)" "$lines"
+    [ "$lines" -gt 0 ] || return 0
+    step=$((lines / 5 + 1))
+    i=0
+    while [ "$i" -lt "$lines" ]; do
+        check "seek -f $i agrees with iteration: $rx" \
+              "$(sed -n "$((i + 1))p" "$tmp/seq")" \
+              "$("$RXENUM" -z -f "$i" "$rx" 2>&1)"
+        i=$((i + step))
+    done
+}
+
+echo "== documented examples (README and rxenum.1) =="
+t_count '[A-Z]{8}'                                  '208,827,064,576'
+t_count '[0-9A-Za-z]{8}'                            '218,340,105,584,896'
+t_count '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)' '4,294,967,296'
+t_count '(([01]\d\d|2[0-4]\d|25[0-5]|\d{1,2})\.){3}(?2)' '17,944,209,936'
+t_opts  'DEAD BEEF /' -z -f 3735928559 '([0-9A-F]{4} ){2}'
+check "README approximations" \
+      '208,827,064,576 ~ 10^11.3198 ~  2^37.6035' \
+      "$("$RXENUM" '[A-Z]{8}' | tr '\n' ' ' | sed 's/ *$//')"
+check "roman numeral 3999" 'MMMCMXCIX' \
+      "$("$RXENUM" -z 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)(X{0,3}|XL|LX{0,3}|XC)(I{0,3}|IV|VI{0,3}|IX)' -f 3999)"
+# The man page shows this as the documented duplicate-generation example.
+t_opts '1 /2 a/3 a/4 aa/' -n '(a?){2}'
+
+echo "== #1 uninitialised rxe->status: valid input must not be reported as an error =="
+t_count 'abc'   '1'
+t_count 'a'     '1'
+t_rc 0 'abc'
+t_rc 0 '[A-Z]{8}'
+t_rc 0 '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)'
+
+echo "== #1 parse errors must report the right message, not a garbage table index =="
+t_error 'a*'       'infinite'
+t_error 'a+'       'infinite'
+t_error 'a{2}{3}'  'nested quantifiers'
+t_error '(ab'      'missing parentheses'
+t_error 'ab)'      'extraneous parentheses'
+t_error '?a'       'nothing before quantifier'
+t_error '[abc'     'unterminated character class'
+t_error '\1'       'invalid backreference'
+t_error '(a\1)'    'infinite'
+t_error 'a{3,1}'   'bad repetition parameters'
+
+echo "== #2 backreferences must enumerate rather than double-free =="
+t_enum '(a)\1'              'aa/'
+t_enum '([ab])\1'           'aa/bb/'
+t_enum '([ab])([cd])\1\2'   'acac/adad/bcbc/bdbd/'
+t_enum '(a)(b)(c)\3\2\1'    'abccba/'
+t_enum '(([ab])\2)\1'       'aaaa/bbbb/'
+t_count '([0-9]{2})-\1'     '100'
+t_rc 0 -e '(a)\1'
+t_rc 0 -e '([ab])([cd])\1\2'
+# (?N) recursion deep-clones, so it is independent of iteration.
+t_enum '([ab])(?1)\1'       'aaa/aba/bab/bbb/'
+
+echo "== #3 sets of cardinality zero =="
+t_count 'a[]b'              '0'
+t_count '[]'                '0'
+# Reachable in strictly Perl-legal syntax: a negated class covering all bytes.
+t_count '[^\x0-\xFF]'       '0'
+t_count 'a[^\x0-\xFF]b'     '0'
+t_opts  ''      -e 'a[]b'
+t_opts  ''      -n 'a[]b'
+t_opts  ''      -c 3 'a[]b'
+t_rc 0  -e 'a[]b'
+t_rc 1  -r 'a[]b'
+# An alternation that matches nothing must not contribute a member. This one
+# used to emit a string built by indexing a zero-length allocation.
+t_count 'xy|a[]b'           '1'
+t_enum  'xy|a[]b'           'xy/'
+t_enum  'a[]b|xy'           'xy/'
+t_enum  'xy|a[]b|zw'        'xy/zw/'
+t_enum  '[]|a'              'a/'
+
+echo "== #3 regression guard: a node-less alternation matches the empty string =="
+# Cardinality 1, not 0. Treating these as 'matches nothing' would silently
+# break every optional construct in the language.
+t_enum 'a?'         '/a/'
+t_enum '(a)?'       '/a/'
+t_enum '(ab)?'      '/ab/'
+t_enum 'a{0,2}'     '/a/aa/'
+t_enum '(a){0,2}'   '/a/aa/'
+t_enum 'M{0,3}'     '/M/MM/MMM/'
+t_enum 'a?b?c'      'c/bc/ac/abc/'
+t_enum 'a|'         'a//'
+t_enum '|a'         '/a/'
+t_enum 'a||b'       'a//b/'
+t_count 'a{0}'      '1'
+t_count '(a){0}'    '1'
+
+echo "== #15 '?' replaces the node rather than multiplying it =="
+# The quantified node kept its own characters as well as gaining the
+# alternation below it, so rxe_iterate stepped both and enumerated the cross
+# product. Only 'a?' (one character) and '(ab)?' (none) escaped, so the
+# cardinality and the enumeration disagreed for every class of size 2 or more.
+t_count '[ab]?'         '3'
+t_enum  '[ab]?'         '/a/b/'
+t_enum  '[abc]?'        '/a/b/c/'
+t_enum  '[ab]?x'        'x/ax/bx/'
+t_count '[ab]?[cd]?'    '9'
+t_enum  '[ab]?[cd]?'    '/c/d/a/ac/ad/b/bc/bd/'
+t_enum  '\d?'           '/0/1/2/3/4/5/6/7/8/9/'
+# Caseless doubles a single letter's characters, so it broke 'a?' too.
+t_opts  '/a/A/'         -i -e 'a?'
+t_opts  '/ab/aB/Ab/AB/' -i -e '(ab)?'
+
+echo "== #10 a backreference names the last repetition, as in Perl =="
+t_enum '([ab]){2}\1'        'aaa/abb/baa/bbb/'
+t_enum '([ab]){3}\1'        'aaaa/aabb/abaa/abbb/baaa/babb/bbaa/bbbb/'
+t_enum '(([ab])(c)){2}\2'   'acaca/acbcb/bcaca/bcbcb/'
+t_enum '((a)(b)){2}\2'      'ababa/'
+# Groups that are not themselves repeated are unaffected.
+t_enum '(x)([ab]){2}\1'     'xaax/xabx/xbax/xbbx/'
+t_count '(x)([ab]){1,2}\1'  '6'
+# Variable repetition cannot name a single repetition, so it is refused.
+t_error '([ab]){1,2}\1' 'backreference into a variably repeated group'
+t_error '([ab]){0,2}\1' 'backreference into a variably repeated group'
+t_error '(a){2,5}\1'    'backreference into a variably repeated group'
+# The reformulation the man page suggests must reproduce Perl's answer.
+t_enum '([ab])\1|([ab]){2}\2' 'aa/bb/aaa/abb/baa/bbb/'
+
+echo "== counting, iteration and seeking must agree =="
+t_selfcheck '[ab]{3}'
+t_selfcheck 'a?b?c'
+t_selfcheck '(a|bc)(d|ef)'
+t_selfcheck '[a-c]{1,3}'
+t_selfcheck 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)'
+t_selfcheck '([ab]){2}\1'
+t_selfcheck 'xy|a[]b|zw'
+t_selfcheck '(a?){2}'
+t_selfcheck '[ab]?[cd]?'
+t_selfcheck '([0-9A-F]{2} ){2}'
+
+echo "== number formatting =="
+t_count '[a-j]{3}'          '1,000'
+t_count '[a-j]{6}'          '1,000,000'
+t_count '[a-j]{3}|x'        '1,001'
+t_count '[a-j]{2}'          '100'
+t_count '[a-j]'             '10'
+t_first '208.827.064.576' -. '[A-Z]{8}'
+t_first '208_827_064_576' -_ '[A-Z]{8}'
+t_first '208827064576'    -~ '[A-Z]{8}'
+t_first '208,827,064,576' -, '[A-Z]{8}'
+# print_grouped once sized its buffer from mpz_size(), which is 0 for zero.
+t_count 'a[]b'              '0'
+check "-n column alignment holds across a digit boundary" \
+      '   999 bmk/ 1,000 bml/' \
+      "$("$RXENUM" -n '[a-z]{3}' | sed -n '999p;1000p' | tr '\n' '/')"
+
+echo "== options =="
+t_opts 'a/b/'      -e '[ab]'
+t_opts '1 a/2 b/'  -n '[ab]'
+t_opts '0 a/1 b/'  -zn '[ab]'
+t_opts 'aa/ab/ac/' -c 3 -e '[a-z]{2}'
+t_opts '5 ae/6 af/7 ag/' -n -f 5 -c 3 '[a-z]{2}'
+t_count 'ab'       '1'
+t_first '2' -~ '(?i:a)'
+t_rc 1 -c 0 '[ab]'
+t_rc 1 '[ab]' -f 0
+
+echo "== known divergences, still open =="
+# #5: a caret elsewhere in a class should be a literal member.
+xcheck '#5' '[a^b] counts the caret'   '3' "$("$RXENUM" -~ 'x[a^b]y' 2>&1 | head -1)"
+# #4: bare inline flag groups.
+xcheck '#4' '(?i)a sets caseless'      '2' "$("$RXENUM" -~ '(?i)a'   2>&1 | head -1)"
+xcheck '#4' '(?s). matches all bytes'  '256' "$("$RXENUM" -~ '(?s).' 2>&1 | head -1)"
+# #14: open-ended repetition should report 'infinite'; the RXE_INFINITE
+# assignment in handle_repeats falls through into the bad-parameter check.
+xcheck '#14' 'a{1,} reports infinite' 'infinite' "$("$RXENUM" 'a{1,}' 2>&1 | head -1)"
+# #13: ']' straight after '[' is a literal in Perl.
+xcheck '#13' '[]] is the class holding ]' '1' "$("$RXENUM" -~ '[]]' 2>&1 | head -1)"
+
+printf '\n%d passed, %d failed' "$pass" "$fail"
+[ "$xfail" -gt 0 ] && printf ', %d known-failing' "$xfail"
+[ "$xpass" -gt 0 ] && printf ', %d UNEXPECTEDLY FIXED' "$xpass"
+printf '\n'
+[ "$fail" -eq 0 ] || exit 1
+[ "$xpass" -eq 0 ] || exit 1
+exit 0
