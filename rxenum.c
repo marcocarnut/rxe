@@ -130,7 +130,15 @@ int main(int argc, char **argv)
             mpz_urandomm(from,state,rxe->nitems);
             enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep);
             mpz_sub_ui(count,count,1);
-            if (!mpz_sgn(count)) return 0;
+            if (!mpz_sgn(count)) {
+                mpz_clear(zero);
+                mpz_clear(from);
+                mpz_clear(to);
+                mpz_clear(count);
+                gmp_randclear(state);
+                rxe_free(rxe);
+                return 0;
+            }
         }
     }
     if (!have_from) mpz_set_ui(from,offset);
@@ -165,11 +173,16 @@ int main(int argc, char **argv)
                 mpz_pow_ui(num,b,l);
                 printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
                 printf("%2d^%g\n",base[n],l);
+                mpz_clear(num);
+                mpz_clear(b);
             }
         }
     }
     //rxe_backref_table_free(rxe->brt);
     rxe_free(rxe);
+    mpz_clear(from);
+    mpz_clear(to);
+    mpz_clear(count);
     return 0;
 }
 
@@ -224,6 +237,12 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
          }
          if (flags & ENUM_ONCE) break;
     }
+    // -r calls this once per sample, so leaving these behind accumulated.
+    mpz_clear(final);
+    mpz_clear(count);
+    mpz_clear(step1);
+    mpz_clear(step2);
+    mpz_clear(q);
 }
 
 void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep)
@@ -264,9 +283,11 @@ int mpz_len(mpz_t x)
     int len = 0;
     for (;;) {
         len++;
-        if (mpz_cmp(r,x)>0) return len;
+        if (mpz_cmp(r,x)>0) break;
         mpz_mul_ui(r,r,10);
     }
+    mpz_clear(r);
+    return len;
 }
 
 /* ---------------------------- Support Routines -------------------------- */

@@ -162,6 +162,18 @@ char *rxe_error_message(struct rxe *rxe)
 // On success, returns a pointer to the character after the successfully
 // parsed (sub)expression. On error, the return value is undefined.
 
+// parse() leaves through eighteen separate points, most of them error paths.
+// Route every one of them through here so that none can forget to release the
+// accumulators.
+
+static char *parse_done(mpz_t x, mpz_t n, mpz_t p, char *str)
+{
+    mpz_clear(x);
+    mpz_clear(n);
+    mpz_clear(p);
+    return str;
+}
+
 char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
 {
     mpz_t x,n,p;
@@ -180,13 +192,13 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
             // End of subexpression
             case ')': if (!depth) {
                           rxe->status = RXE_TOO_MANY_PARENS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // fall-thru
             // End of string
             case  0 : if (depth && !c) { 
                           rxe->status = RXE_TOO_LITTLE_PARENS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // fall-thru
             // Alternation: does not really finish; flushes partial
@@ -198,11 +210,13 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       // empty string (product one, no nodes).
                       mpz_set(alt->nitems,x);
                       mpz_add(ret,ret,x);
-                      if (c != '|') return str;
-                      // Below runs for alternation only
-                      mpz_init_set_ui(x,1);
-                      mpz_init_set_ui(n,1);
-                      mpz_init_set_ui(p,1);
+                      if (c != '|') return parse_done(x,n,p,str);
+                      // Below runs for alternation only. These are already
+                      // live, so re-initialising them would orphan the limbs
+                      // they hold; just assign.
+                      mpz_set_ui(x,1);
+                      mpz_set_ui(n,1);
+                      mpz_set_ui(p,1);
                       alt = rxe_new_alt(rxe);
                       mpz_set(alt->start,ret);
                       break;
@@ -211,7 +225,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       str2 = handle_flags(str,&newflags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_FLAGS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
                       if (*str==')') {
@@ -221,7 +235,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       }
                       if (*str>='0' && *str<='9' && str[-1]=='?') {
                           str2 = handle_recursion(str,n,alt,rxe);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                           break;
                       }
@@ -238,22 +252,22 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       sub_rxe->flags |= RXE_FLAG_CLOSED_BRACKET;
                       if (sub_rxe->status) {
                           rxe->status = sub_rxe->status;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       break;
             // ---------------- Universal quantifiers --------------
             case '*': rxe->status = RXE_INFINITE;
-                      return str;
+                      return parse_done(x,n,p,str);
             case '+': rxe->status = RXE_INFINITE;
-                      return str;
+                      return parse_done(x,n,p,str);
             // ------------------- Quantifiers ---------------------
             case '?': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       if (!alt->tail) {
                           rxe->status = RXE_LONE_QUANTIFIER;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // FIXME: Split handle_repetitions into two functions,
                       // the first which only parses/validades the parameters
@@ -285,28 +299,28 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       break;
             case '{': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       if (!alt->tail) {
                           rxe->status = RXE_LONE_QUANTIFIER;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str2 = handle_repeats(alt,n,p,str);
                       if (!str2) {
                           rxe->status = mpz_get_ui(n);
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
                       mpz_mul(x,x,n);
-                      mpz_init_set_ui(n,1);
-                      mpz_init_set_ui(p,1);
+                      mpz_set_ui(n,1);   // already live; assign, do not re-init
+                      mpz_set_ui(p,1);
                       quantifier = 1;
                       break;
             // ----------------- Character Classes -----------------
             case '[': str2 = handle_character_class(rxe,alt,n,str,flags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_CLASS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
                       quantifier = 0;
@@ -321,13 +335,13 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
             // ----------------- Escaped Characters ----------------
            case '\\': if (!*str) {
                           rxe->status = RXE_UNTERMINATED_LITERAL;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       c = *str; prev='\\';
                       quantifier = 0;
                       if (c>='0' && c<='9') {
                           str2 = handle_backreferences(str,n,alt,rxe);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                           break;
                       }
@@ -336,7 +350,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       // references, \g with named references, \k, etc.
                       if (c == 'x') {
                           str2 = handle_hex_char(rxe,str,&c);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                       }
                       else if (c>='A' && c<='z') {
@@ -353,7 +367,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                               }
                           } else {
                              rxe->status = RXE_UNIMPLEMENTED;
-                             return str;
+                             return parse_done(x,n,p,str);
                           }
                       }
                       // fall thru
@@ -582,13 +596,13 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
     struct rxe *new_rxe = rxe_new();
     int n;
     mpz_set_ui(ret,0);
-    mpz_t pp;
-    mpz_init(pp);
+    // Declared out here and reused: initialising it inside the loop leaked one
+    // allocation per repeat count, which for a wide range is a great many.
+    mpz_t p;
+    mpz_init(p);
     for (n=r0;n<=r1;n++) {
         int m;
         struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
-        mpz_t p;
-        mpz_init(p);
         mpz_pow_ui(p,x,n);
         mpz_add(new_alt->start,prev_node->start,ret);
         mpz_add(ret,ret,p);
@@ -604,11 +618,15 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
         // the empty string, which is a member and must not be mistaken for an
         // alternation that matches nothing.
         mpz_set(new_alt->nitems,p);
-        mpz_set(pp,p);
     }
+    mpz_clear(p);
     mpz_set(new_rxe->nitems,ret);
     mpz_set(prev_node->nitems,ret);
-    prev_node->rxe = NULL;
+    // Exactly one clone aliases the original subexpression and inherits it, so
+    // it must not be freed here. That clone only exists when at least one was
+    // made: for {0} the loop above bodies out without cloning anything, and
+    // this node then holds the only pointer to the subexpression.
+    if (r1 > 0) prev_node->rxe = NULL;
     rxe_free_node_data(prev_node);
     prev_node->rxe = new_rxe;
     *end++ = '}';

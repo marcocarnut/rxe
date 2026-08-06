@@ -1,0 +1,5 @@
+*.o
+*.a
+*~
+rxenum
+rxenum-asan

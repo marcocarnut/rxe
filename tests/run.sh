@@ -13,6 +13,10 @@
 # zero. rxe_new() once left rxe->status uninitialised, which every operation
 # read; on a zeroed heap that happens to be RXE_OK, so the bug was invisible
 # until malloc started recycling dirty memory. Do not remove this.
+#
+# 'make test-asan' runs this same suite against a build with AddressSanitizer,
+# UndefinedBehaviorSanitizer and LeakSanitizer, with leak detection enabled, so
+# a leaked allocation on any path exercised below fails the build.
 
 : "${RXENUM:=./rxenum}"
 : "${MALLOC_PERTURB_:=42}"
@@ -180,6 +184,11 @@ t_enum '|a'         '/a/'
 t_enum 'a||b'       'a//b/'
 t_count 'a{0}'      '1'
 t_count '(a){0}'    '1'
+# {0} clones nothing, so no clone inherits the subexpression and this node
+# holds the only pointer to it. Freeing it here is what 'make test-asan'
+# checks; the count is just the visible half.
+t_count '(a){0,0}'  '1'
+t_count '(ab){0}'   '1'
 
 echo "== #15 '?' replaces the node rather than multiplying it =="
 # The quantified node kept its own characters as well as gaining the
@@ -268,6 +277,9 @@ check "200 draws of [a-z]{4} are not all identical" 'varied' \
       "$(n=$(i=0; while [ $i -lt 200 ]; do "$RXENUM" -r '[a-z]{4}'; i=$((i+1)); done | sort -u | wc -l);
          [ "$n" -gt 1 ] && echo varied || echo identical)"
 t_rc 0 -r '[a-z]{6}'
+# enumerate() runs once per sample here, and used to leak its accumulators
+# on each call. Under 'make test-asan' that is now a failure.
+t_rc 0 -r -c 20 '[a-z]{4}'
 
 echo "== #4 inline flag groups =="
 # handle_flags returned past the ')', so the caller read a flags-only group as

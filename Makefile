@@ -30,16 +30,15 @@ test: rxenum
 	    echo "oracle: skipped, python3 not found"; \
 	fi
 
-# Same suite under AddressSanitizer and UndefinedBehaviorSanitizer. Leak
-# detection is off because the library still leaks on every parse; turn it
-# back on once that is fixed.
+# Same suite under AddressSanitizer, UndefinedBehaviorSanitizer and
+# LeakSanitizer. Leak detection is on: a leak here fails the build.
 rxenum-asan: $(SRC) $(HDR)
 	$(CC) $(SANFLAGS) $(SRC) -lgmp -lm -o rxenum-asan
 
 test-asan: rxenum-asan
-	ASAN_OPTIONS=detect_leaks=0 RXENUM=./rxenum-asan sh tests/run.sh
+	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
 	@if command -v python3 >/dev/null 2>&1; then \
-	    ASAN_OPTIONS=detect_leaks=0 RXENUM=./rxenum-asan python3 tests/oracle.py; \
+	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/oracle.py; \
 	fi
 
 clean:

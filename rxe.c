@@ -176,7 +176,10 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
         // An impossible node cannot be indexed into. Alternations holding one
         // are skipped above, so reaching this means the caller seeked into a
         // set that has no such element; report failure rather than abort.
-        if (!mpz_sgn(n)) return 1;
+        if (!mpz_sgn(n)) {
+            mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
+            return 1;
+        }
         mpz_tdiv_qr(q,r,p,n);
         mpz_set(p,q);
         if (node->rxe) {
@@ -186,9 +189,9 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
             node->iterator = mpz_get_ui(r);
         }
     }
-    if (mpz_sgn(q)>0 && mpz_cmp_ui(n,1)>0 || mpz_sgn(p)>0) 
-        return 1;
-    return 0;
+    int past_end = (mpz_sgn(q)>0 && mpz_cmp_ui(n,1)>0) || mpz_sgn(p)>0;
+    mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
+    return past_end;
 }
 
 struct rxe *rxe_parse(char *str, int flags)
