@@ -231,6 +231,11 @@ t_selfcheck '([ab]){2}\1'
 t_selfcheck 'xy|a[^\x0-\xFF]b|zw'
 t_selfcheck '(a?){2}'
 t_selfcheck '[ab]?[cd]?'
+t_selfcheck '(?L)[ab][cd]'
+t_selfcheck '(?L)[01]{3}'
+t_selfcheck '(?L)[a-c]{1,3}'
+t_selfcheck '(?L)[ab](?-L:[cd][ef])'
+t_selfcheck '(?L)(a|bc)(d|ef)'
 t_selfcheck '([0-9A-F]{2} ){2}'
 
 echo "== number formatting =="
@@ -338,6 +343,32 @@ t_count '(?i)(a)\1'   '2'
 t_count '(?i:x)(a)\1' '2'
 # (?N) recursion still resolves against the corrected numbering.
 t_count '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)' '4,294,967,296'
+
+echo "== #12 enumeration direction =="
+# Right to left is the default: the last position is the least significant
+# digit, which is what lets the mapping be read as an ordinary numeral.
+t_enum  '[ab][cd]'               'ac/ad/bc/bd/'
+t_enum  '[01]{3}'                '000/001/010/011/100/101/110/111/'
+# (?L), or -L, makes the first position vary fastest instead.
+t_enum  '(?L)[ab][cd]'           'ac/bc/ad/bd/'
+t_enum  '(?L)[01]{3}'            '000/100/010/110/001/101/011/111/'
+t_opts  'ac/bc/ad/bd/' -L -e '[ab][cd]'
+# It reaches subexpressions and repetitions, which build struct rxe of their
+# own and so had to be told about it explicitly.
+t_enum  '(?L)[ab]([cd][ef])'     'ace/bce/ade/bde/acf/bcf/adf/bdf/'
+t_enum  '(?L:[01]{3})'           '000/100/010/110/001/101/011/111/'
+t_enum  '(?L)[01]{2}[ab]'        '00a/10a/01a/11a/00b/10b/01b/11b/'
+# ...and (?-L:...) puts one subexpression back the other way.
+t_enum  '(?L)[ab](?-L:[cd][ef])' 'ace/bce/acf/bcf/ade/bde/adf/bdf/'
+t_enum  '(?L:[ab](?-L:[cd][ef]))' 'ace/bce/acf/bcf/ade/bde/adf/bdf/'
+t_enum  '(?-L)[ab][cd]'          'ac/ad/bc/bd/'
+# Only the order changes; the set and its size do not.
+t_count '(?L)[ab][cd]'           '4'
+t_count '(?L)[0-9A-F]{4}'        '65,536'
+t_count '(?L)((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)' '4,294,967,296'
+# The default must not move: the documented radix conversion depends on it.
+t_opts  'DEAD BEEF /'    -z -f 3735928559 '([0-9A-F]{4} ){2}'
+t_opts  'FEEB DAED /' -L -z -f 3735928559 '([0-9A-F]{4} ){2}'
 
 echo "== known divergences, still open =="
 

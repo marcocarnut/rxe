@@ -23,12 +23,6 @@
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
-// Bits of struct rxe's 'flags' field. Note this namespace is shared with
-// rxe.c, which defines RXE_FLAG_HAS_BKRTABLE as bit 1.
-
-#define RXE_FLAG_CLOSED_BRACKET      1
-#define RXE_FLAG_VARIABLE_REPEAT     4
-
 #define FLAG_SET                     1
 #define FLAG_RESET                   0
 
@@ -37,26 +31,14 @@
 // Status/error message strings
 
 const char *rxe_status_msgs[] = {
-    "",
-    "infinite",
-    "extraneous parentheses",
-    "missing parentheses",
-    "nothing before quantifier",
-    "nested quantifiers",
-    "unterminated literal",
-    "unterminated character class",
-    "unterminated repetition",
-    "unterminated flags",
-    "bad repetition parameters",
-    "unimplemented",
-    "invalid backreference",
-    "stray non-digit characters in numeric constant",
-    "unterminated hex constant",
-    "backreference into a variably repeated group",
+#define RXE_STATUS_MSG_ENTRY(name,msg) msg,
+    RXE_STATUS_LIST(RXE_STATUS_MSG_ENTRY)
+#undef RXE_STATUS_MSG_ENTRY
 };
 
-// rxe_error_message() indexes the table above with a value of enum
-// rxe_parse_status, which is declared in a different file. Keep them in step.
+// Both this table and the enum come from RXE_STATUS_LIST in rxe.h, so they
+// cannot disagree. The assert stays as a tripwire in case someone later
+// expands one of them by hand.
 
 _Static_assert(
     sizeof(rxe_status_msgs)/sizeof(rxe_status_msgs[0]) == RXE_NSTATUS,
@@ -133,7 +115,7 @@ const char *backslash_letters[] = {
 /* -------------------------- Function Prototypes ------------------------- */
 
 const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str);
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
 const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
@@ -149,6 +131,10 @@ enum rxe_parse_status rxe_error(struct rxe *rxe)
 
 const char *rxe_error_message(struct rxe *rxe)
 {
+    // Indexing the table with an out-of-range status is what turned the
+    // uninitialised rxe->status into a segfault. Cheap to rule out for good.
+    if (!rxe || (unsigned)rxe->status >= (unsigned)RXE_NSTATUS)
+        return "unknown error";
     return rxe_status_msgs[rxe->status];
 }
 
@@ -184,6 +170,11 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
     int i, newflags, is_flag_group, quantifier = 0;
     struct rxe_alt *alt = rxe_new_alt(rxe); 
     mpz_set(alt->start,ret);
+    // Direction is decided while parsing but consulted while enumerating, so
+    // unlike the other options it cannot just live in 'flags'; it has to be
+    // recorded on the subexpression itself. Inheriting it here is what makes
+    // (?L) apply to nested groups and (?-L:...) able to override it again.
+    if (flags & RXE_LEFT_TO_RIGHT) rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
     struct rxe_node *node;
     const char *str2;
     char prev=0;
@@ -239,6 +230,14 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       str = str2;
                       if (is_flag_group && *str==')') {
                           flags = newflags;
+                          // A bare (?L) or (?-L) governs the whole enclosing
+                          // group rather than just the rest of it. An odometer
+                          // is a single unit: there is no coherent way for the
+                          // direction to change partway along one.
+                          if (flags & RXE_LEFT_TO_RIGHT)
+                              rxe->flags |=  RXE_FLAG_LEFT_TO_RIGHT;
+                          else
+                              rxe->flags &= ~RXE_FLAG_LEFT_TO_RIGHT;
                           str++;
                           continue;
                       }
@@ -292,6 +291,8 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       mpz_add_ui(n,n,1);
                       mpz_set_ui(p,1);
                       struct rxe *new_rxe = rxe_new();
+                      if (flags & RXE_LEFT_TO_RIGHT)
+                          new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
                       struct rxe_alt *emp_alt = rxe_new_alt(new_rxe);
                       mpz_set(emp_alt->start,alt->tail->start);
                       mpz_set_ui(emp_alt->nitems,1);   // matches the empty string
@@ -320,7 +321,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           rxe->status = RXE_LONE_QUANTIFIER;
                           return parse_done(x,n,p,str);
                       }
-                      str2 = handle_repeats(alt,n,p,str);
+                      str2 = handle_repeats(alt,n,p,str,flags);
                       if (!str2) {
                           rxe->status = mpz_get_ui(n);
                           return parse_done(x,n,p,str);
@@ -557,6 +558,11 @@ const char *handle_flags(const char *str, int *flags)
             // in a set enumerator -- the whole regex is implicitly anchored --
             // so accepting it and doing nothing is the correct reading.
             case 'm': break;
+            // Not a Perl flag. Perl's inline flags are all lower case, so an
+            // upper case letter cannot collide with one, now or later. Lower
+            // case 'l' was not available: Perl 5.14 gave it to locale rules.
+            case 'L': flag = RXE_LEFT_TO_RIGHT;
+                      break;
             case '-': dir = FLAG_RESET;
                       break;
         }
@@ -568,7 +574,7 @@ const char *handle_flags(const char *str, int *flags)
     return str;
 }
 
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str)
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags)
 {
     const char *end = strchr(str,'}');
     if (!end) {
@@ -618,6 +624,10 @@ const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *
     if (r0 != r1 && prev_node->rxe)
         prev_node->rxe->flags |= RXE_FLAG_VARIABLE_REPEAT;
     struct rxe *new_rxe = rxe_new();
+    // The repeated copies live in an alternation of their own, so the
+    // direction has to reach this subexpression as well, or {n} would keep
+    // counting right to left inside a (?L) group.
+    if (flags & RXE_LEFT_TO_RIGHT) new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
     int n;
     mpz_set_ui(ret,0);
     // Declared out here and reused: initialising it inside the loop leaked one

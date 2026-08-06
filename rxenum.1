@@ -101,6 +101,11 @@ Makes the dot quantifier really match all characters instead of "all but
 newline". Corresponds to the /s "single line" flag in Perl regexes.
 .TP
 .B
+\-L
+Enumerate left to right, so that the first position in the string varies
+fastest instead of the last. See ENUMERATION ORDER below.
+.TP
+.B
 \-e
 Enumerate the set, generating and printing the element instead of just
 counting them.
@@ -175,14 +180,56 @@ Uses the 'underscore' character as the thousands separator.
 \-~
 Use no thousands separator at all.
 
+.SH ENUMERATION ORDER
+By default the enumeration runs right to left: the last position in the
+string is the least significant one, so it varies fastest, exactly as the
+last digit of an ordinary numeral does. That is what allows the mapping to
+be used for radix conversion:
+
+.RS
+rxenum -z -f 3735928559 '([0-9A-F]{4} ){2}'
+.br
+DEAD BEEF
+.RE
+
+The
+.B -L
+option, or the non-standard "(?L)" flag written inside the regex, reverses
+this so the first position varies fastest:
+
+.RS
+rxenum -L -z -f 3735928559 '([0-9A-F]{4} ){2}'
+.br
+FEEB DAED
+.RE
+
+The flag is inherited by subexpressions and by repetitions, and "(?-L)"
+turns it off again, so the direction can be chosen independently for any
+part of a regex:
+
+.RS
+rxenum -e '(?L)[ab](?-L:[cd][ef])'
+.br
+ace bce acf bcf ade bde adf bdf
+.RE
+
+Only the order changes. The set and its size are identical either way.
+
+Alternations are always enumerated in the order they are written and are
+not affected by this flag. To reverse them, write them the other way round.
+
+Note that L is not a Perl flag. Every inline flag Perl defines is lower
+case, so an upper case letter cannot collide with one; lower case l was not
+available, Perl having given it to locale rules in version 5.14.
+
 .SH OTHER EXAMPLES
 .TP
-((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2))
+((\\d|[1-9]\\d|1\\d\\d|2[0-4]\\d|25[0-5])\\.){3}(?2)
 Generates all 4,294,967,296 possible IPv4 addresses. Notice the usage of the
 (?2) construct to reuse the second parenthesized subexpression as a kind of
 "subroutine".
 .TP
-(([01]\d\d|2[0-4]\d|25[0-5]|\d{1,2})\.){3}(?2)
+(([01]\\d\\d|2[0-4]\\d|25[0-5]|\\d{1,2})\\.){3}(?2)
 Alternative formulation that also handles zero-padded numbers. Because of
 that, there are 17,944,209,936 items in this set instead of 4,294,967,296.
 

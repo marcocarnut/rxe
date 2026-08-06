@@ -26,11 +26,6 @@
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
-#define ENUM_ONCE                    1
-#define ENUM_NUMBER                  2
-
-#define RXE_FLAG_HAS_BKRTABLE        2
-
 /* -------------------------- Global Declarations ------------------------- */
 
 int rxe_initialized;
@@ -112,7 +107,11 @@ int rxe_iterate(struct rxe *rxe)
     if (!rxe || !rxe->curr) return 1;
     struct rxe_alt *alt = rxe->curr;
     if (!alt) return 1;
-    struct rxe_node *node = alt->tail;
+    // Which end of the alternation carries first: the last node is the least
+    // significant digit by default, so that enumeration counts the way an
+    // ordinary numeral does.
+    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
+    struct rxe_node *node = l2r ? alt->head : alt->tail;
     int carry = 1;
     if (node) {
         while (carry) {
@@ -122,7 +121,7 @@ int rxe_iterate(struct rxe *rxe)
             if (carry) {
                 if (++node->iterator >= node->len) {
                     node->iterator = 0;
-                    node = node->prev;
+                    node = l2r ? node->next : node->prev;
                     if (!node) break;
                 } else {
                     carry = 0;
@@ -152,6 +151,7 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     mpz_init_set(p,pos);
     struct rxe_alt *alt;
     struct rxe_node *node = NULL;
+    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
     // FIXME: Performance: this is slow if the number of alternations is large.
     // We should enumerate this into an array and binary search it instead.
     // Also, as an enhancement, we should add a flag to allow left-to-right
@@ -162,12 +162,12 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
         if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
         if (mpz_cmp(alt->start,pos)<=0) {
             rxe->curr = alt;
-            node = alt->tail;
+            node = l2r ? alt->head : alt->tail;
             mpz_sub(p,p,alt->start);
             break;
         }
     }
-    for ( ; node ; node = node->prev ) {
+    for ( ; node ; node = l2r ? node->next : node->prev ) {
         if (node->is_backref) continue;
         mpz_set(n, node->rxe ? node->rxe->nitems : node->nitems);
         // An impossible node cannot be indexed into. Alternations holding one
@@ -239,6 +239,10 @@ struct rxe *rxe_deep_clone(struct rxe *src_rxe)
 {
    struct rxe *dst_rxe = rxe_new();
    struct rxe_alt *src_alt;
+   // Carry the subexpression's own flags across -- the enumeration direction
+   // among them -- but never the ownership bit: only the root owns the
+   // backreference table, and this clone has none to free.
+   dst_rxe->flags = src_rxe->flags & ~RXE_FLAG_HAS_BKRTABLE;
    mpz_set(dst_rxe->nitems,src_rxe->nitems);
    for ( src_alt = src_rxe->head ; src_alt ; src_alt = src_alt->next ) {
        struct rxe_alt *dst_alt = rxe_new_alt(dst_rxe);

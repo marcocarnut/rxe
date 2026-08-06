@@ -43,7 +43,7 @@ int mpz_len(mpz_t x);
 int main(int argc, char **argv)
 {
     if (argc<2) {
-        die(0,"Usage: rxenum [-isnezr] [-c count] [-f from] [-t to] <regex>\n");
+        die(0,"Usage: rxenum [-isLnezr] [-c count] [-f from] [-t to] <regex>\n");
     }
     int flags = 0;
     int do_enumerate = 0;
@@ -58,12 +58,14 @@ int main(int argc, char **argv)
     mpz_init(to);
     mpz_init(count);
     for (;;) {
-        int o = getopt(argc,argv,"isenzf:t:c:r.,_~");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
                       break;
             case 's': flags |= RXE_DOTALL;
+                      break;
+            case 'L': flags |= RXE_LEFT_TO_RIGHT;
                       break;
             case 'n': options |= ENUM_NUMBER;
                       do_enumerate = 1;
