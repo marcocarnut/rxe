@@ -269,10 +269,31 @@ check "200 draws of [a-z]{4} are not all identical" 'varied' \
          [ "$n" -gt 1 ] && echo varied || echo identical)"
 t_rc 0 -r '[a-z]{6}'
 
+echo "== #4 inline flag groups =="
+# handle_flags returned past the ')', so the caller read a flags-only group as
+# a subexpression that never closed and rejected it as 'missing parentheses'.
+t_count '(?i)a'         '2'
+t_count '(?i)ab'        '4'
+t_count '(?i)[a-c]'     '6'
+t_count 'a(?i)b'        '2'
+t_count '(?i)a(?-i)b'   '2'
+t_count '(?-i)a'        '1'
+t_count '(?i:a)'        '2'
+t_enum  '(?i)a'         'a/A/'
+t_enum  '(?i)a(?-i)b'   'ab/Ab/'
+# Perl's /s is the flag that makes the dot match everything; the arm used to
+# be 'm', so (?s) did nothing and (?m) silently did what (?s) should.
+t_count '(?s).'         '256'
+t_count '.'             '255'
+t_first '256' -s -~ '.'
+# /m governs where ^ and $ match, which a set enumerator does not honour, so
+# it is accepted and correctly does nothing.
+t_count '(?m).'         '255'
+# A group that only sets flags must not consume a group number.
+t_count '(?i)(a)\1'     '2'
+t_count '(?i:x)(a)\1'   '2'
+
 echo "== known divergences, still open =="
-# #4: bare inline flag groups.
-xcheck '#4' '(?i)a sets caseless'      '2' "$("$RXENUM" -~ '(?i)a'   2>&1 | head -1)"
-xcheck '#4' '(?s). matches all bytes'  '256' "$("$RXENUM" -~ '(?s).' 2>&1 | head -1)"
 # #13: ']' straight after '[' is a literal in Perl.
 xcheck '#13' '[]] is the class holding ]' '1' "$("$RXENUM" -~ '[]]' 2>&1 | head -1)"
 

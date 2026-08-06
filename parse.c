@@ -506,11 +506,22 @@ char *handle_flags(char *str, int *flags)
         switch (*str++) {
             case  0 : return NULL;
       case '0'...'9': return --str;
-            case ')': return str;
+            // Back up onto the ')' so the caller can recognise a group that
+            // only sets flags, such as (?i). Returning past it made the caller
+            // read the group as a subexpression whose parenthesis never
+            // closed, reporting 'missing parentheses' for a valid regex.
+            case ')': return --str;
             case 'i': flag = RXE_CASELESS;
                       break;
-            case 'm': flag = RXE_DOTALL;
+            // Perl's /s is the one that makes the dot match everything. This
+            // arm used to be 'm', so (?s) did nothing and (?m) silently did
+            // what (?s) should.
+            case 's': flag = RXE_DOTALL;
                       break;
+            // /m governs where ^ and $ match. Those are not honoured anywhere
+            // in a set enumerator -- the whole regex is implicitly anchored --
+            // so accepting it and doing nothing is the correct reading.
+            case 'm': break;
             case '-': dir = FLAG_RESET;
                       break;
         }

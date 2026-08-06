@@ -191,6 +191,18 @@ All regular expressions are assumed to be anchored, as if they were
 preceded by ^ and terminated by $. In fact, a ^ in the beginning is ignored,
 as is a dollar sign at the end. Anywhere else, they are treated as literals.
 
+The
+.B -i
+and
+.B -s
+flags can also be set inside the regex itself, either for the remainder of
+the enclosing group as in "(?i)abc", or for a single subexpression as in
+"(?i:abc)". A leading minus turns them off again, as in "(?-i)". A group
+that only sets flags does not count as a capturing group, so it does not
+consume a backreference number. The /m flag is accepted and ignored: it
+governs where ^ and $ match, and those are not honoured anywhere, as noted
+above.
+
 Absolute backreferences are supported, but relative ones are not.
 
 A backreference to a group repeated a fixed number of times refers to the
