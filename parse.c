@@ -541,8 +541,12 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
     char *c = strchr(str,',');
     if (c) {
         if (!c[1]) {
+            // Nothing after the comma, as in a{1,}: an open-ended repetition,
+            // which denotes an infinite set. Must return here, or the
+            // non-digit check below overwrites this with a less accurate one.
             // FIXME: Use something else more elegant to return the status code
             mpz_set_ui(ret,RXE_INFINITE);
+            return NULL;
         }
         if (c[1]<'0' || c[1]>'9') {
             // FIXME: Use something else more elegant to return the status code
@@ -619,6 +623,16 @@ char *handle_character_class(
     for (n=0;n<256;n++) used[n] = 0;
     for (;;) {
         c = *str++;
+        // A caret inverts the class only as its very first character. Anywhere
+        // else it is an ordinary member, so let it reach the default arm
+        // below. This is checked before the switch rather than inside it
+        // because the default arm cannot be reached by falling through the
+        // backslash case, which would misread an escaped caret.
+        if (c=='^' && !prev) {
+            invert = 1;
+            prev = c;
+            continue;
+        }
         // FIXME: Implement POSIX named character classes
         switch (c) {
              case  0 : // fall-thru
@@ -632,8 +646,6 @@ char *handle_character_class(
                        mpz_set_ui(node->nitems,count);
                        if (!c) return NULL;
                        return str;
-             case '^': if (!prev) invert = 1;
-                       break;
              case '-': if (*str == ']') {
                            count++; used['-']=1;
                            continue;

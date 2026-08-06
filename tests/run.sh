@@ -128,6 +128,11 @@ t_error '[abc'     'unterminated character class'
 t_error '\1'       'invalid backreference'
 t_error '(a\1)'    'infinite'
 t_error 'a{3,1}'   'bad repetition parameters'
+# Open-ended repetition denotes an infinite set. The RXE_INFINITE assignment
+# used to fall through into the bad-parameter check and be overwritten.
+t_error 'a{1,}'    'infinite'
+t_error 'a{0,}'    'infinite'
+t_error 'a{5,}'    'infinite'
 
 echo "== #2 backreferences must enumerate rather than double-free =="
 t_enum '(a)\1'              'aa/'
@@ -246,15 +251,28 @@ t_first '2' -~ '(?i:a)'
 t_rc 1 -c 0 '[ab]'
 t_rc 1 '[ab]' -f 0
 
+echo "== #5 a caret is special only as a class's first character =="
+t_count '[a^b]'     '3'
+t_count 'x[a^b]y'   '3'
+t_count '[ab^]'     '3'
+t_count '[a^]'      '2'
+t_count '[\^ab]'    '3'
+t_enum  '[a^b]'     '^/a/b/'
+# Still an inverter where it belongs, including inverting itself.
+t_count '[^ab]'     '254'
+t_count '[^^]'      '255'
+t_count '[^a-y]'    '231'
+
+echo "== #6 -r seeds from a block of entropy, not one repeatedly-discarded word =="
+check "200 draws of [a-z]{4} are not all identical" 'varied' \
+      "$(n=$(i=0; while [ $i -lt 200 ]; do "$RXENUM" -r '[a-z]{4}'; i=$((i+1)); done | sort -u | wc -l);
+         [ "$n" -gt 1 ] && echo varied || echo identical)"
+t_rc 0 -r '[a-z]{6}'
+
 echo "== known divergences, still open =="
-# #5: a caret elsewhere in a class should be a literal member.
-xcheck '#5' '[a^b] counts the caret'   '3' "$("$RXENUM" -~ 'x[a^b]y' 2>&1 | head -1)"
 # #4: bare inline flag groups.
 xcheck '#4' '(?i)a sets caseless'      '2' "$("$RXENUM" -~ '(?i)a'   2>&1 | head -1)"
 xcheck '#4' '(?s). matches all bytes'  '256' "$("$RXENUM" -~ '(?s).' 2>&1 | head -1)"
-# #14: open-ended repetition should report 'infinite'; the RXE_INFINITE
-# assignment in handle_repeats falls through into the bad-parameter check.
-xcheck '#14' 'a{1,} reports infinite' 'infinite' "$("$RXENUM" 'a{1,}' 2>&1 | head -1)"
 # #13: ']' straight after '[' is a literal in Perl.
 xcheck '#13' '[]] is the class holding ]' '1' "$("$RXENUM" -~ '[]]' 2>&1 | head -1)"
 

@@ -110,15 +110,19 @@ int main(int argc, char **argv)
         gmp_randstate_t state;
         gmp_randinit_mt(state);
         FILE *fp = fopen("/dev/urandom","rb");
-        if (!fp) die(1,"unable to open /dev/rrandom\n");
-        int n;
-        int size = mpz_size(rxe->nitems)+1;
-        for (n=0;n<32;n++) {
-            unsigned long int seed;
-            fread(&seed,1,sizeof(seed),fp);
-            gmp_randseed_ui(state,seed);
-        }
-        close(fp);
+        if (!fp) die(1,"unable to open /dev/urandom\n");
+        // Seed from one block of entropy. The loop this replaces called
+        // gmp_randseed_ui 32 times over, each call discarding the seed set by
+        // the one before, so only the final word ever had any effect.
+        unsigned char seed_bytes[32];
+        if (fread(seed_bytes,1,sizeof(seed_bytes),fp) != sizeof(seed_bytes))
+            die(1,"unable to read from /dev/urandom\n");
+        fclose(fp);
+        mpz_t seed;
+        mpz_init(seed);
+        mpz_import(seed,sizeof(seed_bytes),1,1,0,0,seed_bytes);
+        gmp_randseed(state,seed);
+        mpz_clear(seed);
         if (!mpz_sgn(count)) mpz_set_ui(count,1);
         mpz_t zero;
         mpz_init(zero);
