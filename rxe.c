@@ -22,6 +22,7 @@
 #include "rxe_alt.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
+#include "parse.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
@@ -36,26 +37,22 @@ int rxe_initialized;
 
 void *(*rxe_mem_alloc)(size_t);
 void (*rxe_mem_free)(void *);
-void (*rxe_mem_alloc_failed)(size_t size, char *file, int line);
+void (*rxe_mem_alloc_failed)(size_t size, const char *file, int line);
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow);
-struct rxe *rxe_deep_clone(struct rxe *src_rxe);
-
-void kmalloc_failed(size_t size, char *file, int line);
+void kmalloc_failed(size_t size, const char *file, int line);
 
 void rxe_set_alloc(
     void * (*malloc_func)(size_t),
     void (*free_func)(void *),
-    void (*fail_func)(size_t size, char *file, int line)
+    void (*fail_func)(size_t size, const char *file, int line)
 );
 
 /* ------------------------------------------------------------------------ */
 
 void rxe_init(void)
 {
-    int n;
     rxe_initialized = 1;
     rxe_set_alloc(malloc,free,kmalloc_failed);
 }
@@ -63,7 +60,7 @@ void rxe_init(void)
 void rxe_set_alloc(
     void * (*malloc_func)(size_t),
     void (*free_func)(void *),
-    void (*fail_func)(size_t size, char *file, int line)
+    void (*fail_func)(size_t size, const char *file, int line)
 )
 {
     rxe_mem_alloc = malloc_func;
@@ -87,7 +84,7 @@ static struct rxe_alt *rxe_first_alt(struct rxe *rxe)
 
 char *rxe_current(char *str, int maxlen, struct rxe *rxe)
 {
-    if (maxlen<=0) return;
+    if (maxlen<=0) return str;
     str[0] = 0;
     struct rxe_alt *alt = rxe->curr;
     struct rxe_node *node;
@@ -147,7 +144,7 @@ int rxe_iterate(struct rxe *rxe)
 
 int rxe_seek(struct rxe *rxe, mpz_t pos)
 {
-    if (!rxe) return;
+    if (!rxe) return 1;
     mpz_t q,r,p,n;
     mpz_init(q);
     mpz_init(r);
@@ -194,7 +191,7 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     return past_end;
 }
 
-struct rxe *rxe_parse(char *str, int flags)
+struct rxe *rxe_parse(const char *str, int flags)
 {
     if (!rxe_initialized) rxe_init();
     struct rxe *rxe = rxe_new();
@@ -270,14 +267,17 @@ void rxe_free(struct rxe *rxe)
 
 /* ---------------------------- Support Routines -------------------------- */
 
-void *kmalloc(size_t size, char *file, int line)
+void *kmalloc(size_t size, const char *file, int line)
 {
     void *p = rxe_mem_alloc(size);
     if (p) return p;
+    // The hook is expected not to return, but nothing enforces that, and
+    // falling off the end of a non-void function is undefined behaviour.
     if (rxe_mem_alloc_failed) rxe_mem_alloc_failed(size,file,line);
+    return NULL;
 }
 
-void kmalloc_failed(size_t size, char *file, int line)
+void kmalloc_failed(size_t size, const char *file, int line)
 {
     fprintf(stderr,"Can't get %d bytes of memory at %s line %d.",
         (int)size,file,line);

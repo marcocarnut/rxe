@@ -3,3 +3,5 @@
 *~
 rxenum
 rxenum-asan
+tests/api
+tests/api-asan

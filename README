@@ -22,7 +22,17 @@ INSTALLATION INSTRUCTIONS
 
        make
 
-3. If you get no errors, test with:
+3. If you get no errors, run the test suite:
+
+       make test
+
+   If you have a sanitizer-capable compiler, this is worth running too. It
+   repeats the same suite against a build with AddressSanitizer,
+   UndefinedBehaviorSanitizer and LeakSanitizer:
+
+       make test-asan
+
+4. Try it out:
 
        ./rxenum '[A-Z]{8}'
 
@@ -35,11 +45,11 @@ INSTALLATION INSTRUCTIONS
    Which means there are about 208 billion strings composed of eight
    characters from A to Z.
 
-4. Install the program and its manual page, running (as root):
+5. Install the program and its manual page, running (as root):
 
         make install
 
-5. Read the fine manual:
+6. Read the fine manual:
 
         man rxenum
 

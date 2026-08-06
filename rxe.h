@@ -127,9 +127,9 @@ extern void (*rxe_mem_free)(void *);
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-struct rxe *rxe_parse(char *str, int flags);
+struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
-char *rxe_error_message(struct rxe *rxe);
+const char *rxe_error_message(struct rxe *rxe);
 
 char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);
@@ -141,7 +141,7 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int sha
 struct rxe *rxe_deep_clone(struct rxe *src_rxe);
 void rxe_free(struct rxe *rxe);
 
-void *kmalloc(size_t size, char *file, int line);
+void *kmalloc(size_t size, const char *file, int line);
 
 /* ------------------------ Macro-Defined Functions ----------------------- */
 

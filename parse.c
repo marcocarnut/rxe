@@ -36,7 +36,7 @@
 
 // Status/error message strings
 
-char *rxe_status_msgs[] = {
+const char *rxe_status_msgs[] = {
     "",
     "infinite",
     "extraneous parentheses",
@@ -69,7 +69,7 @@ _Static_assert(
 // Some escapes, like \x and \g, are hardcoded and handled before this table
 // is looked up.
 
-char *backslash_letters[] = {
+const char *backslash_letters[] = {
     "",                // \A: beginning of the string assertion, ignored
     "",                // \B: match at non word assertion, ignored
     NULL,              // \C: C language octet, unimplemented
@@ -132,13 +132,13 @@ char *backslash_letters[] = {
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth);
-char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str);
-char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, char *str, int flags);
-char *handle_flags(char *str, int *flags);
-char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
-char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
-char *handle_hex_char(struct rxe *rxe, char *str, char *chr);
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str);
+const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
+const char *handle_flags(const char *str, int *flags);
+const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
+const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
+const char *handle_hex_char(struct rxe *rxe, const char *str, char *chr);
 
 /* ------------------------------------------------------------------------ */
 
@@ -147,7 +147,7 @@ enum rxe_parse_status rxe_error(struct rxe *rxe)
     return rxe->status;
 }
 
-char *rxe_error_message(struct rxe *rxe)
+const char *rxe_error_message(struct rxe *rxe)
 {
     return rxe_status_msgs[rxe->status];
 }
@@ -166,7 +166,7 @@ char *rxe_error_message(struct rxe *rxe)
 // Route every one of them through here so that none can forget to release the
 // accumulators.
 
-static char *parse_done(mpz_t x, mpz_t n, mpz_t p, char *str)
+static const char *parse_done(mpz_t x, mpz_t n, mpz_t p, const char *str)
 {
     mpz_clear(x);
     mpz_clear(n);
@@ -174,7 +174,7 @@ static char *parse_done(mpz_t x, mpz_t n, mpz_t p, char *str)
     return str;
 }
 
-char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth)
 {
     mpz_t x,n,p;
     mpz_init_set_ui(x,1);  // Multiplicative accumulator
@@ -185,7 +185,8 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
     struct rxe_alt *alt = rxe_new_alt(rxe); 
     mpz_set(alt->start,ret);
     struct rxe_node *node;
-    char *str2,prev=0;
+    const char *str2;
+    char prev=0;
     for (;;) {
         switch (c = *str++) {
             // ---------------- Termination conditions ---------------
@@ -354,11 +355,14 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                           str = str2;
                       }
                       else if (c>='A' && c<='z') {
-                          char *p = backslash_letters[c-'A'];
-                          if (p) {
-                              if (c=p[0]) {
-                                  if (p[1]) {
-                                      handle_character_class(rxe,alt,n,p,0);
+                          // Named 'esc', not 'p': the outer accumulator is
+                          // called p, and shadowing it here hid it from the
+                          // cleanup call below.
+                          const char *esc = backslash_letters[c-'A'];
+                          if (esc) {
+                              if ((c=esc[0])) {   // assign, then test
+                                  if (esc[1]) {
+                                      handle_character_class(rxe,alt,n,esc,0);
                                       break;
                                   } // else fall thru
                               } else {
@@ -372,6 +376,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       }
                       // fall thru
             case '$': if (!*str && prev!='\\') continue;
+                      // fall-thru - a dollar anywhere else is a literal
              default: i = 1;
                       node = rxe_new_node(alt);
                       node->str = NEW(2,char);
@@ -394,7 +399,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
     }
 }
 
-char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
+const char *handle_hex_char(struct rxe *rxe, const char *str, char *chr)
 {
     int val = 0;
     int done = 0;
@@ -412,12 +417,14 @@ char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
                 // fall-thru
             case 'A'...'F':
                 c -= 7;
+                // fall-thru
             case '0'...'9':
                 val = val * 16 + c-'0';
                 if (++ndigits==2) done = 1;
                 break;
             default:
                 str--;
+                // fall-thru
             case '}':
                 done = 1;
                 break;
@@ -435,7 +442,7 @@ char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
     return str;
 }
 
-char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
+const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
 {
     int brnum = 0;
     int done = 0;
@@ -472,7 +479,7 @@ char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe 
     return str;
 }
 
-char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
+const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
 {
     int brnum = 0;
     int done = 0;
@@ -511,7 +518,7 @@ char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
     return str;
 }
 
-char *handle_flags(char *str, int *flags)
+const char *handle_flags(const char *str, int *flags)
 {
     if (*str != '?') return str;
     int dir = FLAG_SET;
@@ -547,25 +554,28 @@ char *handle_flags(char *str, int *flags)
     return str;
 }
 
-char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str)
 {
-    char *end = strchr(str,'}');
+    const char *end = strchr(str,'}');
     if (!end) {
         // FIXME: Use something else more elegant to return the status code
         mpz_set_ui(ret,RXE_UNTERMINATED_REPEAT);
         return NULL;
     }
-    *end = 0;
     if (*str<'0' || *str>'9') {
         // FIXME: Use something else more elegant to return the status code
         mpz_set_ui(ret,RXE_BAD_REPETITION);
         return NULL;
     }
+    // atoi stops at the closing brace on its own. The comma search must be
+    // bounded explicitly, though: this used to be done by writing a NUL over
+    // the '}' and restoring it afterwards, which made rxe_parse scribble on
+    // the caller's string and crash outright on a string literal.
     int r0  = atoi(str);
     int r1  = r0;
-    char *c = strchr(str,',');
+    const char *c = memchr(str,',',end-str);
     if (c) {
-        if (!c[1]) {
+        if (c+1 == end) {
             // Nothing after the comma, as in a{1,}: an open-ended repetition,
             // which denotes an infinite set. Must return here, or the
             // non-digit check below overwrites this with a less accurate one.
@@ -629,15 +639,14 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
     if (r1 > 0) prev_node->rxe = NULL;
     rxe_free_node_data(prev_node);
     prev_node->rxe = new_rxe;
-    *end++ = '}';
-    return end;
+    return end+1;   // just past the '}'
 }
 
-char *handle_character_class(
-    struct rxe *rxe, 
-    struct rxe_alt *alt, 
-    mpz_t ret, 
-    char *str, 
+const char *handle_character_class(
+    struct rxe *rxe,
+    struct rxe_alt *alt,
+    mpz_t ret,
+    const char *str,
     int flags
 ) {
     int  count  = 0;
@@ -687,7 +696,7 @@ char *handle_character_class(
                        if (c=='b') {
                            c=8;
                        } else if (c=='x') {
-                           char *str2 = handle_hex_char(rxe,str,&c);
+                           const char *str2 = handle_hex_char(rxe,str,&c);
                            if (!str2) return str;
                            str = str2;
                        }
