@@ -187,6 +187,7 @@ struct rxe *rxe_new(void)
     struct rxe *rxe = NEW(1,struct rxe);
     rxe->head = rxe-> tail = rxe->curr = NULL;
     rxe->nalts = 0;
+    rxe->status = RXE_OK;
     rxe->brt = NULL;
     rxe->flags = 0;
     mpz_init(rxe->nitems);
