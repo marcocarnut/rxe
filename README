@@ -45,9 +45,23 @@ INSTALLATION INSTRUCTIONS
    Which means there are about 208 billion strings composed of eight
    characters from A to Z.
 
-5. Install the program and its manual page, running (as root):
+5. Install the program, the library, its header and the manual page,
+   running (as root):
 
         make install
+
+   This installs under /usr/local by default. Override PREFIX to put it
+   somewhere else, or DESTDIR to stage into a package root:
+
+        make install PREFIX=/usr
+        make install DESTDIR=/tmp/staging
+
+   To link against the library, include rxe.h and link librxe.a together
+   with GNU MP:
+
+        cc myprogram.c -lrxe -lgmp -lm
+
+   'make uninstall' removes everything it installed.
 
 6. Read the fine manual:
 

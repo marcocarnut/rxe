@@ -1,3 +1,5 @@
+PREFIX ?= /usr/local
+
 SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c
 HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
@@ -56,9 +58,24 @@ test-asan: rxenum-asan tests/api-asan
 clean:
 	rm -f *~ *.o *.a rxenum rxenum-asan tests/api tests/api-asan
 
-install: rxenum
-	install -m 755 rxenum /usr/bin
-	install -m 644 rxenum.1 /usr/share/man/man1
+# librxe.a and rxe.h are installed too: the library is the deliverable, and
+# until now only the demo program and its manual page were ever installed.
+# Override PREFIX to relocate, DESTDIR to stage into a package root.
+install: rxenum librxe.a
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -d $(DESTDIR)$(PREFIX)/lib
+	install -d $(DESTDIR)$(PREFIX)/include
+	install -d $(DESTDIR)$(PREFIX)/share/man/man1
+	install -m 755 rxenum    $(DESTDIR)$(PREFIX)/bin
+	install -m 644 librxe.a  $(DESTDIR)$(PREFIX)/lib
+	install -m 644 rxe.h     $(DESTDIR)$(PREFIX)/include
+	install -m 644 rxenum.1  $(DESTDIR)$(PREFIX)/share/man/man1
 
-.PHONY: all test test-asan clean install
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/rxenum
+	rm -f $(DESTDIR)$(PREFIX)/lib/librxe.a
+	rm -f $(DESTDIR)$(PREFIX)/include/rxe.h
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
+
+.PHONY: all test test-asan clean install uninstall
 

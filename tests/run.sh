@@ -151,23 +151,23 @@ t_rc 0 -e '([ab])([cd])\1\2'
 t_enum '([ab])(?1)\1'       'aaa/aba/bab/bbb/'
 
 echo "== #3 sets of cardinality zero =="
-t_count 'a[]b'              '0'
-t_count '[]'                '0'
-# Reachable in strictly Perl-legal syntax: a negated class covering all bytes.
+# A negated class covering all 256 byte values. Note '[]' is NOT an empty
+# class -- Perl reads the ']' as a member, so a bare '[]' is unterminated.
 t_count '[^\x0-\xFF]'       '0'
 t_count 'a[^\x0-\xFF]b'     '0'
-t_opts  ''      -e 'a[]b'
-t_opts  ''      -n 'a[]b'
-t_opts  ''      -c 3 'a[]b'
-t_rc 0  -e 'a[]b'
-t_rc 1  -r 'a[]b'
+t_error '[]'                'unterminated character class'
+t_opts  ''      -e 'a[^\x0-\xFF]b'
+t_opts  ''      -n 'a[^\x0-\xFF]b'
+t_opts  ''      -c 3 'a[^\x0-\xFF]b'
+t_rc 0  -e 'a[^\x0-\xFF]b'
+t_rc 1  -r 'a[^\x0-\xFF]b'
 # An alternation that matches nothing must not contribute a member. This one
 # used to emit a string built by indexing a zero-length allocation.
-t_count 'xy|a[]b'           '1'
-t_enum  'xy|a[]b'           'xy/'
-t_enum  'a[]b|xy'           'xy/'
-t_enum  'xy|a[]b|zw'        'xy/zw/'
-t_enum  '[]|a'              'a/'
+t_count 'xy|a[^\x0-\xFF]b'           '1'
+t_enum  'xy|a[^\x0-\xFF]b'           'xy/'
+t_enum  'a[^\x0-\xFF]b|xy'           'xy/'
+t_enum  'xy|a[^\x0-\xFF]b|zw'        'xy/zw/'
+t_enum  '[^\x0-\xFF]|a'              'a/'
 
 echo "== #3 regression guard: a node-less alternation matches the empty string =="
 # Cardinality 1, not 0. Treating these as 'matches nothing' would silently
@@ -228,7 +228,7 @@ t_selfcheck '(a|bc)(d|ef)'
 t_selfcheck '[a-c]{1,3}'
 t_selfcheck 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)'
 t_selfcheck '([ab]){2}\1'
-t_selfcheck 'xy|a[]b|zw'
+t_selfcheck 'xy|a[^\x0-\xFF]b|zw'
 t_selfcheck '(a?){2}'
 t_selfcheck '[ab]?[cd]?'
 t_selfcheck '([0-9A-F]{2} ){2}'
@@ -244,7 +244,7 @@ t_first '208_827_064_576' -_ '[A-Z]{8}'
 t_first '208827064576'    -~ '[A-Z]{8}'
 t_first '208,827,064,576' -, '[A-Z]{8}'
 # print_grouped once sized its buffer from mpz_size(), which is 0 for zero.
-t_count 'a[]b'              '0'
+t_count 'a[^\x0-\xFF]b'              '0'
 check "-n column alignment holds across a digit boundary" \
       '   999 bmk/ 1,000 bml/' \
       "$("$RXENUM" -n '[a-z]{3}' | sed -n '999p;1000p' | tr '\n' '/')"
@@ -305,9 +305,41 @@ t_count '(?m).'         '255'
 t_count '(?i)(a)\1'     '2'
 t_count '(?i:x)(a)\1'   '2'
 
+echo "== #13 a ']' in the first member position is a literal =="
+t_count '[]]'       '1'
+t_count '[^]]'      '255'
+t_count '[]a]'      '2'
+t_count '[]-a]'     '5'
+t_enum  '[]]'       ']/'
+t_enum  '[]a]'      ']/a/'
+# The class '[a]' followed by a literal ']', not a class holding 'a' and ']'.
+t_enum  '[a]]'      'a]/'
+# A caret still inverts, and the first member position survives it.
+t_error '[]'        'unterminated character class'
+t_error '[^]'       'unterminated character class'
+t_count '[-]'       '1'
+t_count '[^-]'      '255'
+t_count '[^^]'      '255'
+
+echo "== #16 group numbering: () captures, (?...) does not =="
+# () reached the flags-only branch, because handle_flags returns at once when
+# there is no '?', so the group was discarded and took no number.
+t_enum  '()'          '/'
+t_enum  '()\1'        '/'
+t_enum  'a()b'        'ab/'
+t_enum  '(a)()\1'     'aa/'
+t_enum  '()(a)\2'     'aa/'
+# Conversely, every (?...) group is non-capturing and must NOT take a number.
+# Registering them shifted every later backreference by one.
+t_enum  '(?:a)(b)\1'  'abb/'
+t_enum  '(?i:a)(b)\1' 'abb/Abb/'
+t_error '(?:a)(b)\2'  'invalid backreference'
+t_count '(?i)(a)\1'   '2'
+t_count '(?i:x)(a)\1' '2'
+# (?N) recursion still resolves against the corrected numbering.
+t_count '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)' '4,294,967,296'
+
 echo "== known divergences, still open =="
-# #13: ']' straight after '[' is a literal in Perl.
-xcheck '#13' '[]] is the class holding ]' '1' "$("$RXENUM" -~ '[]]' 2>&1 | head -1)"
 
 printf '\n%d passed, %d failed' "$pass" "$fail"
 [ "$xfail" -gt 0 ] && printf ', %d known-failing' "$xfail"

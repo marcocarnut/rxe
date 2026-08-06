@@ -181,7 +181,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
     mpz_init_set_ui(n,1);  // Current number of elements
     mpz_init_set_ui(p,1);  // Previous n
     char c;
-    int i, newflags, quantifier = 0;
+    int i, newflags, is_flag_group, quantifier = 0;
     struct rxe_alt *alt = rxe_new_alt(rxe); 
     mpz_set(alt->start,ret);
     struct rxe_node *node;
@@ -223,13 +223,21 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       break;
             // ------------------- Sub-expressions -----------------
             case '(': newflags = flags;
+                      // Only a group introduced by '?' can be one that merely
+                      // sets flags. Without this test an empty group '()' also
+                      // arrived at the branch below -- handle_flags returns
+                      // straight away when there is no '?' -- and was
+                      // discarded, so it captured nothing and consumed no
+                      // backreference number. Perl makes it a capturing group
+                      // that matches the empty string.
+                      is_flag_group = (*str=='?');
                       str2 = handle_flags(str,&newflags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_FLAGS;
                           return parse_done(x,n,p,str);
                       }
                       str = str2;
-                      if (*str==')') {
+                      if (is_flag_group && *str==')') {
                           flags = newflags;
                           str++;
                           continue;
@@ -245,7 +253,13 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       struct rxe *sub_rxe = rxe_new();
                       node = rxe_new_node(alt);
                       sub_rxe->brt = rxe->brt;
-                      rxe_backref_table_add(rxe->brt,sub_rxe);
+                      // Every group introduced by '?' -- (?:...) and (?i:...)
+                      // alike -- is non-capturing, so it must not take a
+                      // backreference number. Registering them shifted every
+                      // later \N by one: '(?:a)(b)\1' gave "aba" for what Perl
+                      // reads as "abb", and '(?:a)(b)\2' was accepted at all.
+                      if (!is_flag_group)
+                          rxe_backref_table_add(rxe->brt,sub_rxe);
                       str = parse(sub_rxe,n,str,newflags,depth+1);
                       node->rxe = sub_rxe;
                       mpz_set(node->rxe->nitems,n);
@@ -658,6 +672,10 @@ const char *handle_character_class(
     int n,m;
     int range_start,range_finish;
     int do_range = 0;
+    // True until the first member has been consumed. Tracked separately from
+    // 'prev', which doubles as the low end of a pending range and which the
+    // '-' arm below deliberately leaves alone.
+    int at_start = 1;
     for (n=0;n<256;n++) used[n] = 0;
     for (;;) {
         c = *str++;
@@ -665,9 +683,21 @@ const char *handle_character_class(
         // else it is an ordinary member, so let it reach the default arm
         // below. This is checked before the switch rather than inside it
         // because the default arm cannot be reached by falling through the
-        // backslash case, which would misread an escaped caret.
-        if (c=='^' && !prev) {
+        // backslash case, which would misread an escaped caret. The first
+        // member position survives it, so "[^]]" is the class without ']'.
+        if (c=='^' && at_start && !invert) {
             invert = 1;
+            prev = c;
+            continue;
+        }
+        int was_at_start = at_start;
+        at_start = 0;
+        // Perl and POSIX both read a ']' in the first member position as an
+        // ordinary member rather than the end of the class, so "[]]" holds
+        // ']' and a bare "[]" is unterminated rather than empty.
+        if (c==']' && was_at_start) {
+            count++;
+            used[(unsigned char)']'] = 1;
             prev = c;
             continue;
         }
