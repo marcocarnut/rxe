@@ -105,6 +105,8 @@ int main(int argc, char **argv)
     }
 
     if (have_random) {
+        if (!mpz_sgn(rxe->nitems))
+            die(1,"the set is empty, there is nothing to choose from\n");
         gmp_randstate_t state;
         gmp_randinit_mt(state);
         FILE *fp = fopen("/dev/urandom","rb");
@@ -139,20 +141,27 @@ int main(int argc, char **argv)
     }
     
     if (do_enumerate) {
-        enumerate(rxe,options,offset,from,count,sep);
+        // An empty set enumerates to nothing at all; there is no element to
+        // seek to, so skip straight past.
+        if (mpz_sgn(rxe->nitems))
+            enumerate(rxe,options,offset,from,count,sep);
     } else {
         print_grouped(stdout,NULL,rxe->nitems,"\n",sep);
-        double log_d = log(mpz_get_d(rxe->nitems));
-        int n, base[] = { 10, 2 };
-        int nbases = sizeof(base)/sizeof(base[0]);
-        for (n=0;n<nbases;n++) {
-            double l = log_d/log(base[n]);
-            mpz_t num,b;
-            mpz_init(num);
-            mpz_init_set_ui(b,base[n]);
-            mpz_pow_ui(num,b,l);
-            printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
-            printf("%2d^%g\n",base[n],l);
+        // The logarithms are meaningless for an empty set, and log(0) is
+        // -infinity, which mpz_pow_ui turns into a GMP abort.
+        if (mpz_sgn(rxe->nitems)) {
+            double log_d = log(mpz_get_d(rxe->nitems));
+            int n, base[] = { 10, 2 };
+            int nbases = sizeof(base)/sizeof(base[0]);
+            for (n=0;n<nbases;n++) {
+                double l = log_d/log(base[n]);
+                mpz_t num,b;
+                mpz_init(num);
+                mpz_init_set_ui(b,base[n]);
+                mpz_pow_ui(num,b,l);
+                printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
+                printf("%2d^%g\n",base[n],l);
+            }
         }
     }
     //rxe_backref_table_free(rxe->brt);
@@ -215,11 +224,17 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
 
 void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep)
 {
-    int size = mpz_size(x)*21;
-    char str[size+1];
-    gmp_sprintf(str,"%*Zd",size,x);
     if (prefix) fprintf(fp,"%s",prefix);
     if (mpz_sgn(x)) {
+        // Pad the field out to a whole number of three-digit groups, so the
+        // loop below -- which counts groups from the left of the padded
+        // string -- breaks on real thousands boundaries. mpz_sizeinbase may
+        // overshoot by one digit; the extra padding is blank and is skipped.
+        // Sizing this from mpz_size() instead yielded a zero-length buffer
+        // for x==0, which gmp_sprintf then overran.
+        int size = ((mpz_sizeinbase(x,10)+2)/3)*3;
+        char str[size+1];
+        gmp_sprintf(str,"%*Zd",size,x);
         char *p = str;
         int   i = 2;
         int   f = 0;

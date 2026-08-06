@@ -192,6 +192,11 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
             // Alternation: does not really finish; flushes partial
             // results, accumulates them and restarts
             case '|': mpz_mul(x,x,n);
+                      // x is now this alternation's cardinality. Record it:
+                      // enumeration needs to tell an alternation that matches
+                      // nothing (product zero) from one that matches only the
+                      // empty string (product one, no nodes).
+                      mpz_set(alt->nitems,x);
                       mpz_add(ret,ret,x);
                       if (c != '|') return str;
                       // Below runs for alternation only
@@ -260,6 +265,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       struct rxe *new_rxe = rxe_new();
                       struct rxe_alt *emp_alt = rxe_new_alt(new_rxe);
                       mpz_set(emp_alt->start,alt->tail->start);
+                      mpz_set_ui(emp_alt->nitems,1);   // matches the empty string
                       struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
                       rxe_node_deep_clone(new_alt,alt->tail,1);
                       mpz_add_ui(new_alt->start,alt->tail->start,1);
@@ -571,10 +577,10 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
             // repetition, as Perl does.
             rxe_node_deep_clone(new_alt,prev_node,n==r1 && m==n-1);
         }
-        if (new_alt->tail) 
-            mpz_set(new_alt->nitems,new_alt->tail->nitems);
-        else
-            mpz_set_ui(new_alt->nitems,0);
+        // p is x^n, the cardinality of this repeat count. For n==0 that is 1,
+        // the empty string, which is a member and must not be mistaken for an
+        // alternation that matches nothing.
+        mpz_set(new_alt->nitems,p);
         mpz_set(pp,p);
     }
     mpz_set(new_rxe->nitems,ret);

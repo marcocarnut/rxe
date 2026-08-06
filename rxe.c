@@ -71,18 +71,35 @@ void rxe_set_alloc(
     rxe_mem_alloc_failed = fail_func;
 }
 
+// Returns the first alternation that contributes any string at all. An
+// alternation whose product is zero holds an impossible node -- an empty
+// character class, say -- and matches nothing, so enumeration must step over
+// it. This is distinct from an alternation with no nodes, whose product is
+// one because it matches the empty string.
+
+static struct rxe_alt *rxe_first_alt(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        if (mpz_sgn(alt->nitems)) return alt;
+    return NULL;
+}
+
 char *rxe_current(char *str, int maxlen, struct rxe *rxe)
 {
     if (maxlen<=0) return;
     str[0] = 0;
     struct rxe_alt *alt = rxe->curr;
     struct rxe_node *node;
+    if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
         if (node->rxe) {
             char *new_str = rxe_current(str,maxlen,node->rxe);
             maxlen -= new_str - str;
             str = new_str;
-        } else {
+        } else if (node->len) {
+            // A node with no characters has nothing to contribute. Indexing
+            // its str would read past a zero-length allocation.
             if (maxlen>0) {
                 *str++ = node->str[node->iterator];
                 maxlen--;
@@ -117,12 +134,12 @@ int rxe_iterate(struct rxe *rxe)
         }
     }
     if (carry) {
-        alt = alt->next;
+        do { alt = alt->next; } while (alt && !mpz_sgn(alt->nitems));
         if (alt) {
             rxe->curr = alt;
             carry = 0;
         } else {
-            rxe->curr = rxe->head;
+            rxe->curr = rxe_first_alt(rxe);
         }
     }
     return carry;
@@ -145,6 +162,7 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     // subexpression so we can fine tune the order in which the sets will be
     // enumerated.
     for ( alt = rxe->tail ; alt ; alt = alt->prev ) {
+        if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
         if (mpz_cmp(alt->start,pos)<=0) {
             rxe->curr = alt;
             node = alt->tail;
@@ -155,7 +173,10 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     for ( ; node ; node = node->prev ) {
         if (node->is_backref) continue;
         mpz_set(n, node->rxe ? node->rxe->nitems : node->nitems);
-        assert(mpz_sgn(n)!=0);
+        // An impossible node cannot be indexed into. Alternations holding one
+        // are skipped above, so reaching this means the caller seeked into a
+        // set that has no such element; report failure rather than abort.
+        if (!mpz_sgn(n)) return 1;
         mpz_tdiv_qr(q,r,p,n);
         mpz_set(p,q);
         if (node->rxe) {
