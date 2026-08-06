@@ -269,6 +269,14 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
                       rxe_node_deep_clone(new_alt,alt->tail,1);
                       mpz_add_ui(new_alt->start,alt->tail->start,1);
+                      // The clone has taken over this node's characters and
+                      // any subexpression, so drop them from the node itself.
+                      // Leaving both in place makes rxe_iterate step the
+                      // node's own characters as well as the alternation
+                      // below it, multiplying the set instead of replacing
+                      // it. handle_repeats does the same for {n,m}.
+                      alt->tail->rxe = NULL;
+                      rxe_free_node_data(alt->tail);
                       alt->tail->rxe = new_rxe;
                       mpz_set(new_alt->nitems,new_alt->tail->nitems);
                       mpz_add_ui(alt->tail->nitems,new_alt->nitems,1);
