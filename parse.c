@@ -23,7 +23,11 @@
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
+// Bits of struct rxe's 'flags' field. Note this namespace is shared with
+// rxe.c, which defines RXE_FLAG_HAS_BKRTABLE as bit 1.
+
 #define RXE_FLAG_CLOSED_BRACKET      1
+#define RXE_FLAG_VARIABLE_REPEAT     4
 
 #define FLAG_SET                     1
 #define FLAG_RESET                   0
@@ -48,7 +52,16 @@ char *rxe_status_msgs[] = {
     "invalid backreference",
     "stray non-digit characters in numeric constant",
     "unterminated hex constant",
+    "backreference into a variably repeated group",
 };
+
+// rxe_error_message() indexes the table above with a value of enum
+// rxe_parse_status, which is declared in a different file. Keep them in step.
+
+_Static_assert(
+    sizeof(rxe_status_msgs)/sizeof(rxe_status_msgs[0]) == RXE_NSTATUS,
+    "rxe_status_msgs[] is out of sync with enum rxe_parse_status"
+);
 
 // Backslash-letter escape table.
 // Empty string means ignored, NULL means unimplemented, anything else is
@@ -421,6 +434,10 @@ char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe 
         rxe->status = RXE_INFINITE;
         return NULL;
     }
+    if (node->rxe->flags & RXE_FLAG_VARIABLE_REPEAT) {
+        rxe->status = RXE_BACKREF_INTO_VARIABLE_REPEAT;
+        return NULL;
+    }
     node->is_backref = 1;
     mpz_set_ui(node->nitems,1);
     mpz_set_ui(n,1);
@@ -526,12 +543,18 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
         return NULL;
     }
     struct rxe_node *prev_node = alt->tail;
+    // A variable repetition builds one alternation per repeat count, each with
+    // a different number of clones. Only one of them can alias the original
+    // subexpression, so a later \N -- which resolves through that single alias
+    // -- would read from an alternation that is not the one being enumerated.
+    // Mark the subexpression so handle_backreferences can refuse it.
+    if (r0 != r1 && prev_node->rxe)
+        prev_node->rxe->flags |= RXE_FLAG_VARIABLE_REPEAT;
     struct rxe *new_rxe = rxe_new();
     int n;
     mpz_set_ui(ret,0);
     mpz_t pp;
     mpz_init(pp);
-    int shallow = 1;
     for (n=r0;n<=r1;n++) {
         int m;
         struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
@@ -541,8 +564,12 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
         mpz_add(new_alt->start,prev_node->start,ret);
         mpz_add(ret,ret,p);
         for (m=0;m<n;m++) {
-            rxe_node_deep_clone(new_alt,prev_node,shallow);
-            shallow = 0;
+            // Exactly one clone may alias the original subexpression rather
+            // than deep-copying it; it inherits ownership of it. Make that the
+            // *last* clone, so a \N resolving through the backreference table
+            // -- which still points at the original -- refers to the final
+            // repetition, as Perl does.
+            rxe_node_deep_clone(new_alt,prev_node,n==r1 && m==n-1);
         }
         if (new_alt->tail) 
             mpz_set(new_alt->nitems,new_alt->tail->nitems);

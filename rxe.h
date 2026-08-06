@@ -43,6 +43,8 @@ enum rxe_parse_status {
     RXE_INVALID_BACKREF,
     RXE_INVALID_CONSTANT,
     RXE_UNTERMINATED_HEX_CONSTANT,
+    RXE_BACKREF_INTO_VARIABLE_REPEAT,
+    RXE_NSTATUS                 // Must be last; counts the entries above
 };
 
 // ---- Main data structures
