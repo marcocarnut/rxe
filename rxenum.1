@@ -229,6 +229,79 @@ Note that L is not a Perl flag. Every inline flag Perl defines is lower
 case, so an upper case letter cannot collide with one; lower case l was not
 available, Perl having given it to locale rules in version 5.14.
 
+.SH INFINITE SETS
+The star and plus metacharacters, and open-ended repetitions such as
+"a{1,}", describe sets with no largest member. There is no count to print,
+so \fBrxenum\fR says so:
+
+.RS
+rxenum 'a*'
+.br
+infinite
+.RE
+
+They are still enumerated, and still addressed by index, so everything but
+the counting works as it does for a finite set. Use \fB-c\fR to say how many
+elements you want:
+
+.RS
+rxenum -e -c 5 '[ab]+'
+.br
+a b aa ab ba
+.RE
+
+The mapping is a bijection onto the whole set: every member is reached after
+finitely many steps, and \fB-f\fR addresses the same order, so a run can be
+stopped and resumed exactly as a finite one can.
+
+.RS
+rxenum -z -f 1000 'a*b*'
+.br
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbb
+.RE
+
+An expression with more than one unbounded quantifier has more than one
+dimension with no largest value, and place value cannot carry that: counting
+would spend eternity in the first dimension and never reach the second. The
+index is spread across them by the Cantor pairing function instead, which
+walks diagonals so that all of them grow together:
+
+.RS
+rxenum -e -c 10 'a*b*'
+.br
+(empty) a b aa ab bb aaa aab abb bbb
+.RE
+
+which is shortest first and alphabetically within a length. That exact
+correspondence holds when each dimension's index is the length it
+contributes, as it is above. When the repeated unit has more than one member,
+an index of n stands for a string of about log(n) characters, so the
+diagonals slant across the lengths rather than following them, and the order
+is merely diagonal rather than strictly shortest first. Every member is still
+reached in finite time, which is the property that matters.
+
+Alternations that are infinite are enumerated after every finite one, and
+dovetailed with each other rather than laid end to end, which would mean the
+second never started:
+
+.RS
+rxenum -e -c 5 'a|b*'
+.br
+a (empty) b bb bbb
+.RE
+
+Repeating something that is itself unbounded, as in "(a*)*" or "(\\d+,)*", is
+refused. Every position would be a dimension of its own and the repeat count
+another on top of them, so a block of a given count would itself be endless
+rather than a finite thing to step past. The same goes for a bounded
+repetition of one, such as "(a*){2}": a bound limits how many dimensions
+there are, not how big each one is.
+
+.B -r
+and
+.B -k
+both need a finite set to work over and report an error otherwise.
+
 .SH PERMUTED ORDER
 .B \-k
 composes the integer mapping with a keyed permutation of the integers, so
@@ -313,11 +386,6 @@ subexpressions, say, "(a?){2}".
 .SH LIMITATIONS
 Works only in 8-bit characters and ASCII. No Unicode support.
 
-Does not handle infinite sets, even when they are enumerable. This also
-means that the universal quantifiers (the star and plus metacharacters)
-will cause the program to croak 'infinite'. Same for open-ended repetitions
-such as "a{1,}".
-
 Neither detects nor skips duplicates:
 
 .RS
@@ -333,8 +401,8 @@ rxenum -n '(a?){2}'
 .RE
 
 A generated element is truncated at 2048 characters, without saying so. Wide
-repetitions such as "a{1,100000}" are counted and seeked correctly but cannot
-be printed in full.
+and unbounded repetitions are counted and seeked correctly but cannot be
+printed in full past that: "a{1,100000}" and "a*" both hit it.
 
 POSIX character classes are currently unimplemented, as are many backslash
 special characters. Named backreferences are also currently unimplemented.

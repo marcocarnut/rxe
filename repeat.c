@@ -49,6 +49,14 @@
 
 void rxe_repeat_nitems(mpz_t out, const mpz_t base, int r0, int r1)
 {
+    // An unbounded repetition has no cardinality to report unless the thing
+    // it repeats matches nothing, in which case only the empty run exists and
+    // the answer is finite after all. Callers test rxe_repeat_is_infinite
+    // first; this returns the finite answer for the one case there is.
+    if (r1 == RXE_REP_UNBOUNDED) {
+        mpz_set_ui(out, mpz_sgn(base) ? 0 : (r0 == 0 ? 1 : 0));
+        return;
+    }
     if (r1 < r0) { mpz_set_ui(out,0); return; }
     // A subexpression that matches nothing can still be repeated zero times,
     // which matches the empty string. Any other count is impossible.
@@ -67,9 +75,40 @@ void rxe_repeat_nitems(mpz_t out, const mpz_t base, int r0, int r1)
     mpz_clear(lo);
 }
 
+// Repeating something with no largest member gives a set with no largest
+// member, unless there is nothing to repeat at all.
+
+int rxe_repeat_is_infinite(struct rxe_node *node)
+{
+    return node->rep_max == RXE_REP_UNBOUNDED && mpz_sgn(node->rxe->nitems);
+}
+
+// Make room for at least 'want' position indices. An unbounded repetition
+// cannot size this at parse time, and even a bounded one is better off not
+// doing so: 'a{1,1000000}' would otherwise reserve a million integers to
+// enumerate a set whose first element is one character long.
+
+static void rep_grow(struct rxe_node *node, int want)
+{
+    if (want <= node->rep_alloc) return;
+    int i, n = node->rep_alloc ? node->rep_alloc : 8;
+    while (n < want) n *= 2;
+    mpz_t *fresh = NEW(n,mpz_t);
+    for (i=0;i<node->rep_alloc;i++) {
+        // mpz_t is an array type, so this hands the limbs over rather than
+        // copying them; the old entries must not be cleared afterwards.
+        fresh[i][0] = node->rep_digit[i][0];
+    }
+    for (i=node->rep_alloc;i<n;i++) mpz_init(fresh[i]);
+    if (node->rep_digit) rxe_mem_free(node->rep_digit);
+    node->rep_digit = fresh;
+    node->rep_alloc = n;
+}
+
 // Turn an ordinary subexpression node into a repetition of it. The caller has
 // already moved the repeated thing into node->rxe and set node->nitems to its
-// cardinality; on return node->nitems is the cardinality of the repetition.
+// cardinality; on return node->nitems is the cardinality of the repetition,
+// or zero if there is no such number because the repetition is unbounded.
 
 void rxe_repeat_make(struct rxe_node *node, int r0, int r1)
 {
@@ -78,11 +117,9 @@ void rxe_repeat_make(struct rxe_node *node, int r0, int r1)
     node->rep_max   = r1;
     node->rep_count = r0;
     node->rep_digit = NULL;
-    if (r1 > 0) {
-        int i;
-        node->rep_digit = NEW(r1,mpz_t);
-        for (i=0;i<r1;i++) mpz_init(node->rep_digit[i]);
-    }
+    node->rep_alloc = 0;
+    node->is_inf    = rxe_repeat_is_infinite(node);
+    if (r0 > 0) rep_grow(node,r0);
     rxe_repeat_nitems(node->nitems,node->rxe->nitems,r0,r1);
 }
 
@@ -90,9 +127,10 @@ void rxe_repeat_free(struct rxe_node *node)
 {
     if (!node->rep_digit) return;
     int i;
-    for (i=0;i<node->rep_max;i++) mpz_clear(node->rep_digit[i]);
+    for (i=0;i<node->rep_alloc;i++) mpz_clear(node->rep_digit[i]);
     rxe_mem_free(node->rep_digit);
     node->rep_digit = NULL;
+    node->rep_alloc = 0;
 }
 
 // Position i of a run of n counts from the right by default, so that the last
@@ -110,41 +148,50 @@ static int digit_at(int n, int significance, int l2r)
 int rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r)
 {
     struct rxe *sub = node->rxe;
+    int unbounded = node->rep_max == RXE_REP_UNBOUNDED;
     int n = node->rep_min, i, rc = 1;
     mpz_t p,block,r;
     mpz_init_set(p,pos);
     mpz_init(block);
     mpz_init(r);
     if (mpz_sgn(p) < 0) goto done;
-    // Walk the repeat counts in ascending order, subtracting each block as it
-    // is passed. With base >= 2 the blocks grow geometrically, so this ends
-    // after about log_base(pos) steps however wide the repetition is; with
-    // base 0 or 1 the loop below is bounded by the counts themselves, and
-    // those cases are settled without looping at all.
     if (!mpz_sgn(sub->nitems)) {
         // Nothing to repeat: only a run of length zero exists, and only if it
-        // is allowed.
+        // is allowed. This is the one way an unbounded repetition can turn
+        // out to be finite.
         if (node->rep_min != 0 || mpz_sgn(p)) goto done;
         node->rep_count = 0;
         rc = 0;
         goto done;
     }
     if (!mpz_cmp_ui(sub->nitems,1)) {
-        // One string per count, so pos selects the count directly.
-        if (mpz_cmp_ui(p,node->rep_max-node->rep_min+1) >= 0) goto done;
+        // One string per count, so pos selects the count directly. Unbounded,
+        // that is every count there is, and the mapping is the identity.
+        if (!unbounded && mpz_cmp_ui(p,node->rep_max-node->rep_min+1) >= 0)
+            goto done;
+        // A run this long has to be renderable before it can be selected, and
+        // an index that does not fit in a machine word never will be.
+        if (!mpz_fits_slong_p(p)) goto done;
         node->rep_count = node->rep_min + (int)mpz_get_ui(p);
+        rep_grow(node,node->rep_count);
         for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
         rc = 0;
         goto done;
     }
+    // Walk the repeat counts in ascending order, subtracting each block as it
+    // is passed. The base is two or more here, so the blocks grow
+    // geometrically and this ends after about log_base(pos) steps -- which is
+    // what lets an unbounded repetition be walked at all, the loop finding its
+    // own end rather than running out of counts.
     mpz_pow_ui(block,sub->nitems,node->rep_min);
-    for (n=node->rep_min;n<=node->rep_max;n++) {
+    for (n=node->rep_min;unbounded || n<=node->rep_max;n++) {
         if (mpz_cmp(p,block) < 0) break;
         mpz_sub(p,p,block);
         mpz_mul(block,block,sub->nitems);
     }
-    if (n > node->rep_max) goto done;
+    if (!unbounded && n > node->rep_max) goto done;
     node->rep_count = n;
+    rep_grow(node,n);
     // p is now an n-digit numeral in base sub->nitems. Peel the digits off
     // least significant first and store each at the position it drives.
     for (i=0;i<n;i++) {
@@ -178,12 +225,19 @@ int rxe_repeat_iterate(struct rxe_node *node, int l2r)
         mpz_set_ui(*d,0);
     }
     // Every digit wrapped, so the run of this length is exhausted; the next
-    // block is the next repeat count up.
-    if (++node->rep_count > node->rep_max) {
+    // block is the next repeat count up. There is always one when the
+    // repetition is unbounded, which is why it never carries out.
+    int carry = 0;
+    node->rep_count++;
+    // Unbounded, there is always a next count, so it never carries out.
+    if (node->rep_max != RXE_REP_UNBOUNDED &&
+        node->rep_count > node->rep_max) {
         node->rep_count = node->rep_min;
-        for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
-        return 1;
+        carry = 1;
     }
+    // The indices are allocated on demand, so a longer run than any reached
+    // so far has to make room for itself before it can be cleared.
+    rep_grow(node,node->rep_count);
     for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
-    return 0;
+    return carry;
 }

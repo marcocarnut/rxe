@@ -26,7 +26,9 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->len = node->iterator = 0;
     node->is_backref = 0;
     node->is_repeat = 0;
+    node->is_inf = 0;
     node->rep_min = node->rep_max = node->rep_count = 0;
+    node->rep_alloc = 0;
     node->rep_digit = NULL;
     node->str = NULL;
     node->rxe = NULL;
@@ -50,6 +52,7 @@ void rxe_free_node_data(struct rxe_node *node)
     // A repetition owns one index per position it can occupy.
     rxe_repeat_free(node);
     node->is_repeat = 0;
+    node->is_inf = 0;
     node->rep_min = node->rep_max = node->rep_count = 0;
     // Keyed off the pointer, not the length: an empty character class still
     // allocates a (zero-length) block, and testing len left it behind.

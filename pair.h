@@ -14,14 +14,10 @@
  *
  */
 
-#ifndef __RXE_REPEAT_H__
-#define __RXE_REPEAT_H__
+#ifndef __RXE_PAIR_H__
+#define __RXE_PAIR_H__
 
-void rxe_repeat_nitems(mpz_t out, const mpz_t base, int r0, int r1);
-void rxe_repeat_make(struct rxe_node *node, int r0, int r1);
-int  rxe_repeat_is_infinite(struct rxe_node *node);
-void rxe_repeat_free(struct rxe_node *node);
-int  rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r);
-int  rxe_repeat_iterate(struct rxe_node *node, int l2r);
+void rxe_unpair(mpz_t *out, int n, const mpz_t index);
+void rxe_pair(mpz_t index, mpz_t *in, int n);
 
-#endif // __RXE_REPEAT_H__
+#endif // __RXE_PAIR_H__

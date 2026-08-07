@@ -10,6 +10,14 @@ DONE SINCE 0.9.1
 - Flag to change the enumeration direction: (?L), (?-L) and -L.
 - Keyed permutation of the enumeration order: -k key, and the
   rxe_permutation_* entry points in rxe.h.
+- Infinite sets. '*', '+' and '{n,}' used to be a hard error; they are now
+  enumerated and addressed by index like anything else, with only the
+  counting reporting that there is no count. One unbounded quantifier is the
+  repeat counts walked without an upper bound; several are several dimensions
+  with no largest value, and the index is spread across them by the Cantor
+  pairing function. Infinite alternations are dovetailed above the finite
+  ones. rxe_is_infinite() is the new entry point. Repeating something that is
+  itself unbounded is still refused -- see below.
 - Closed-form counted repetition. "x{r0,r1}" is now a repeat count and one
   index per position rather than one written-out copy per position per repeat
   count, so the memory a repetition costs is the length of the string it
@@ -63,31 +71,43 @@ SHORT TERM TO-DOs
 LONG-TERM TO-DOs
 ================
 
-> Enumerate infinite sets. Keep reporting that the set is infinite, but
-  still map integers onto its members, so * and + stop being a hard error.
-  This is now the next thing to do, and much of it is already built: a
-  repetition node carries rep_min and rep_max and walks the repeat counts
-  in ascending order, subtracting each block from the index as it passes.
-  An unbounded quantifier is that same node with rep_max removed, and 'a*'
-  is 'a{0,}'.
+> Repeat an expression that is itself unbounded. '(a*)*' is refused, and so
+  is '(a*){2}' and every other repetition of an endless thing bar zero
+  repetitions. It matters more than it looks: '(\d+,)*', a comma-separated
+  list, is exactly this shape and is a thing people write.
 
-  What is left is the part the finite case never had to answer. The block
-  walk terminates today because the counts run out; unbounded, it terminates
-  because the blocks grow, which they only do when the repeated
-  subexpression has two or more members -- 'a*' has one string per count and
-  cannot be reached by that route at all, though its mapping is just the
-  identity. Cardinality stops being a number, so nitems needs a value meaning
-  infinite that propagates through the products and sums without pretending
-  to be large. And two unbounded quantifiers in one expression are two
-  dimensions, each infinite, so the single index has to be spread across them
-  by a pairing function rather than by place value.
+  Two problems, both of which the finite case never had to answer. Every
+  position of the repetition becomes a dimension of its own rather than a
+  digit, so a repetition of n copies needs an n-way pairing, and n varies
+  with the repeat count. And the block walk that finds the repeat count works
+  by stepping past each block in turn, which needs the blocks to be finite;
+  here every block from the first onwards is endless, so the count itself has
+  to be paired with the index within it rather than subtracted off.
 
-  Note that ordering has a real choice in it. Enumerating 'a*b*' as
-  "", "a", "b", "ab", "aab", "aabb" -- shortlex, shortest first and
-  alphabetically within a length -- is the useful reading, and is what the
-  Cantor pairing gives if the dimensions are walked by total length. Simply
-  making the first quantifier the more significant digit would never reach
-  the second one at all.
+  Both are the machinery that is already there -- rxe_unpair over a varying
+  arity, and a pairing rather than a subtraction to pick the count -- so this
+  is a bounded piece of work rather than a new idea. The awkward part is the
+  block for count zero, which holds exactly one string where every other
+  block holds infinitely many, so it is not a copy of N and cannot take part
+  in a pairing over N without leaving a hole.
+
+> A stricter shortlex order. The Cantor pairing walks diagonals over the
+  dimensions' indices, which coincides with shortest-string-first exactly
+  when each index is the length it contributes: 'a*b*' comes out "", a, b,
+  aa, ab, bb, which is shortlex. When the repeated unit has more than one
+  member -- '[ab]*[cd]*' -- an index of n stands for a string of about log(n)
+  characters, so the diagonals slant across the lengths instead of following
+  them.
+
+  Getting true shortlex in general means ordering by string length, which
+  means being able to say how many members an expression has of each length
+  rather than in total. That is a generating function per subexpression
+  rather than a single cardinality, and for a finite expression it is
+  strictly more expensive than what is there now: '[a-z]{1,20000}' has one
+  cardinality of 28,300 digits and would have 20,001 of them, one per length.
+  So it would want to be an alternative representation chosen when an
+  unbounded quantifier is present, not a replacement. Probably not worth it
+  unless somebody actually needs the order.
 
 > Abstract the arithmetic behind a base-type shim, so the width can be
   chosen at build time: GMP for unbounded cardinalities as now, or

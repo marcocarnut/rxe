@@ -116,9 +116,10 @@ const char *backslash_letters[] = {
 /* -------------------------- Function Prototypes ------------------------- */
 
 const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, const char *str,
+const char *handle_repeats(struct rxe_alt *alt, const char *str,
                            int flags, enum rxe_parse_status *status);
-void build_repeat(struct rxe_node *node, int r0, int r1, int flags);
+int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
+                 enum rxe_parse_status *status);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
 const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
@@ -199,12 +200,31 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
             // Alternation: does not really finish; flushes partial
             // results, accumulates them and restarts
             case '|': mpz_mul(x,x,n);
-                      // x is now this alternation's cardinality. Record it:
-                      // enumeration needs to tell an alternation that matches
-                      // nothing (product zero) from one that matches only the
-                      // empty string (product one, no nodes).
+                      // Count the endless positions now rather than tallying
+                      // them as they appear. A quantifier can take one away
+                      // again -- '(a*){0}' is just the empty string -- and a
+                      // recount cannot fall out of step the way a running
+                      // tally did.
+                      alt->ninf = 0;
+                      for ( node = alt->head ; node ; node = node->next )
+                          if (node->is_inf) alt->ninf++;
+                      // x is now this alternation's cardinality, counting the
+                      // finite positions only. Record it: enumeration needs to
+                      // tell an alternation that matches nothing (product
+                      // zero) from one that matches only the empty string
+                      // (product one, no nodes).
                       mpz_set(alt->nitems,x);
-                      mpz_add(ret,ret,x);
+                      // A position that matches nothing empties the whole
+                      // alternation, however endless the rest of it is.
+                      if (!mpz_sgn(x)) alt->ninf = 0;
+                      if (alt->ninf) {
+                          // It has no size to add to the total; it is a
+                          // dimension of its own, indexed above every finite
+                          // alternation rather than after this one.
+                          rxe->ninf++;
+                      } else {
+                          mpz_add(ret,ret,x);
+                      }
                       if (c != '|') return parse_done(x,n,p,str);
                       // Below runs for alternation only. These are already
                       // live, so re-initialising them would orphan the limbs
@@ -266,6 +286,15 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       node->rxe = sub_rxe;
                       mpz_set(node->rxe->nitems,n);
                       mpz_set(node->nitems,n);
+                      // However many endless dimensions the group holds
+                      // inside, it is one of them from out here: a single
+                      // index addresses the whole of it. It contributes a
+                      // dimension rather than a factor, so it must leave the
+                      // running product alone -- its finite total is zero
+                      // when it has no finite alternation, and multiplying
+                      // that in emptied the whole expression.
+                      node->is_inf = rxe_is_infinite(sub_rxe);
+                      if (node->is_inf) mpz_set_ui(n,1);
                       sub_rxe->flags |= RXE_FLAG_CLOSED_BRACKET;
                       if (sub_rxe->status) {
                           rxe->status = sub_rxe->status;
@@ -273,10 +302,22 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       }
                       break;
             // ---------------- Universal quantifiers --------------
-            case '*': rxe->status = RXE_INFINITE;
-                      return parse_done(x,n,p,str);
-            case '+': rxe->status = RXE_INFINITE;
-                      return parse_done(x,n,p,str);
+            // 'a*' is 'a{0,}' and 'a+' is 'a{1,}'. They used to be a hard
+            // error; an unbounded repetition is now a repetition like any
+            // other whose upper bound happens not to exist.
+            case '*':
+            case '+': if (quantifier) {
+                          rxe->status = RXE_NESTED_QUANTIFIERS;
+                          return parse_done(x,n,p,str);
+                      }
+                      if (!alt->tail) {
+                          rxe->status = RXE_LONE_QUANTIFIER;
+                          return parse_done(x,n,p,str);
+                      }
+                      if (!build_repeat(alt->tail,c=='+',RXE_REP_UNBOUNDED,
+                                        flags,&rxe->status))
+                          return parse_done(x,n,p,str);
+                      goto quantified;
             // ------------------- Quantifiers ---------------------
             case '?': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
@@ -292,13 +333,9 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       // failing to clear the quantified node's own characters,
                       // then failing to inherit the enumeration direction --
                       // came to be fixed twice, separately.
-                      build_repeat(alt->tail,0,1,flags);
-                      mpz_set(n,alt->tail->nitems);
-                      mpz_mul(x,x,n);
-                      mpz_set_ui(n,1);   // already live; assign, do not re-init
-                      mpz_set_ui(p,1);
-                      quantifier = 1;
-                      break;
+                      if (!build_repeat(alt->tail,0,1,flags,&rxe->status))
+                          return parse_done(x,n,p,str);
+                      goto quantified;
             case '{': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
                           return parse_done(x,n,p,str);
@@ -310,9 +347,17 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       // The status used to be smuggled back inside 'n', the
                       // mpz_t meant for the result, for want of anywhere else
                       // to put it. There is somewhere else now.
-                      str2 = handle_repeats(alt,n,str,flags,&rxe->status);
+                      str2 = handle_repeats(alt,str,flags,&rxe->status);
                       if (!str2) return parse_done(x,n,p,str);
                       str = str2;
+                      // All three quantifiers land here. An endless one has no
+                      // cardinality to fold into the product: it is a
+                      // dimension of the alternation instead, counted in ninf.
+            quantified: if (alt->tail->is_inf) {
+                          mpz_set_ui(n,1);
+                      } else {
+                          mpz_set(n,alt->tail->nitems);
+                      }
                       mpz_mul(x,x,n);
                       mpz_set_ui(n,1);   // already live; assign, do not re-init
                       mpz_set_ui(p,1);
@@ -467,7 +512,9 @@ const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt,
     }
     node->rxe = rxe->brt->bkref[brnum];
     if (!(node->rxe->flags & RXE_FLAG_CLOSED_BRACKET)) {
-        rxe->status = RXE_INFINITE;
+        // The group has not been closed yet, so this names the group it is
+        // written inside. Nothing finite satisfies that.
+        rxe->status = RXE_RECURSIVE_BACKREF;
         return NULL;
     }
     if (node->rxe->flags & RXE_FLAG_VARIABLE_REPEAT) {
@@ -509,13 +556,15 @@ const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, stru
     }
     struct rxe *base_rxe = rxe->brt->bkref[brnum];
     if (!(base_rxe->flags & RXE_FLAG_CLOSED_BRACKET)) {
-        rxe->status = RXE_INFINITE;
+        rxe->status = RXE_RECURSIVE_BACKREF;
         return NULL;
     }
     struct rxe *new_rxe = rxe_deep_clone(base_rxe);
     node->rxe = new_rxe;
+    node->is_inf = rxe_is_infinite(new_rxe);
+    if (node->is_inf) mpz_set_ui(n,1);
+    else mpz_set(n,new_rxe->nitems);
     mpz_set(node->nitems,new_rxe->nitems);
-    mpz_set(n,new_rxe->nitems);
     return str;
 }
 
@@ -584,11 +633,10 @@ static const char *parse_repeat_params(const char *str, int *r0, int *r1,
     const char *c = memchr(str,',',end-str);
     if (c) {
         if (c+1 == end) {
-            // Nothing after the comma, as in a{1,}: an open-ended repetition,
-            // which denotes an infinite set. Must return here, or the
-            // non-digit check below overwrites this with a less accurate one.
-            *status = RXE_INFINITE;
-            return NULL;
+            // Nothing after the comma, as in 'a{1,}': no upper bound. Must
+            // return here, or the non-digit check below would reject it.
+            *r1 = RXE_REP_UNBOUNDED;
+            return end+1;
         }
         if (c[1]<'0' || c[1]>'9') {
             *status = RXE_BAD_REPETITION;
@@ -618,22 +666,49 @@ static struct rxe *demote_node(struct rxe_node *node, int flags)
     inner->str        = node->str;
     inner->rxe        = node->rxe;
     inner->is_backref = node->is_backref;
+    inner->is_inf     = node->is_inf;
+    inner->is_repeat  = node->is_repeat;
+    inner->rep_min    = node->rep_min;
+    inner->rep_max    = node->rep_max;
+    inner->rep_count  = node->rep_count;
+    inner->rep_alloc  = node->rep_alloc;
+    inner->rep_digit  = node->rep_digit;
     mpz_set(inner->nitems,node->nitems);
     mpz_set(alt->nitems,node->nitems);
     mpz_set(sub->nitems,node->nitems);
+    if (inner->is_inf) { alt->ninf = 1; sub->ninf = 1; }
     node->len = 0;
     node->str = NULL;
     node->rxe = NULL;
     node->is_backref = 0;
+    node->is_inf     = 0;
+    node->is_repeat  = 0;
+    node->rep_min = node->rep_max = node->rep_count = node->rep_alloc = 0;
+    node->rep_digit = NULL;
     return sub;
 }
 
-// Turn the node into a repetition of what it currently holds, r0 to r1 times.
-// This is where the representation stops being one copy per position: see
-// repeat.c. On return node->nitems is the cardinality of the repetition.
+// Turn the node into a repetition of what it currently holds, r0 to r1 times,
+// r1 being RXE_REP_UNBOUNDED for no upper limit. This is where the
+// representation stops being one copy per position: see repeat.c. Returns 0
+// with *status set if the repetition cannot be built.
 
-void build_repeat(struct rxe_node *node, int r0, int r1, int flags)
+int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
+                 enum rxe_parse_status *status)
 {
+    // Repeating something endless -- '(a*)*', or the '(\\d+,)*' that comes of
+    // it in practice -- makes every position a dimension of its own, and the
+    // repeat counts another on top of them, so a block of a given count is
+    // itself endless rather than a finite thing to step past. That holds for
+    // '(a*){2}' as much as for '(a*)*': a bound limits how many dimensions
+    // there are, not how big each one is. Refuse the lot rather than answer
+    // wrongly, which '(a*){2}' did by reporting a set of size zero; see the
+    // TODO. Zero repetitions is the exception, being the empty string and
+    // nothing else.
+    if (node->is_inf && r1 != 0) {
+        *status = RXE_NESTED_UNBOUNDED;
+        return 0;
+    }
     // A variable repetition cannot say which repeat count a backreference
     // into it should mean, so mark the subexpression for
     // handle_backreferences to refuse.
@@ -645,16 +720,16 @@ void build_repeat(struct rxe_node *node, int r0, int r1, int flags)
     if (!node->rxe || node->str || node->is_backref)
         node->rxe = demote_node(node,flags);
     rxe_repeat_make(node,r0,r1);
+    return 1;
 }
 
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, const char *str,
+const char *handle_repeats(struct rxe_alt *alt, const char *str,
                            int flags, enum rxe_parse_status *status)
 {
     int r0, r1;
     const char *end = parse_repeat_params(str,&r0,&r1,status);
     if (!end) return NULL;
-    build_repeat(alt->tail,r0,r1,flags);
-    mpz_set(ret,alt->tail->nitems);
+    if (!build_repeat(alt->tail,r0,r1,flags,status)) return NULL;
     return end;
 }
 

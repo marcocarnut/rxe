@@ -36,6 +36,12 @@
 // sets live in different fields, so testing one against the other is a
 // mistake that should not be able to look plausible.
 
+// The rep_max of a repetition with no upper bound, as in 'a*', 'a+' or
+// 'a{3,}'. Such a repetition is infinite unless the thing it repeats matches
+// nothing at all, in which case only the empty run exists.
+
+#define RXE_REP_UNBOUNDED            (-1)
+
 #define RXE_FLAG_CLOSED_BRACKET      0x0100
 #define RXE_FLAG_HAS_BKRTABLE        0x0200
 #define RXE_FLAG_VARIABLE_REPEAT     0x0400
@@ -52,6 +58,10 @@
 #define RXE_STATUS_LIST(X)                                                     \
     X(RXE_OK,                           "")                                    \
     X(RXE_INFINITE,                     "infinite")                            \
+    X(RXE_RECURSIVE_BACKREF,                                                   \
+      "backreference to the group it is inside")                               \
+    X(RXE_NESTED_UNBOUNDED,                                                    \
+      "repetition of an unbounded expression")                                 \
     X(RXE_TOO_MANY_PARENS,              "extraneous parentheses")              \
     X(RXE_TOO_LITTLE_PARENS,            "missing parentheses")                 \
     X(RXE_LONE_QUANTIFIER,              "nothing before quantifier")           \
@@ -97,7 +107,8 @@ struct rxe_node;    // ...nature of the data structures
 
 struct rxe_alt {
     int nnodes;                   // Number of nodes in this alternation
-    mpz_t nitems;                 // Total number of items in the set
+    int ninf;                     // How many of its nodes are infinite
+    mpz_t nitems;                 // Number of items, counting finite nodes only
     mpz_t start;                  // Start point in the integer mapping
     struct rxe_node *curr;        // Current node being iterated
     struct rxe_node *head;        // Start of the linked list of nodes
@@ -133,10 +144,12 @@ struct rxe_node {
     int   iterator;               // Current item being iterated
     int   is_backref;             // True if this node is a backreference
     int   is_repeat;              // True if this node is a repetition
+    int   is_inf;                 // True if this node has no largest member
     int   rep_min;                // Fewest repetitions, when is_repeat
-    int   rep_max;                // Most repetitions, when is_repeat
+    int   rep_max;                // Most repetitions, or RXE_REP_UNBOUNDED
     int   rep_count;              // Repetitions currently selected
-    mpz_t *rep_digit;             // rep_max indices into rxe, one per position
+    int   rep_alloc;              // How many rep_digit entries are live
+    mpz_t *rep_digit;             // One index into rxe per position
     struct rxe *rxe;              // Pointer to a subexpression or backref
     struct rxe_node *prev;        // Pointer to the next node
     struct rxe_node *next;        // Pointer to the previous node
@@ -156,11 +169,13 @@ struct rxe_backref_table {
 
 struct rxe {
     int nalts;                     // number of alternations in the linked list
+    int ninf;                      // how many of them have no largest member
     enum rxe_parse_status status;  // error code returned during parsing
     struct rxe_alt *head;          // start of the linked list of alternations
     struct rxe_alt *tail;          // end of the linked list of alternations
     struct rxe_alt *curr;          // current item being iterated
-    mpz_t nitems;                  // number of items in the set
+    mpz_t nitems;                  // items in the set, finite alternations only
+    mpz_t index;                   // index the expression currently sits at
     struct rxe_backref_table *brt; // backreferences table (only on root node)
     int flags;                     // miscellaneous flags
 };
@@ -174,6 +189,12 @@ extern void (*rxe_mem_free)(void *);
 struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
 const char *rxe_error_message(struct rxe *rxe);
+
+// Non-zero when the expression describes an infinite set. rxe->nitems then
+// counts only the part of it that is finite, and is not the size of the set;
+// there is no largest index, and rxe_seek accepts any.
+
+int rxe_is_infinite(struct rxe *rxe);
 
 char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);

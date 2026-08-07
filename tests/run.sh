@@ -122,21 +122,19 @@ t_rc 0 '[A-Z]{8}'
 t_rc 0 '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)'
 
 echo "== #1 parse errors must report the right message, not a garbage table index =="
-t_error 'a*'       'infinite'
-t_error 'a+'       'infinite'
 t_error 'a{2}{3}'  'nested quantifiers'
 t_error '(ab'      'missing parentheses'
 t_error 'ab)'      'extraneous parentheses'
 t_error '?a'       'nothing before quantifier'
 t_error '[abc'     'unterminated character class'
 t_error '\1'       'invalid backreference'
-t_error '(a\1)'    'infinite'
+t_error '(a\1)'    'backreference to the group it is inside'
 t_error 'a{3,1}'   'bad repetition parameters'
-# Open-ended repetition denotes an infinite set. The RXE_INFINITE assignment
-# used to fall through into the bad-parameter check and be overwritten.
-t_error 'a{1,}'    'infinite'
-t_error 'a{0,}'    'infinite'
-t_error 'a{5,}'    'infinite'
+# Open-ended repetition denotes an infinite set. It used to be refused; it is
+# now enumerated, and the count reports that there is no count. See #19.
+t_count 'a{1,}'    'infinite'
+t_count 'a{0,}'    'infinite'
+t_count 'a{5,}'    'infinite'
 
 echo "== #2 backreferences must enumerate rather than double-free =="
 t_enum '(a)\1'              'aa/'
@@ -445,6 +443,65 @@ t_selfcheck '(a|bc){1,3}'
 t_selfcheck '(?L)[abc]{0,2}'
 t_selfcheck 'x(ab|c){0,2}y[de]?'
 t_selfcheck '([ab]{1,2}){0,2}'
+
+echo "== #19 sets with no largest member =="
+# '*', '+' and '{n,}' used to be refused outright. There is still no
+# cardinality to report, and the count says so rather than printing the size
+# of the finite part.
+t_count 'a*'        'infinite'
+t_count 'a+'        'infinite'
+t_count 'a{5,}'     'infinite'
+t_count '[ab]*'     'infinite'
+t_count 'x(a*)y'    'infinite'
+t_count 'a|b*'      'infinite'
+t_rc 0 'a*'
+t_rc 0 -e -c 3 'a*'
+# One unbounded quantifier is the repeat counts walked without an upper bound.
+t_opts '/a/aa/aaa/aaaa/'      -e -c 5 'a*'
+t_opts 'a/aa/aaa/aaaa/aaaaa/' -e -c 5 'a+'
+t_opts 'aaaaa/aaaaaa/'        -e -c 2 'a{5,}'
+t_opts 'a/b/aa/ab/ba/bb/'     -e -c 6 '[ab]+'
+t_opts 'xy/xay/xaay/'         -e -c 3 'xa*y'
+t_opts 'xy/xay/xaay/'         -e -c 3 'x(a*)y'
+t_opts 'b/ab/aab/'            -e -c 3 'a*b'
+# Repeating something that matches nothing is finite after all: only the empty
+# run exists, and only when zero repetitions are allowed.
+t_count '[^\x0-\xFF]*'     '1'
+t_enum  '[^\x0-\xFF]*'     '/'
+t_count '[^\x0-\xFF]+'     '0'
+# Two of them are two dimensions, spread over the one index by a pairing
+# function. The order is pinned: it is the interface, as with -k.
+t_opts '/a/b/aa/ab/bb/aaa/aab/abb/bbb/' -e -c 10 'a*b*'
+t_opts '/a/b/aa/ab/bb/'                 -e -c 6 '(a*)(b*)'
+t_opts 'aabb/aaabb/aabbb/aaaabb/'       -e -c 4 'a{2,}b{2,}'
+t_opts '0@a/1@a/0@b/2@a/1@b/0@c/'       -e -c 6 '[0-9]+@[a-z]+'
+# Endless alternations are dovetailed above the finite ones rather than laid
+# end to end, which would mean the second never started.
+t_opts 'a//b/bb/bbb/'   -e -c 5 'a|b*'
+t_opts 'a//b/bb/bbb/'   -e -c 5 'b*|a'
+t_opts '//a/b/aa/'      -e -c 5 'a*|b*'
+# Direction still reaches inside.
+t_opts '/a/b/aa/ba/ab/bb/' -e -c 7 '(?L)[ab]*'
+# Seeking is independent of iterating, and there is no end to run past.
+t_opts 'aaaaaaaaaa/'       -z -f 10 'a*'
+t_opts 'aab/'              -z -f 2  'a*b'
+t_opts 'abb/'              -z -f 8  'a*b*'
+t_rc 0 -z -f 100000 'a*b*'
+# Repeating something endless without limit is refused rather than answered
+# wrongly. See the TODO.
+t_error '(a*)*'      'repetition of an unbounded expression'
+t_error '(a*)+'      'repetition of an unbounded expression'
+t_error '(\d+,)*'    'repetition of an unbounded expression'
+t_error '(a*){2}'    'repetition of an unbounded expression'
+t_error '(a*)?'      'repetition of an unbounded expression'
+# Except zero repetitions, which is the empty string and nothing else.
+t_count '(a*){0}'    '1'
+t_enum  '(a*){0}'    '/'
+t_error 'a**'        'nested quantifiers'
+t_error '*a'         'nothing before quantifier'
+# -k and -r need a domain to work over and there is not one.
+t_rc 1 -k x 'a*'
+t_rc 1 -r   'a*'
 
 echo "== known divergences, still open =="
 

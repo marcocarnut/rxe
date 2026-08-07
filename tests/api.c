@@ -86,9 +86,9 @@ int main(void)
 
     // 5. Errors are reported, not crashed on. rxe_error_message() indexes a
     //    table with rxe->status, which rxe_new() once left uninitialised.
-    rxe = rxe_parse("a*", 0);
-    check_int("a* is rejected", RXE_INFINITE, rxe_error(rxe));
-    check("its message", "infinite", rxe_error_message(rxe));
+    rxe = rxe_parse("a{3,1}", 0);
+    check_int("a{3,1} is rejected", RXE_BAD_REPETITION, rxe_error(rxe));
+    check("its message", "bad repetition parameters", rxe_error_message(rxe));
     rxe_free(rxe);
 
     rxe = rxe_parse("abc", 0);
@@ -174,6 +174,66 @@ int main(void)
         // cardinality as the original rather than an empty or aliased one.
         check_int("the clone has the same cardinality as the original", 36,
                   (long)mpz_get_ui(rxe->nitems));
+        rxe_free(rxe);
+    }
+
+    // 10. Sets with no largest member. rxe_is_infinite is the only way to
+    //     tell: nitems counts the finite alternations, so for 'a*' it is zero
+    //     and for 'a|b*' it is one, neither of which is the size of the set.
+    {
+        struct rxe *rxe = rxe_parse("a*", 0);
+        char buf[64];
+        mpz_t pos;
+        check_int("a* parses", RXE_OK, rxe_error(rxe));
+        check_int("a* is infinite", 1, rxe_is_infinite(rxe) != 0);
+        mpz_init(pos);
+        // Every index is valid, however large, so seek never runs off the end.
+        mpz_set_ui(pos, 40);
+        check_int("seeking far into it succeeds", 0, rxe_seek(rxe, pos));
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check_int("and gives a run of that length", 40, (int)strlen(buf));
+        // Iteration cannot carry out of an infinite set, so rxe_next stays
+        // true however long it is driven.
+        check_int("iterating past it never wraps", 1, rxe_next(rxe) ? 1 : 0);
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check_int("and steps to the next length", 41, (int)strlen(buf));
+        mpz_clear(pos);
+        rxe_free(rxe);
+
+        rxe = rxe_parse("abc", 0);
+        check_int("a finite set is not infinite", 0, rxe_is_infinite(rxe));
+        rxe_free(rxe);
+    }
+
+    // 11. Two unbounded quantifiers are two dimensions spread over the one
+    //     index by a pairing function, which must be onto: every pair of
+    //     lengths has to be reachable, or part of the set is unreachable.
+    {
+        struct rxe *rxe = rxe_parse("a*b*", 0);
+        char buf[64];
+        mpz_t pos;
+        int i, seen[6][6];
+        memset(seen, 0, sizeof(seen));
+        mpz_init(pos);
+        for (i = 0; i < 400; i++) {
+            const char *p;
+            int na = 0, nb = 0;
+            mpz_set_ui(pos, i);
+            check_int("seek into a*b* succeeds", 0, rxe_seek(rxe, pos));
+            rxe_current(buf, sizeof(buf) - 1, rxe);
+            for (p = buf; *p == 'a'; p++) na++;
+            for (; *p == 'b'; p++) nb++;
+            if (*p) { check("a*b* generated a non-member", "", buf); break; }
+            if (na < 6 && nb < 6) seen[na][nb]++;
+        }
+        {
+            int missing = 0, na, nb;
+            for (na = 0; na < 6; na++)
+                for (nb = 0; nb < 6; nb++)
+                    if (!seen[na][nb]) missing++;
+            check_int("every (a,b) pair up to 5 each is reached", 0, missing);
+        }
+        mpz_clear(pos);
         rxe_free(rxe);
     }
 

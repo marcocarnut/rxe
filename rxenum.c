@@ -121,6 +121,11 @@ int main(int argc, char **argv)
         die(1,"-r and -k are mutually exclusive: -k already visits every "
               "member exactly once\n");
 
+    if (rxe_is_infinite(rxe)) {
+        // Both need a domain to work over, and there is not one.
+        if (key)        die(1,"-k needs a finite set to permute\n");
+        if (have_random) die(1,"-r needs a finite set to choose from\n");
+    }
     struct rxe_permutation *perm = NULL;
     if (key) perm = rxe_permutation_new(rxe->nitems,key);
 
@@ -148,6 +153,12 @@ int main(int argc, char **argv)
         mpz_init(zero);
         for (;;) {
             mpz_urandomm(from,state,rxe->nitems);
+            // enumerate() takes a number in the caller's numbering, which
+            // starts at 'offset', and subtracts it back off. Without this the
+            // random choice was one too low, and could be -1: seeking to that
+            // used to leave the expression at whatever it already held, so
+            // '-r' quietly returned the first element instead of failing.
+            mpz_add_ui(from,from,offset);
             enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep,NULL);
             mpz_sub_ui(count,count,1);
             if (!mpz_sgn(count)) {
@@ -174,9 +185,15 @@ int main(int argc, char **argv)
     
     if (do_enumerate) {
         // An empty set enumerates to nothing at all; there is no element to
-        // seek to, so skip straight past.
-        if (mpz_sgn(rxe->nitems))
+        // seek to, so skip straight past. An infinite one always has a first
+        // element however empty its finite part is.
+        if (mpz_sgn(rxe->nitems) || rxe_is_infinite(rxe))
             enumerate(rxe,options,offset,from,count,sep,perm);
+    } else if (rxe_is_infinite(rxe)) {
+        // There is no number to print. Say so rather than print the size of
+        // the finite part, which would be a smaller number than the truth by
+        // an unbounded amount.
+        printf("infinite\n");
     } else {
         print_grouped(stdout,NULL,rxe->nitems,"\n",sep);
         // The logarithms are meaningless for an empty set, and log(0) is
@@ -215,6 +232,10 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
     if (mpz_sgn(cnt)) {
         mpz_add(final,from,cnt);
         mpz_sub_ui(final,final,1);
+    } else if (rxe_is_infinite(rxe)) {
+        // No last element to count digits up to. Leave room for a wide
+        // number: this only sizes the field the index is printed in.
+        mpz_set_ui(final,1000000000);
     } else {
         mpz_set(final,rxe->nitems);
     }
@@ -269,11 +290,11 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
          } else {
              if (!rxe_next(rxe)) break;
          }
+         if (flags & ENUM_ONCE) break;
          if (mpz_sgn(cnt)) {
              mpz_sub_ui(cnt,cnt,1);
              if (!mpz_sgn(cnt)) break;
          }
-         if (flags & ENUM_ONCE) break;
     }
     // -r calls this once per sample, so leaving these behind accumulated.
     mpz_clear(idx);

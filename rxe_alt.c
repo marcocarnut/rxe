@@ -27,6 +27,7 @@ struct rxe_alt *rxe_new_alt(struct rxe *rxe)
     alt->prev = rxe->tail;
     mpz_init(alt->nitems);
     mpz_init(alt->start);
+    alt->ninf = 0;
     rxe->nalts++;
     if (rxe->tail)  rxe->tail->next = alt;
     rxe->tail = alt;
