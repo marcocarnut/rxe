@@ -114,6 +114,14 @@ int main(int argc, char **argv)
 
     struct rxe *rxe;
     if (!argv[optind]) die(1,"missing regex\n");
+    // GNU getopt reorders argv so that options may follow the regex; the musl
+    // and BSD ones stop at the first thing that is not an option, as POSIX
+    // says. That difference used to make 'rxenum -z <regex> -f 3999' quietly
+    // ignore the -f and print a count instead, which is a worse answer than
+    // refusing. The usage line has always put the options first.
+    if (argv[optind+1])
+        die(1,"unexpected argument '%s': options must come before the regex\n",
+            argv[optind+1]);
     rxe = rxe_parse(argv[optind],flags);
     if (rxe_error(rxe)) {
         fprintf(stderr,"%s\n",rxe_error_message(rxe));

@@ -110,13 +110,17 @@ check "README approximations" \
       '208,827,064,576 ~ 10^11.3198 ~  2^37.6035' \
       "$("$RXENUM" '[A-Z]{8}' | tr '\n' ' ' | sed 's/ *$//')"
 check "roman numeral 3999" 'MMMCMXCIX' \
-      "$("$RXENUM" -z 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)(X{0,3}|XL|LX{0,3}|XC)(I{0,3}|IV|VI{0,3}|IX)' -f 3999)"
+      "$("$RXENUM" -z -f 3999 'M{0,3}(C{0,3}|CD|DC{0,3}|CM)(X{0,3}|XL|LX{0,3}|XC)(I{0,3}|IV|VI{0,3}|IX)')"
 # The man page shows this as the documented duplicate-generation example.
 t_opts '1 /2 a/3 a/4 aa/' -n '(a?){2}'
 
 echo "== #1 uninitialised rxe->status: valid input must not be reported as an error =="
 t_count 'abc'   '1'
 t_count 'a'     '1'
+# Options come before the regex. GNU getopt permutes argv so that the other
+# order also worked; musl and BSD do not, so it is now refused outright rather
+# than silently dropping the option.
+t_rc 1 '[ab]' -f 0
 t_rc 0 'abc'
 t_rc 0 '[A-Z]{8}'
 t_rc 0 '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)'
@@ -261,7 +265,7 @@ t_opts '5 ae/6 af/7 ag/' -n -f 5 -c 3 '[a-z]{2}'
 t_count 'ab'       '1'
 t_first '2' -~ '(?i:a)'
 t_rc 1 -c 0 '[ab]'
-t_rc 1 '[ab]' -f 0
+t_rc 1 -f 0 '[ab]'
 
 echo "== #5 a caret is special only as a class's first character =="
 t_count '[a^b]'     '3'
