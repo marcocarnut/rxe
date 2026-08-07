@@ -220,15 +220,34 @@ int main(int argc, char **argv)
         // The logarithms are meaningless for an empty set, and log(0) is
         // -infinity, which mpz_pow_ui turns into a GMP abort.
         if (mpz_sgn(rxe->nitems)) {
-            double log_d = log(mpz_get_d(rxe->nitems));
+            // Take the base-two logarithm from the number's own scale rather
+            // than by converting it to a double. mpz_get_d overflows to
+            // infinity past about 1.8e308 -- a mere 309 digits, which this
+            // library reaches constantly -- and infinity then flows into the
+            // exponent of mpz_pow_ui below, where the cast to unsigned long is
+            // undefined: on one platform it yielded a harmless value, on
+            // another an astronomical one that made GMP allocate until it
+            // aborted. mpz_get_d_2exp returns a mantissa in [0.5,1) and the
+            // binary exponent separately, so the logarithm is exact in its
+            // integer part however large the number.
+            signed long e2;
+            double mant = mpz_get_d_2exp(&e2,rxe->nitems);
+            double log2 = log(mant)/log(2) + (double)e2;
             int n, base[] = { 10, 2 };
+            double per[] = { log2*log(2)/log(10), log2 };
             int nbases = sizeof(base)/sizeof(base[0]);
             for (n=0;n<nbases;n++) {
-                double l = log_d/log(base[n]);
+                double l = per[n];
+                // Round to the nearest integer exponent and test exactness
+                // against base^that. l is finite now, so the exponent is a
+                // sane count -- a few tens of thousands at most -- and the
+                // power is cheap to form; it was only the infinite exponent
+                // that was ruinous.
+                unsigned long e = (l >= 0 && l < 1e9) ? (unsigned long)(l+0.5) : 0;
                 mpz_t num,b;
                 mpz_init(num);
                 mpz_init_set_ui(b,base[n]);
-                mpz_pow_ui(num,b,l);
+                mpz_pow_ui(num,b,e);
                 printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
                 printf("%2d^%g\n",base[n],l);
                 mpz_clear(num);

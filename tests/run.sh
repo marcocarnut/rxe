@@ -408,6 +408,15 @@ rx20k=$("$RXENUM" -~ '[a-z]{1,20000}' | head -1)
 check "[a-z]{1,20000} has 28300 digits" '28300' "${#rx20k}"
 check "[a-z]{1,20000} counts correctly" '696a9232d95fe0ba2cccfbbbf96ed889' \
       "$(printf '%s' "$rx20k" | md5sum | cut -d' ' -f1)"
+# The approximate-power lines must be computed from the number's scale, not by
+# converting it to a double: a cardinality this large overflows a double to
+# infinity, which used to flow into mpz_pow_ui as a garbage exponent -- a
+# no-op on one libc, a GMP abort on another. The full count run must exit
+# cleanly and report a sane power of ten (28,300 digits is about 10^28299).
+"$RXENUM" '[a-z]{1,20000}' >/dev/null 2>&1
+check "a 28300-digit count does not abort" '0' "$?"
+check "and reports a sane power of ten" '~ 10^28299.5' \
+      "$("$RXENUM" '[a-z]{1,20000}' 2>/dev/null | sed -n '2p')"
 # rxenum caps a printed element at MAXSTRLEN, so stay inside it: the last of
 # these is exactly the longest element the program will print in full.
 check "a{1,100000} seeks to the 90th" "$(printf 'a%.0s' $(seq 1 90))" \
