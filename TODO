@@ -160,6 +160,50 @@ LONG-TERM TO-DOs
   traversal contract and no stability promise, and a separate consumer would
   be chasing a moving target through the repetition rework.
 
+> Run code on each visited element, so librxe is a brute-forcing framework
+  rather than a generator someone pipes into. Today the pattern is
+  'rxenum <regex> | ./filter': the generator writes strings, a separate
+  process reads and tests them. That is the thing to replace. A regex is a
+  keyspace -- a mask attack, a known-prefix, a structured format are all just
+  regexes, and strictly more expressive than the mask DSLs the password
+  crackers ship, since alternation, backreferences and (?N) subroutines
+  come for free -- and a test is a function of the candidate. The library
+  already holds both halves; what is missing is the seam where they meet.
+
+  The CPU half is nearly free and could be done at any time. It is
+  rxe_iterate with a callback in place of the caller's print loop:
+  visit(index, str, len, ctx), with the return value steering the walk --
+  continue, stop, or a verdict the library tallies. That alone beats the
+  pipe on three counts. A billion candidates do not cross a process boundary,
+  get serialised, and get parsed back. The test can halt the search the
+  instant it succeeds, which an upstream generator in a pipe cannot be told
+  to do. And because the visitor composes with rxe_seek, the same callback
+  driven over disjoint index ranges is an embarrassingly parallel search
+  across cores or machines, with the keyed permutation randomising the order
+  without losing the partition.
+
+  The GPU half is the prize and the real work, and it is the consumer the
+  JIT/GPU entry above was always for. Two kernels compose: generate(index)
+  -> candidate, then test(candidate) -> verdict, run as
+  test(current(seek(pi(base + t)))) for thread t. The generator must run on
+  the device, which means the seek arithmetic -- mixed radix for the finite
+  part, the length counting for the rest -- executes in the kernel over
+  fixed-width integers with no pointers and no malloc: precisely the parse
+  tree flattened to a bytecode and the arithmetic shim, both already on this
+  list, so this does not add a prerequisite but names what they are for. The
+  open questions are the test's ABI (supplied as source compiled at runtime,
+  precompiled, or a restricted DSL?), whether it sees the flat string or the
+  structured choice per position, warp divergence when candidates differ in
+  length (none for the fixed-length '[a-z]{8}' case that dominates brute
+  force, real for the variable-length ones), and how a hit on one thread
+  stops the rest.
+
+  What this is, put plainly, is john or hashcat with the generator and the
+  test unwelded: any structured keyspace a regex can describe, against any
+  test a kernel can run, distributable for free through seek and the
+  permutation. Large, and worth it, but it wants a design of its own before
+  a line of it is written -- recorded here, not started.
+
 > Binary tree over alternations, to replace the linear scan in rxe_seek.
   Deferred, and now probably not worth doing at all: 20,000 hand-written
   alternatives already parse and seek in 0.02s, and enumerate in full in
