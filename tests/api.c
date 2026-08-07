@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "rxe.h"
+#include "lens.h"
 
 static int failures = 0;
 
@@ -233,6 +234,65 @@ int main(void)
                     if (!seen[na][nb]) missing++;
             check_int("every (a,b) pair up to 5 each is reached", 0, missing);
         }
+        mpz_clear(pos);
+        rxe_free(rxe);
+    }
+
+    // 12. Counting by length. rxe_count_at_length answers a question a
+    //     cardinality cannot -- how many members are this long -- and it is
+    //     what puts an infinite set in shortest-first order.
+    {
+        struct rxe *rxe = rxe_parse("(\\d+,)*", 0);
+        mpz_t c;
+        int L;
+        // 1, 0, 10, 100, 1100: nothing of length one, ten one-digit lists,
+        // a hundred two-digit ones, then a thousand three-digit lists plus a
+        // hundred pairs of one-digit ones.
+        long want[] = { 1, 0, 10, 100, 1100 };
+        check_int("(\\d+,)* parses", RXE_OK, rxe_error(rxe));
+        check_int("and is enumerated shortest first", 1,
+                  rxe_is_shortlex(rxe) != 0);
+        mpz_init(c);
+        for (L = 0; L < 5; L++) {
+            char what[64];
+            rxe_count_at_length(c, rxe, L);
+            sprintf(what, "(\\d+,)* has %ld members of length %d", want[L], L);
+            check_int(what, want[L], (long)mpz_get_ui(c));
+        }
+        mpz_clear(c);
+        rxe_free(rxe);
+    }
+
+    // 13. A backreference ties two positions' lengths together, which the
+    //     convolution the counts are built from cannot express, so such an
+    //     expression keeps the diagonal order rather than being refused.
+    {
+        struct rxe *rxe = rxe_parse("([ab]+)\\1", 0);
+        char buf[64];
+        mpz_t pos;
+        check_int("a backreferencing infinite set still parses", RXE_OK,
+                  rxe_error(rxe));
+        check_int("it is infinite", 1, rxe_is_infinite(rxe) != 0);
+        check_int("but not shortest first", 0, rxe_is_shortlex(rxe));
+        mpz_init_set_ui(pos, 3);
+        check_int("and is still fully addressable", 0, rxe_seek(rxe, pos));
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check("giving a doubled string", "abab", buf);
+        mpz_clear(pos);
+        rxe_free(rxe);
+    }
+
+    // 14. Enumeration by length must not disturb a finite expression, whose
+    //     order the documented radix conversion depends on.
+    {
+        struct rxe *rxe = rxe_parse("([0-9A-F]{4} ){2}", 0);
+        char buf[64];
+        mpz_t pos;
+        check_int("a finite set is not shortest first", 0, rxe_is_shortlex(rxe));
+        mpz_init_set_ui(pos, 3735928559UL);
+        check_int("seek succeeds", 0, rxe_seek(rxe, pos));
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check("place value still converts radix", "DEAD BEEF ", buf);
         mpz_clear(pos);
         rxe_free(rxe);
     }

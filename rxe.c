@@ -24,6 +24,7 @@
 #include "bkreftbl.h"
 #include "repeat.h"
 #include "pair.h"
+#include "lens.h"
 #include "parse.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
@@ -88,6 +89,41 @@ int rxe_is_infinite(struct rxe *rxe)
     return rxe && rxe->ninf > 0;
 }
 
+int rxe_is_shortlex(struct rxe *rxe)
+{
+    return rxe && (rxe->flags & RXE_FLAG_SHORTLEX) != 0;
+}
+
+// A backreference's length is whatever the group it names turned out to be,
+// so the positions of a concatenation stop being independent and the
+// convolution the length counts are built from no longer describes the set.
+// Rather than refuse such an expression, it keeps the diagonal order.
+
+static int tree_has_backref(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    struct rxe_node *node;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        for ( node = alt->head ; node ; node = node->next ) {
+            // Do not follow a backreference: it points at a group owned
+            // elsewhere in the tree, and following it would go round in
+            // circles.
+            if (node->is_backref) return 1;
+            if (node->rxe && tree_has_backref(node->rxe)) return 1;
+        }
+    return 0;
+}
+
+static void mark_shortlex(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    struct rxe_node *node;
+    rxe->flags |= RXE_FLAG_SHORTLEX;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        for ( node = alt->head ; node ; node = node->next )
+            if (node->rxe && !node->is_backref) mark_shortlex(node->rxe);
+}
+
 // The i-th alternation that has no largest member, counted in written order.
 
 static struct rxe_alt *rxe_nth_inf_alt(struct rxe *rxe, unsigned long i)
@@ -115,6 +151,7 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
             // significance, so this walks them in string order whichever way
             // round the odometer runs.
             int i;
+            int shortlex = rxe->flags & RXE_FLAG_SHORTLEX;
             for ( i = 0 ; i < node->rep_count ; i++ ) {
                 char *new_str;
                 // An unbounded repetition can select a run far longer than
@@ -122,7 +159,14 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
                 // characters -- so stop as soon as there is no room, rather
                 // than generating the rest of it to throw away.
                 if (maxlen <= 0) break;
-                if (rxe_seek(node->rxe,node->rep_digit[i])) break;
+                // Addressed by the length it takes and its place among the
+                // members of that length, rather than by one index into the
+                // body's whole ordering, which an endless body does not have
+                // in a useful order.
+                if (shortlex
+                        ? rxe_seek_at_length(node->rxe,node->rep_len[i],
+                                             node->rep_digit[i])
+                        : rxe_seek(node->rxe,node->rep_digit[i])) break;
                 new_str = rxe_current(str,maxlen,node->rxe);
                 maxlen -= new_str - str;
                 str = new_str;
@@ -276,6 +320,11 @@ static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
 int rxe_seek(struct rxe *rxe, mpz_t pos)
 {
     if (!rxe || mpz_sgn(pos) < 0) return 1;
+    if (rxe->flags & RXE_FLAG_SHORTLEX) {
+        int rc = rxe_seek_shortlex(rxe,pos);
+        if (!rc) mpz_set(rxe->index,pos);
+        return rc;
+    }
     struct rxe_alt *alt = NULL;
     int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
     int rc;
@@ -324,6 +373,11 @@ struct rxe *rxe_parse(const char *str, int flags)
     rxe->flags |= RXE_FLAG_HAS_BKRTABLE;
     if (*str=='^') str++;
     parse(rxe,rxe->nitems,str,flags,0);
+    // Only an infinite expression is enumerated by length; a finite one is a
+    // numeral and keeps the order it has always had, which the radix
+    // conversion in the manual page depends on.
+    if (!rxe->status && rxe_is_infinite(rxe) && !tree_has_backref(rxe))
+        mark_shortlex(rxe);
     return rxe;
 }
 
@@ -339,6 +393,7 @@ struct rxe *rxe_new(void)
     rxe->flags = 0;
     mpz_init(rxe->nitems);
     mpz_init(rxe->index);
+    rxe_lens_init(&rxe->lens);
     return rxe;
 }
 
@@ -407,6 +462,7 @@ void rxe_free(struct rxe *rxe)
         rxe_backref_table_free(rxe->brt);
     mpz_clear(rxe->nitems);
     mpz_clear(rxe->index);
+    rxe_lens_free(&rxe->lens);
     rxe_mem_free(rxe);
 }
 

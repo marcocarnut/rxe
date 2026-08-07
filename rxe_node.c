@@ -16,6 +16,7 @@
  
  #include "rxe.h"
 #include "repeat.h"
+#include "lens.h"
 
 struct rxe_node *rxe_new_node(struct rxe_alt *alt)
 {
@@ -30,8 +31,12 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->rep_min = node->rep_max = node->rep_count = 0;
     node->rep_alloc = 0;
     node->rep_digit = NULL;
+    node->rep_len = NULL;
     node->str = NULL;
     node->rxe = NULL;
+    node->owner = alt;
+    rxe_lens_init(&node->lens);
+    rxe_lens_init(&node->rest);
     alt->nnodes++;
     if (alt->tail) alt->tail->next = node;
     alt->tail = node;
@@ -67,6 +72,8 @@ void rxe_free_node(struct rxe_node *node)
 {
     rxe_free_node_data(node);
     mpz_clear(node->nitems);
+    rxe_lens_free(&node->lens);
+    rxe_lens_free(&node->rest);
     rxe_mem_free(node);
 }
 

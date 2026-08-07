@@ -474,11 +474,11 @@ t_count '[^\x0-\xFF]+'     '0'
 t_opts '/a/b/aa/ab/bb/aaa/aab/abb/bbb/' -e -c 10 'a*b*'
 t_opts '/a/b/aa/ab/bb/'                 -e -c 6 '(a*)(b*)'
 t_opts 'aabb/aaabb/aabbb/aaaabb/'       -e -c 4 'a{2,}b{2,}'
-t_opts '0@a/1@a/0@b/2@a/1@b/0@c/'       -e -c 6 '[0-9]+@[a-z]+'
+t_opts '0@a/0@b/0@c/0@d/0@e/0@f/'       -e -c 6 '[0-9]+@[a-z]+'
 # Endless alternations are dovetailed above the finite ones rather than laid
 # end to end, which would mean the second never started.
-t_opts 'a//b/bb/bbb/'   -e -c 5 'a|b*'
-t_opts 'a//b/bb/bbb/'   -e -c 5 'b*|a'
+t_opts '/a/b/bb/bbb/'   -e -c 5 'a|b*'
+t_opts '/b/a/bb/bbb/'   -e -c 5 'b*|a'
 t_opts '//a/b/aa/'      -e -c 5 'a*|b*'
 # Direction still reaches inside.
 t_opts '/a/b/aa/ba/ab/bb/' -e -c 7 '(?L)[ab]*'
@@ -489,14 +489,35 @@ t_opts 'abb/'              -z -f 8  'a*b*'
 t_rc 0 -z -f 100000 'a*b*'
 # Repeating something endless without limit is refused rather than answered
 # wrongly. See the TODO.
-t_error '(a*)*'      'repetition of an unbounded expression'
-t_error '(a*)+'      'repetition of an unbounded expression'
-t_error '(\d+,)*'    'repetition of an unbounded expression'
-t_error '(a*){2}'    'repetition of an unbounded expression'
-t_error '(a*)?'      'repetition of an unbounded expression'
-# Except zero repetitions, which is the empty string and nothing else.
+t_error '(a*)*'      'unbounded repetition of a possibly empty expression'
+t_error '(a*)+'      'unbounded repetition of a possibly empty expression'
+t_error '(a?)+'      'unbounded repetition of a possibly empty expression'
+t_error '((a|)b*)*'  'unbounded repetition of a possibly empty expression'
+# Zero repetitions of one is the empty string and nothing else.
 t_count '(a*){0}'    '1'
 t_enum  '(a*){0}'    '/'
+# A body that always spends at least one character is countable by length,
+# and this is the shape that matters: a comma-separated list.
+t_count '(\d+,)*'    'infinite'
+t_opts  '/0,/1,/2,/3,/4,/'  -e -c 6 '(\d+,)*'
+# Counting by length is what makes this reachable: the first two-element list
+# sits at index 1,111 -- lengths 0,2,3 hold 1+10+100 members and length 4 holds
+# 1000 one-element lists before the two-element ones start. Under the diagonal
+# pairing the same string sat at 349, but a five-element list sat at 5.8e18.
+t_opts  '000,/'  -e -z -f 111  '(\d+,)*'
+t_opts  '0,0,/'  -e -z -f 1111 '(\d+,)*'
+# Deep seeks must be arithmetic, not a walk. Under the diagonal pairing a
+# five-element list sat at 5.8e18 and could not be reached at all.
+t_opts  '2,415,789,/'          -e -z -f 2000000000 '(\d+,)*'
+t_opts  '587145910526315789,/' -e -z -f 1000000000000000000 '(\d+,)*'
+t_opts  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbb/' -e -z -f 1000 'a*b*'
+check "(\d+,)* has 1100 members of length 4" '1100' \
+      "$("$RXENUM" -e -c 1300 '(\d+,)*' | awk 'length($0)==4' | wc -l | tr -d ' ')"
+# A bounded repetition of an endless body is countable too: the bound limits
+# how many dimensions there are, and each is finite once the length is fixed.
+t_count '(a*){2}'    'infinite'
+t_opts  '/a/a/aa/aa/aa/'    -e -c 6 '(a*){2}'
+t_opts  '//a/aa/aaa/'       -e -c 5 '(a*)?'
 t_error 'a**'        'nested quantifiers'
 t_error '*a'         'nothing before quantifier'
 # -k and -r need a domain to work over and there is not one.

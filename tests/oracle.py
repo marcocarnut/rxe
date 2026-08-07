@@ -70,6 +70,14 @@ INFINITE = [
     (r"a?b*", 5, 400), (r"a{2,}b{2,}", 6, 400), (r"a*|b*", 5, 400),
     # three, so it is nested twice
     (r"a*b*c*", 4, 800), (r"[ab]*[cd]*[ef]*", 2, 600),
+    # a repetition whose body is itself unbounded, which counting by length is
+    # what makes reachable at all
+    (r"(\d+,)*", 4, 1300), (r"(ab,)*", 6, 200), (r"([ab]+,)*", 4, 400),
+    (r"(a*){2}", 6, 200), (r"(a*)?", 6, 200), (r"(a*|b){1,2}", 4, 200),
+    # backreferences tie two positions' lengths together, so these keep the
+    # diagonal order rather than being refused. Still a bijection onto the
+    # whole set, which is what the checks below actually test.
+    (r"([ab]+)\1", 4, 200), (r"([0-9]+)-\1", 3, 200), (r"(a)\1a*", 6, 200),
 ]
 
 # rxenum prints at most this many characters of an element and says nothing
@@ -134,7 +142,19 @@ def check_infinite(pat, maxlen, prefix):
                        f" expected {gen[i]!r}")
             break
 
-    # 4. there is no cardinality to report, and it must say so rather than
+    # 4. shortest first, where that is claimed. The whole point of counting
+    #    by length is that the lengths come out non-decreasing, so this is the
+    #    property to check rather than any particular sequence.
+    rc, out = run(["-Q", pat])
+    if rc == 0 and out.strip() == "shortlex":
+        lens = [len(g) for g in gen]
+        for i in range(1, len(lens)):
+            if lens[i] < lens[i - 1]:
+                bad.append(f"FAIL  {pat}: element {i} has length {lens[i]}"
+                           f" after one of length {lens[i-1]}")
+                break
+
+    # 5. there is no cardinality to report, and it must say so rather than
     #    report the size of the finite part
     rc, out = run(["-~", pat])
     if out.split("\n")[0].strip() != "infinite":

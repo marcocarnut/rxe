@@ -164,6 +164,11 @@ instead of in index order, visiting every member exactly once. See
 PERMUTED ORDER below. Implies \fB-e\fR, and cannot be combined with \fB-r\fR.
 .TP
 .B
+\-Q
+Print which order the set is enumerated in -- "shortlex", "diagonal" or
+"place value" -- and do nothing else. See ENUMERATION ORDER and INFINITE SETS.
+.TP
+.B
 \-r
 Randomly choose an element of the set. You can get several random choices
 by setting
@@ -260,11 +265,9 @@ rxenum -z -f 1000 'a*b*'
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbb
 .RE
 
-An expression with more than one unbounded quantifier has more than one
-dimension with no largest value, and place value cannot carry that: counting
-would spend eternity in the first dimension and never reach the second. The
-index is spread across them by the Cantor pairing function instead, which
-walks diagonals so that all of them grow together:
+Members come out shortest first. Within a length, the more significant
+positions take as much of it as they can before the less significant ones do,
+and within a given division the ordinary place value applies:
 
 .RS
 rxenum -e -c 10 'a*b*'
@@ -272,30 +275,39 @@ rxenum -e -c 10 'a*b*'
 (empty) a b aa ab bb aaa aab abb bbb
 .RE
 
-which is shortest first and alphabetically within a length. That exact
-correspondence holds when each dimension's index is the length it
-contributes, as it is above. When the repeated unit has more than one member,
-an index of n stands for a string of about log(n) characters, so the
-diagonals slant across the lengths rather than following them, and the order
-is merely diagonal rather than strictly shortest first. Every member is still
-reached in finite time, which is the property that matters.
+That order is what makes an infinite set practical rather than merely
+enumerable. \fBrxenum\fR works out how many members an expression has of each
+length rather than in total, which a cardinality cannot say, and then walks
+the lengths in turn. The counts are worked out only as far as they are asked
+for, so an expression such as "[a-z]{1,20000}a*" costs nothing until you
+enumerate strings twenty thousand characters long.
 
-Alternations that are infinite are enumerated after every finite one, and
-dovetailed with each other rather than laid end to end, which would mean the
-second never started:
+A comma-separated list is the shape where this tells:
 
 .RS
-rxenum -e -c 5 'a|b*'
+rxenum -e -c 6 '(\\d+,)*'
 .br
-a (empty) b bb bbb
+(empty) 0, 1, 2, 3, 4,
 .RE
 
-Repeating something that is itself unbounded, as in "(a*)*" or "(\\d+,)*", is
-refused. Every position would be a dimension of its own and the repeat count
-another on top of them, so a block of a given count would itself be endless
-rather than a finite thing to step past. The same goes for a bounded
-repetition of one, such as "(a*){2}": a bound limits how many dimensions
-there are, not how big each one is.
+with the first two-element list at index 1,111, after the one empty string,
+the ten one-digit lists, the hundred two-digit ones and the thousand
+three-digit ones.
+
+One shape is refused: an unbounded repetition whose body can match nothing at
+all, as in "(a*)*" or "(a?)+". Such an expression derives the empty string
+infinitely many ways, so the number of members of a given length is not a
+number and there is nothing to count. Perl's matcher refuses an empty loop
+body for the same reason. The restriction is narrow, and deliberately so:
+"(\\d+,)*" spends at least two characters per repetition and is perfectly
+countable.
+
+A backreference is the exception to all of the above. Its length is whatever
+the group it names turned out to be, so the positions of a concatenation stop
+being independent and their lengths can no longer be counted separately. Such
+an expression is enumerated in a different order -- a diagonal walk over the
+unbounded quantifiers, which still reaches every member in finite time but
+not shortest first.
 
 .B -r
 and

@@ -15,6 +15,7 @@
  */
  
 #include "rxe.h"
+#include "lens.h"
 #include "rxe_alt.h"
 #include "rxe_node.h"
 
@@ -28,6 +29,8 @@ struct rxe_alt *rxe_new_alt(struct rxe *rxe)
     mpz_init(alt->nitems);
     mpz_init(alt->start);
     alt->ninf = 0;
+    alt->owner = rxe;
+    rxe_lens_init(&alt->lens);
     rxe->nalts++;
     if (rxe->tail)  rxe->tail->next = alt;
     rxe->tail = alt;
@@ -45,5 +48,6 @@ void rxe_free_alt(struct rxe_alt *alt)
     }
     mpz_clear(alt->start);
     mpz_clear(alt->nitems);
+    rxe_lens_free(&alt->lens);
     rxe_mem_free(alt);
 }

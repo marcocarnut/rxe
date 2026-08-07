@@ -80,7 +80,15 @@ void rxe_repeat_nitems(mpz_t out, const mpz_t base, int r0, int r1)
 
 int rxe_repeat_is_infinite(struct rxe_node *node)
 {
-    return node->rep_max == RXE_REP_UNBOUNDED && mpz_sgn(node->rxe->nitems);
+    // An endless body has no cardinality, so nitems is zero for it and cannot
+    // stand in for "has any members at all".
+    int body_endless = rxe_is_infinite(node->rxe);
+    if (!body_endless && !mpz_sgn(node->rxe->nitems)) return 0;
+    // No upper bound, and something to repeat: endless.
+    if (node->rep_max == RXE_REP_UNBOUNDED) return 1;
+    // Bounded, but each repetition draws from an endless body, so the whole
+    // is endless too unless there are no repetitions at all.
+    return body_endless && node->rep_max >= 1;
 }
 
 // Make room for at least 'want' position indices. An unbounded repetition
@@ -88,7 +96,7 @@ int rxe_repeat_is_infinite(struct rxe_node *node)
 // doing so: 'a{1,1000000}' would otherwise reserve a million integers to
 // enumerate a set whose first element is one character long.
 
-static void rep_grow(struct rxe_node *node, int want)
+void rxe_repeat_reserve(struct rxe_node *node, int want)
 {
     if (want <= node->rep_alloc) return;
     int i, n = node->rep_alloc ? node->rep_alloc : 8;
@@ -102,6 +110,15 @@ static void rep_grow(struct rxe_node *node, int want)
     for (i=node->rep_alloc;i<n;i++) mpz_init(fresh[i]);
     if (node->rep_digit) rxe_mem_free(node->rep_digit);
     node->rep_digit = fresh;
+    // The parallel array of lengths, used only when the expression is
+    // enumerated shortest first: there a position is addressed by the length
+    // it takes and its index among the members of that length, rather than by
+    // one index into the body's whole ordering.
+    int *lens = NEW(n,int);
+    for (i=0;i<node->rep_alloc;i++) lens[i] = node->rep_len[i];
+    for (i=node->rep_alloc;i<n;i++) lens[i] = 0;
+    if (node->rep_len) rxe_mem_free(node->rep_len);
+    node->rep_len = lens;
     node->rep_alloc = n;
 }
 
@@ -117,9 +134,10 @@ void rxe_repeat_make(struct rxe_node *node, int r0, int r1)
     node->rep_max   = r1;
     node->rep_count = r0;
     node->rep_digit = NULL;
+    node->rep_len   = NULL;
     node->rep_alloc = 0;
     node->is_inf    = rxe_repeat_is_infinite(node);
-    if (r0 > 0) rep_grow(node,r0);
+    if (r0 > 0) rxe_repeat_reserve(node,r0);
     rxe_repeat_nitems(node->nitems,node->rxe->nitems,r0,r1);
 }
 
@@ -130,6 +148,8 @@ void rxe_repeat_free(struct rxe_node *node)
     for (i=0;i<node->rep_alloc;i++) mpz_clear(node->rep_digit[i]);
     rxe_mem_free(node->rep_digit);
     node->rep_digit = NULL;
+    if (node->rep_len) rxe_mem_free(node->rep_len);
+    node->rep_len = NULL;
     node->rep_alloc = 0;
 }
 
@@ -173,7 +193,7 @@ int rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r)
         // an index that does not fit in a machine word never will be.
         if (!mpz_fits_slong_p(p)) goto done;
         node->rep_count = node->rep_min + (int)mpz_get_ui(p);
-        rep_grow(node,node->rep_count);
+        rxe_repeat_reserve(node,node->rep_count);
         for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
         rc = 0;
         goto done;
@@ -191,7 +211,7 @@ int rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r)
     }
     if (!unbounded && n > node->rep_max) goto done;
     node->rep_count = n;
-    rep_grow(node,n);
+    rxe_repeat_reserve(node,n);
     // p is now an n-digit numeral in base sub->nitems. Peel the digits off
     // least significant first and store each at the position it drives.
     for (i=0;i<n;i++) {
@@ -237,7 +257,7 @@ int rxe_repeat_iterate(struct rxe_node *node, int l2r)
     }
     // The indices are allocated on demand, so a longer run than any reached
     // so far has to make room for itself before it can be cleared.
-    rep_grow(node,node->rep_count);
+    rxe_repeat_reserve(node,node->rep_count);
     for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
     return carry;
 }

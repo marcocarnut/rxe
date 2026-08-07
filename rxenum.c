@@ -59,6 +59,7 @@ int main(int argc, char **argv)
     int have_from = 0;
     int have_to = 0;
     int have_random = 0;
+    int report_order = 0;
     char *key = NULL;
     char sep = ',';
     mpz_t from,to,count;
@@ -66,7 +67,7 @@ int main(int argc, char **argv)
     mpz_init(to);
     mpz_init(count);
     for (;;) {
-        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:Q");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -95,6 +96,8 @@ int main(int argc, char **argv)
                       break;
             case 'r': have_random = 1;
                       break;
+            case 'Q': report_order = 1;
+                      break;
             case 'k': key = optarg;
                       do_enumerate = 1;
                       break;
@@ -117,6 +120,16 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    if (report_order) {
+        // Which of the two orders this expression is enumerated in. Used by
+        // the test suite to know which invariants apply; see ENUMERATION
+        // ORDER in the manual page.
+        printf("%s\n", rxe_is_shortlex(rxe) ? "shortlex" :
+                        rxe_is_infinite(rxe) ? "diagonal" : "place value");
+        rxe_free(rxe);
+        mpz_clear(from); mpz_clear(to); mpz_clear(count);
+        return 0;
+    }
     if (have_random && key)
         die(1,"-r and -k are mutually exclusive: -k already visits every "
               "member exactly once\n");

@@ -17,6 +17,7 @@
 #include "rxe.h"
 #include "rxe_alt.h"
 #include "repeat.h"
+#include "lens.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
 #include <string.h>
@@ -696,16 +697,14 @@ static struct rxe *demote_node(struct rxe_node *node, int flags)
 int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
                  enum rxe_parse_status *status)
 {
-    // Repeating something endless -- '(a*)*', or the '(\\d+,)*' that comes of
-    // it in practice -- makes every position a dimension of its own, and the
-    // repeat counts another on top of them, so a block of a given count is
-    // itself endless rather than a finite thing to step past. That holds for
-    // '(a*){2}' as much as for '(a*)*': a bound limits how many dimensions
-    // there are, not how big each one is. Refuse the lot rather than answer
-    // wrongly, which '(a*){2}' did by reporting a set of size zero; see the
-    // TODO. Zero repetitions is the exception, being the empty string and
-    // nothing else.
-    if (node->is_inf && r1 != 0) {
+    // An unbounded repetition whose body can match nothing at all derives
+    // the empty string infinitely many ways, so the number of members of any
+    // given length is not a number. '(a*)*' is the shape; Perl's matcher
+    // refuses an empty loop body for the same reason. This is narrow on
+    // purpose: '(\\d+,)*' spends at least two characters per repetition and
+    // is perfectly countable, which is the whole point of counting by length.
+    if (r1 == RXE_REP_UNBOUNDED && node->rxe && !node->is_backref &&
+        rxe_matches_empty(node->rxe)) {
         *status = RXE_NESTED_UNBOUNDED;
         return 0;
     }

@@ -12,12 +12,18 @@ DONE SINCE 0.9.1
   rxe_permutation_* entry points in rxe.h.
 - Infinite sets. '*', '+' and '{n,}' used to be a hard error; they are now
   enumerated and addressed by index like anything else, with only the
-  counting reporting that there is no count. One unbounded quantifier is the
-  repeat counts walked without an upper bound; several are several dimensions
-  with no largest value, and the index is spread across them by the Cantor
-  pairing function. Infinite alternations are dovetailed above the finite
-  ones. rxe_is_infinite() is the new entry point. Repeating something that is
-  itself unbounded is still refused -- see below.
+  counting reporting that there is no count. rxe_is_infinite() is the entry
+  point.
+- Shortest-member-first order for them, by counting an expression's members
+  of each length rather than in total (lens.c). That is what makes an
+  infinite set walkable rather than merely enumerable, and what lets a
+  repetition whose body is itself unbounded work at all: '(\d+,)*', a
+  comma-separated list, has its first two-element list at index 1,111, where
+  the diagonal pairing this replaced put a five-element one at 5.8e18. The
+  counts are computed lazily, so a finite part of the expression costs
+  nothing until the enumeration is long enough to reach it. Finite
+  expressions keep place value and are untouched. rxe_is_shortlex() says
+  which order an expression got, and 'rxenum -Q' reports it.
 - Closed-form counted repetition. "x{r0,r1}" is now a repeat count and one
   index per position rather than one written-out copy per position per repeat
   count, so the memory a repetition costs is the length of the string it
@@ -71,43 +77,38 @@ SHORT TERM TO-DOs
 LONG-TERM TO-DOs
 ================
 
-> Repeat an expression that is itself unbounded. '(a*)*' is refused, and so
-  is '(a*){2}' and every other repetition of an endless thing bar zero
-  repetitions. It matters more than it looks: '(\d+,)*', a comma-separated
-  list, is exactly this shape and is a thing people write.
+> Count lengths through a backreference. A backreference's length is
+  whatever the group it names turned out to be, so the positions of a
+  concatenation are no longer independent and the convolution the length
+  counts are built from does not describe the set. Such an expression falls
+  back to the diagonal pairing: still a bijection onto the whole set, still
+  reaching everything in finite time, but not shortest first.
+  rxe_is_shortlex() reports which order an expression got and the test suite
+  applies the ordering checks only where it says shortlex.
 
-  Two problems, both of which the finite case never had to answer. Every
-  position of the repetition becomes a dimension of its own rather than a
-  digit, so a repetition of n copies needs an n-way pairing, and n varies
-  with the repeat count. And the block walk that finds the repeat count works
-  by stepping past each block in turn, which needs the blocks to be finite;
-  here every block from the first onwards is endless, so the count itself has
-  to be paired with the index within it rather than subtracted off.
+  Two ways to fix it. The narrow one folds a group and the backreferences to
+  it into a single composite position, whose length distribution is the
+  group's stretched by the number of copies: '([ab]+)\1' has count[2l] equal
+  to the group's count[l]. That is exact and cheap, and covers the shapes
+  people write, but only when the group and its backreferences sit in the
+  same concatenation -- '((a+)x)\2' names a group nested inside another
+  position and does not fold.
 
-  Both are the machinery that is already there -- rxe_unpair over a varying
-  arity, and a pairing rather than a subtraction to pick the count -- so this
-  is a bounded piece of work rather than a new idea. The awkward part is the
-  block for count zero, which holds exactly one string where every other
-  block holds infinitely many, so it is not a copy of N and cannot take part
-  in a pairing over N without leaving a hole.
+  The general one carries the lengths already chosen for referenced groups
+  through the split search as extra state, which is a dimension of the
+  dynamic programming per referenced group: O(positions * L^(k+1)) for k of
+  them. Fine for the one or two that occur in practice, and it subsumes the
+  fold.
 
-> A stricter shortlex order. The Cantor pairing walks diagonals over the
-  dimensions' indices, which coincides with shortest-string-first exactly
-  when each index is the length it contributes: 'a*b*' comes out "", a, b,
-  aa, ab, bb, which is shortlex. When the repeated unit has more than one
-  member -- '[ab]*[cd]*' -- an index of n stands for a string of about log(n)
-  characters, so the diagonals slant across the lengths instead of following
-  them.
-
-  Getting true shortlex in general means ordering by string length, which
-  means being able to say how many members an expression has of each length
-  rather than in total. That is a generating function per subexpression
-  rather than a single cardinality, and for a finite expression it is
-  strictly more expensive than what is there now: '[a-z]{1,20000}' has one
-  cardinality of 28,300 digits and would have 20,001 of them, one per length.
-  So it would want to be an alternative representation chosen when an
-  unbounded quantifier is present, not a replacement. Probably not worth it
-  unless somebody actually needs the order.
+> Order strictly by lexicographic rank within a length, rather than by how
+  the length divides among the positions. Within one length the current order
+  takes the splits in turn -- the most significant position taking as much as
+  it can first -- and applies place value inside each. For 'a*b*' that is the
+  same thing as alphabetical, which is why the examples look clean; for
+  '[ab]*[cd]*' it is not, giving aa, ab, ba, bb, ac rather than aa, ab, ac,
+  ad, ba. Fixing it means comparing characters rather than counting members,
+  which is a different kind of question from the one the counts answer, and
+  it is not obvious it is worth the cost.
 
 > Abstract the arithmetic behind a base-type shim, so the width can be
   chosen at build time: GMP for unbounded cardinalities as now, or
