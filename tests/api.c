@@ -140,6 +140,43 @@ int main(void)
         mpz_clear(dom); mpz_clear(i); mpz_clear(out);
     }
 
+    // 8. Counted repetition. The point of holding a repetition as a count
+    //    rather than as one copy per position is that the memory it costs
+    //    stops depending on the repeat count, so the test is a size that
+    //    could not previously be parsed at all: writing [a-z]{1,20000} out
+    //    wanted about 26GB.
+    {
+        struct rxe *rxe = rxe_parse("[a-z]{1,20000}", 0);
+        check_int("a 20000-wide repetition parses", RXE_OK, rxe_error(rxe));
+        // sum(26^j, j=1..20000) has 28300 decimal digits.
+        check_int("its cardinality has 28300 digits", 28300,
+                  (long)mpz_sizeinbase(rxe->nitems, 10));
+        char buf[64];
+        mpz_t pos;
+        // Index 27 is the second string of the two-character block, which
+        // starts at 26: a..z, then aa, ab.
+        mpz_init_set_ui(pos, 27);
+        check_int("seek into it succeeds", 0, rxe_seek(rxe, pos));
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check("and lands on the right element", "ab", buf);
+        mpz_clear(pos);
+        rxe_free(rxe);
+    }
+
+    // 9. rxe_deep_clone has to copy a repetition node, not just the
+    //    subexpression under it. Recursion -- the (?N) construct -- is the
+    //    only caller left, so this is where it gets exercised directly.
+    {
+        struct rxe *rxe = rxe_parse("([ab]{1,2})(?1)", 0);
+        check_int("a repetition inside a recursed group parses", RXE_OK,
+                  rxe_error(rxe));
+        // Six strings in the group, squared: the clone must have the same
+        // cardinality as the original rather than an empty or aliased one.
+        check_int("the clone has the same cardinality as the original", 36,
+                  (long)mpz_get_ui(rxe->nitems));
+        rxe_free(rxe);
+    }
+
     printf("api: %s\n", failures ? "FAILURES ABOVE" : "all checks passed");
     return failures ? 1 : 0;
 }

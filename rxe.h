@@ -106,22 +106,37 @@ struct rxe_alt {
     struct rxe_alt  *next;        // Pointer to the previous alternation
 };
 
-// A single node, representing a character class, a subexpression or a
-// backreference. The characters comprising the class are in a dynamically
-// allocated string pointed to by 'str'. This string is not null-terminated;
-// instead, the number of characters it holds is in 'len'. The routines must
-// be prepared for the possibility that 'str' might be NULL. A subexpression
-// or backreference is pointed to by the 'rxe' field. If it is a backref, the
-// flag back is_backref shall be true. Nodes are arranged as a doubly linked
-// list with head and tail anchors in 'struct rxe_alt'.
+// A single node, representing a character class, a subexpression, a
+// backreference or a repetition. The characters comprising the class are in a
+// dynamically allocated string pointed to by 'str'. This string is not
+// null-terminated; instead, the number of characters it holds is in 'len'.
+// The routines must be prepared for the possibility that 'str' might be NULL.
+// A subexpression or backreference is pointed to by the 'rxe' field. If it is
+// a backref, the flag is_backref shall be true. Nodes are arranged as a
+// doubly linked list with head and tail anchors in 'struct rxe_alt'.
+//
+// A repetition node has is_repeat set. It holds a single copy of the repeated
+// subexpression in 'rxe' and repeats it between rep_min and rep_max times,
+// which is why 'rxe' alone cannot give the node's cardinality: for every other
+// kind of node the two coincide, but here the node's own nitems is the sum of
+// a geometric series over the subexpression's. Its state is the repeat count
+// currently selected and one index per position, rather than one materialised
+// copy of the subexpression per position: repeating a subexpression of
+// cardinality b between 0 and m times has m+1 alternations holding m(m+1)/2
+// copies between them, so writing them out cost quadratic memory and put a
+// ceiling of a few thousand on m. See repeat.c.
 
 struct rxe_node {
     int   len;                    // Number of chars in *str
     char *str;                    // string with possible characters
     mpz_t nitems;                 // No of items in this set and its subsets
-    mpz_t start;                  // Start point in the integer mapping
     int   iterator;               // Current item being iterated
     int   is_backref;             // True if this node is a backreference
+    int   is_repeat;              // True if this node is a repetition
+    int   rep_min;                // Fewest repetitions, when is_repeat
+    int   rep_max;                // Most repetitions, when is_repeat
+    int   rep_count;              // Repetitions currently selected
+    mpz_t *rep_digit;             // rep_max indices into rxe, one per position
     struct rxe *rxe;              // Pointer to a subexpression or backref
     struct rxe_node *prev;        // Pointer to the next node
     struct rxe_node *next;        // Pointer to the previous node
@@ -166,7 +181,7 @@ int rxe_seek(struct rxe *rxe, mpz_t pos);
 
 void rxe_init(void);
 struct rxe *rxe_new(void);
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow);
+void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node);
 struct rxe *rxe_deep_clone(struct rxe *src_rxe);
 void rxe_free(struct rxe *rxe);
 

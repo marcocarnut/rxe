@@ -16,6 +16,7 @@
 
 #include "rxe.h"
 #include "rxe_alt.h"
+#include "repeat.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
 #include <string.h>
@@ -115,7 +116,9 @@ const char *backslash_letters[] = {
 /* -------------------------- Function Prototypes ------------------------- */
 
 const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags);
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, const char *str,
+                           int flags, enum rxe_parse_status *status);
+void build_repeat(struct rxe_node *node, int r0, int r1, int flags);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
 const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
@@ -283,34 +286,17 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           rxe->status = RXE_LONE_QUANTIFIER;
                           return parse_done(x,n,p,str);
                       }
-                      // FIXME: Split handle_repetitions into two functions,
-                      // the first which only parses/validades the parameters
-                      // and the other that actually does the work. Then
-                      // refactor this code using that second function.
-                      mpz_set(n,p);
-                      mpz_add_ui(n,n,1);
+                      // '?' is exactly {0,1}, and is now built by the same
+                      // routine. It used to have its own copy of the
+                      // construction, which is how the same bug -- first
+                      // failing to clear the quantified node's own characters,
+                      // then failing to inherit the enumeration direction --
+                      // came to be fixed twice, separately.
+                      build_repeat(alt->tail,0,1,flags);
+                      mpz_set(n,alt->tail->nitems);
+                      mpz_mul(x,x,n);
+                      mpz_set_ui(n,1);   // already live; assign, do not re-init
                       mpz_set_ui(p,1);
-                      struct rxe *new_rxe = rxe_new();
-                      if (flags & RXE_LEFT_TO_RIGHT)
-                          new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
-                      struct rxe_alt *emp_alt = rxe_new_alt(new_rxe);
-                      mpz_set(emp_alt->start,alt->tail->start);
-                      mpz_set_ui(emp_alt->nitems,1);   // matches the empty string
-                      struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
-                      rxe_node_deep_clone(new_alt,alt->tail,1);
-                      mpz_add_ui(new_alt->start,alt->tail->start,1);
-                      // The clone has taken over this node's characters and
-                      // any subexpression, so drop them from the node itself.
-                      // Leaving both in place makes rxe_iterate step the
-                      // node's own characters as well as the alternation
-                      // below it, multiplying the set instead of replacing
-                      // it. handle_repeats does the same for {n,m}.
-                      alt->tail->rxe = NULL;
-                      rxe_free_node_data(alt->tail);
-                      alt->tail->rxe = new_rxe;
-                      mpz_set(new_alt->nitems,new_alt->tail->nitems);
-                      mpz_add_ui(alt->tail->nitems,new_alt->nitems,1);
-                      mpz_set(new_rxe->nitems,alt->tail->nitems);
                       quantifier = 1;
                       break;
             case '{': if (quantifier) {
@@ -321,11 +307,11 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           rxe->status = RXE_LONE_QUANTIFIER;
                           return parse_done(x,n,p,str);
                       }
-                      str2 = handle_repeats(alt,n,p,str,flags);
-                      if (!str2) {
-                          rxe->status = mpz_get_ui(n);
-                          return parse_done(x,n,p,str);
-                      }
+                      // The status used to be smuggled back inside 'n', the
+                      // mpz_t meant for the result, for want of anywhere else
+                      // to put it. There is somewhere else now.
+                      str2 = handle_repeats(alt,n,str,flags,&rxe->status);
+                      if (!str2) return parse_done(x,n,p,str);
                       str = str2;
                       mpz_mul(x,x,n);
                       mpz_set_ui(n,1);   // already live; assign, do not re-init
@@ -574,96 +560,102 @@ const char *handle_flags(const char *str, int *flags)
     return str;
 }
 
-const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags)
+// Parse a "{r0,r1}" suffix, str pointing just past the opening brace. On
+// success returns a pointer just past the closing brace with the bounds in
+// *r0 and *r1; on failure returns NULL with the reason in *status.
+
+static const char *parse_repeat_params(const char *str, int *r0, int *r1,
+                                       enum rxe_parse_status *status)
 {
     const char *end = strchr(str,'}');
     if (!end) {
-        // FIXME: Use something else more elegant to return the status code
-        mpz_set_ui(ret,RXE_UNTERMINATED_REPEAT);
+        *status = RXE_UNTERMINATED_REPEAT;
         return NULL;
     }
     if (*str<'0' || *str>'9') {
-        // FIXME: Use something else more elegant to return the status code
-        mpz_set_ui(ret,RXE_BAD_REPETITION);
+        *status = RXE_BAD_REPETITION;
         return NULL;
     }
     // atoi stops at the closing brace on its own. The comma search must be
     // bounded explicitly, though: this used to be done by writing a NUL over
-    // the '}' and restoring it afterwards, which made rxe_parse scribble on
-    // the caller's string and crash outright on a string literal.
-    int r0  = atoi(str);
-    int r1  = r0;
+    // the '}', which made rxe_parse scribble on the caller's string and crash
+    // outright on a string literal.
+    *r0 = *r1 = atoi(str);
     const char *c = memchr(str,',',end-str);
     if (c) {
         if (c+1 == end) {
             // Nothing after the comma, as in a{1,}: an open-ended repetition,
             // which denotes an infinite set. Must return here, or the
             // non-digit check below overwrites this with a less accurate one.
-            // FIXME: Use something else more elegant to return the status code
-            mpz_set_ui(ret,RXE_INFINITE);
+            *status = RXE_INFINITE;
             return NULL;
         }
         if (c[1]<'0' || c[1]>'9') {
-            // FIXME: Use something else more elegant to return the status code
-            mpz_set_ui(ret,RXE_BAD_REPETITION);
+            *status = RXE_BAD_REPETITION;
             return NULL;
         }
-        r1 = atoi(c+1);
+        *r1 = atoi(c+1);
     }
-    if (r0>r1) {
-        // FIXME: Use something else more elegant to return the status code
-        mpz_set_ui(ret,RXE_BAD_REPETITION);
+    if (*r0 > *r1) {
+        *status = RXE_BAD_REPETITION;
         return NULL;
     }
-    struct rxe_node *prev_node = alt->tail;
-    // A variable repetition builds one alternation per repeat count, each with
-    // a different number of clones. Only one of them can alias the original
-    // subexpression, so a later \N -- which resolves through that single alias
-    // -- would read from an alternation that is not the one being enumerated.
-    // Mark the subexpression so handle_backreferences can refuse it.
-    if (r0 != r1 && prev_node->rxe)
-        prev_node->rxe->flags |= RXE_FLAG_VARIABLE_REPEAT;
-    struct rxe *new_rxe = rxe_new();
-    // The repeated copies live in an alternation of their own, so the
-    // direction has to reach this subexpression as well, or {n} would keep
-    // counting right to left inside a (?L) group.
-    if (flags & RXE_LEFT_TO_RIGHT) new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
-    int n;
-    mpz_set_ui(ret,0);
-    // Declared out here and reused: initialising it inside the loop leaked one
-    // allocation per repeat count, which for a wide range is a great many.
-    mpz_t p;
-    mpz_init(p);
-    for (n=r0;n<=r1;n++) {
-        int m;
-        struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
-        mpz_pow_ui(p,x,n);
-        mpz_add(new_alt->start,prev_node->start,ret);
-        mpz_add(ret,ret,p);
-        for (m=0;m<n;m++) {
-            // Exactly one clone may alias the original subexpression rather
-            // than deep-copying it; it inherits ownership of it. Make that the
-            // *last* clone, so a \N resolving through the backreference table
-            // -- which still points at the original -- refers to the final
-            // repetition, as Perl does.
-            rxe_node_deep_clone(new_alt,prev_node,n==r1 && m==n-1);
-        }
-        // p is x^n, the cardinality of this repeat count. For n==0 that is 1,
-        // the empty string, which is a member and must not be mistaken for an
-        // alternation that matches nothing.
-        mpz_set(new_alt->nitems,p);
-    }
-    mpz_clear(p);
-    mpz_set(new_rxe->nitems,ret);
-    mpz_set(prev_node->nitems,ret);
-    // Exactly one clone aliases the original subexpression and inherits it, so
-    // it must not be freed here. That clone only exists when at least one was
-    // made: for {0} the loop above bodies out without cloning anything, and
-    // this node then holds the only pointer to the subexpression.
-    if (r1 > 0) prev_node->rxe = NULL;
-    rxe_free_node_data(prev_node);
-    prev_node->rxe = new_rxe;
     return end+1;   // just past the '}'
+}
+
+// Move whatever this node holds -- a character class, a subexpression, a
+// backreference -- down into a subexpression of its own, leaving the node
+// empty and ready to be made into something else. Returns the new
+// subexpression, which holds the node's former contents and cardinality.
+
+static struct rxe *demote_node(struct rxe_node *node, int flags)
+{
+    struct rxe *sub = rxe_new();
+    if (flags & RXE_LEFT_TO_RIGHT) sub->flags |= RXE_FLAG_LEFT_TO_RIGHT;
+    struct rxe_alt  *alt   = rxe_new_alt(sub);
+    struct rxe_node *inner = rxe_new_node(alt);
+    inner->len        = node->len;
+    inner->str        = node->str;
+    inner->rxe        = node->rxe;
+    inner->is_backref = node->is_backref;
+    mpz_set(inner->nitems,node->nitems);
+    mpz_set(alt->nitems,node->nitems);
+    mpz_set(sub->nitems,node->nitems);
+    node->len = 0;
+    node->str = NULL;
+    node->rxe = NULL;
+    node->is_backref = 0;
+    return sub;
+}
+
+// Turn the node into a repetition of what it currently holds, r0 to r1 times.
+// This is where the representation stops being one copy per position: see
+// repeat.c. On return node->nitems is the cardinality of the repetition.
+
+void build_repeat(struct rxe_node *node, int r0, int r1, int flags)
+{
+    // A variable repetition cannot say which repeat count a backreference
+    // into it should mean, so mark the subexpression for
+    // handle_backreferences to refuse.
+    if (r0 != r1 && node->rxe && !node->is_backref)
+        node->rxe->flags |= RXE_FLAG_VARIABLE_REPEAT;
+    // A node that is already nothing but a subexpression can be repeated as
+    // it stands; anything else has to be demoted into one first, so that the
+    // repetition has a single thing to index into.
+    if (!node->rxe || node->str || node->is_backref)
+        node->rxe = demote_node(node,flags);
+    rxe_repeat_make(node,r0,r1);
+}
+
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, const char *str,
+                           int flags, enum rxe_parse_status *status)
+{
+    int r0, r1;
+    const char *end = parse_repeat_params(str,&r0,&r1,status);
+    if (!end) return NULL;
+    build_repeat(alt->tail,r0,r1,flags);
+    mpz_set(ret,alt->tail->nitems);
+    return end;
 }
 
 const char *handle_character_class(

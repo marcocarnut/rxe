@@ -396,6 +396,51 @@ check "(?L) and -k together still cover the set" \
       "$("$RXENUM" -e '(?L)[ab]{3}' | sort | md5sum)" \
       "$("$RXENUM" -k hunter2 -e '(?L)[ab]{3}' | sort | md5sum)"
 
+echo "== #11 closed-form counted repetition =="
+# Repetitions used to be written out, one copy per position per repeat count,
+# which cost O(m^2) memory. These sizes could not be parsed at all before:
+# [a-z]{1,20000} wanted 26GB and was killed by the OOM killer.
+# sum(26^j, j=1..20000), computed independently in Python. 28,300 digits, so
+# it is pinned by its checksum rather than written out.
+rx20k=$("$RXENUM" -~ '[a-z]{1,20000}' | head -1)
+check "[a-z]{1,20000} has 28300 digits" '28300' "${#rx20k}"
+check "[a-z]{1,20000} counts correctly" '696a9232d95fe0ba2cccfbbbf96ed889' \
+      "$(printf '%s' "$rx20k" | md5sum | cut -d' ' -f1)"
+check "a{1,100000} seeks to the 90th" "$(printf 'a%.0s' $(seq 1 90))" \
+      "$("$RXENUM" -z -f 89 'a{1,100000}' 2>&1)"
+check "[a-z]{1,20000} seeks into a set of 10^28000" 'ab' \
+      "$("$RXENUM" -z -f 27 '[a-z]{1,20000}' 2>&1)"
+# The mapping itself must not have moved: every one of these was checked
+# element for element against the written-out representation.
+t_enum 'a{2,3}'          'aa/aaa/'
+t_enum '[ab]{1,2}'       'a/b/aa/ab/ba/bb/'
+t_enum '(a|bc){0,2}'     '/a/bc/aa/abc/bca/bcbc/'
+t_enum '(a{1,2}){1,2}'   'a/aa/aa/aaa/aaa/aaaa/'
+t_enum '[ab]{0,2}[cd]{0,2}' '/c/d/cc/cd/dc/dd/a/ac/ad/acc/acd/adc/add/b/bc/bd/bcc/bcd/bdc/bdd/aa/aac/aad/aacc/aacd/aadc/aadd/ab/abc/abd/abcc/abcd/abdc/abdd/ba/bac/bad/bacc/bacd/badc/badd/bb/bbc/bbd/bbcc/bbcd/bbdc/bbdd/'
+# A repeat count of zero leaves nothing behind, and an impossible thing can
+# still be repeated zero times.
+t_enum 'a{0}b'           'b/'
+t_enum  '[^\x0-\xFF]{0,2}'  '/'
+t_count '[^\x0-\xFF]{1,2}'  '0'
+# '?' is now the same construction as {0,1} rather than a second copy of it.
+t_enum '(ab|c)?'         '/ab/c/'
+t_enum '[ab]?'           '/a/b/'
+t_enum '(a?){2}'         '/a/a/aa/'
+# Direction still reaches inside a repetition, including when the bare (?L)
+# that sets it appears after the repetition. This one did change: a bare flag
+# group is documented to govern the whole enclosing group, but the repetition
+# used to snapshot the direction when '{' was parsed and so missed it.
+t_enum '(?L)[ab]{1,3}'   'a/b/aa/ba/ab/bb/aaa/baa/aba/bba/aab/bab/abb/bbb/'
+t_enum '[01]{2}(?L)'     '00/10/01/11/'
+t_enum '[01]{2}'         '00/01/10/11/'
+# Self-consistency across the three ways of asking, for shapes the rework
+# touched.
+t_selfcheck '[ab]{0,3}'
+t_selfcheck '(a|bc){1,3}'
+t_selfcheck '(?L)[abc]{0,2}'
+t_selfcheck 'x(ab|c){0,2}y[de]?'
+t_selfcheck '([ab]{1,2}){0,2}'
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"

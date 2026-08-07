@@ -22,6 +22,7 @@
 #include "rxe_alt.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
+#include "repeat.h"
 #include "parse.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
@@ -89,7 +90,23 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
     struct rxe_node *node;
     if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
-        if (node->rxe) {
+        if (node->is_repeat) {
+            // One copy of the subexpression stands in for every position, so
+            // it has to be seeked to each position's index in turn. Rendering
+            // in string order also means the subexpression is left holding the
+            // final repetition, which is what a later backreference into it
+            // should see. The digits are stored by position rather than by
+            // significance, so this walks them in string order whichever way
+            // round the odometer runs.
+            int i;
+            for ( i = 0 ; i < node->rep_count ; i++ ) {
+                char *new_str;
+                if (rxe_seek(node->rxe,node->rep_digit[i])) break;
+                new_str = rxe_current(str,maxlen,node->rxe);
+                maxlen -= new_str - str;
+                str = new_str;
+            }
+        } else if (node->rxe) {
             char *new_str = rxe_current(str,maxlen,node->rxe);
             maxlen -= new_str - str;
             str = new_str;
@@ -119,7 +136,9 @@ int rxe_iterate(struct rxe *rxe)
     int carry = 1;
     if (node) {
         while (carry) {
-            if (node->rxe && !node->is_backref) {
+            if (node->is_repeat) {
+                carry = rxe_repeat_iterate(node,l2r);
+            } else if (node->rxe && !node->is_backref) {
                 carry = rxe_iterate(node->rxe);
             }
             if (carry) {
@@ -156,12 +175,12 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     struct rxe_alt *alt;
     struct rxe_node *node = NULL;
     int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
-    // FIXME: Performance: this is slow if the number of alternations is large.
-    // We should enumerate this into an array and binary search it instead.
-    // Also, as an enhancement, we should add a flag to allow left-to-right
-    // instead of right-to-left associativity. This should be done on each
-    // subexpression so we can fine tune the order in which the sets will be
-    // enumerated.
+    // A linear scan, which is slow when an expression has a great many
+    // alternations. It used to be the obvious thing to replace with a binary
+    // search, because a repetition wrote out one alternation per repeat count
+    // and so manufactured them by the thousand. Repetitions are counted rather
+    // than written out now, and hand-written alternations do not run to those
+    // numbers: 20,000 of them still seek in 0.02s. See the TODO.
     for ( alt = rxe->tail ; alt ; alt = alt->prev ) {
         if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
         if (mpz_cmp(alt->start,pos)<=0) {
@@ -173,7 +192,10 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     }
     for ( ; node ; node = l2r ? node->next : node->prev ) {
         if (node->is_backref) continue;
-        mpz_set(n, node->rxe ? node->rxe->nitems : node->nitems);
+        // A repetition is the one kind of node whose cardinality is not its
+        // subexpression's: it is the geometric sum over it.
+        mpz_set(n, node->rxe && !node->is_repeat ? node->rxe->nitems
+                                                 : node->nitems);
         // An impossible node cannot be indexed into. Alternations holding one
         // are skipped above, so reaching this means the caller seeked into a
         // set that has no such element; report failure rather than abort.
@@ -183,7 +205,12 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
         }
         mpz_tdiv_qr(q,r,p,n);
         mpz_set(p,q);
-        if (node->rxe) {
+        if (node->is_repeat) {
+            if (rxe_repeat_seek(node,r,l2r)) {
+                mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
+                return 1;
+            }
+        } else if (node->rxe) {
             rxe_seek(node->rxe,r);
             mpz_set(n,node->rxe->nitems);
         } else {
@@ -219,15 +246,19 @@ struct rxe *rxe_new(void)
     return rxe;
 }
 
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow)
+// The 'shallow' argument this used to take made the copy alias the original
+// subexpression rather than duplicating it, with ownership passing to whichever
+// of the two was reached first. Only the written-out repetition needed that,
+// and it no longer exists; nothing else could use it safely.
+
+void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
 {
     struct rxe_node *dst_node = rxe_new_node(alt);
     if (src_node->rxe) {
-        if (src_node->is_backref) {
-            dst_node->rxe = src_node->rxe;
-        } else {
-            dst_node->rxe = shallow ? src_node->rxe : rxe_deep_clone(src_node->rxe);
-        }
+        // A backreference names a subexpression owned elsewhere, so the copy
+        // points at the same one rather than duplicating it.
+        dst_node->rxe = src_node->is_backref ? src_node->rxe
+                                             : rxe_deep_clone(src_node->rxe);
     }
     if (src_node->len) {
         dst_node->len = src_node->len;
@@ -237,6 +268,12 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int sha
     }
     dst_node->is_backref = src_node->is_backref;
     mpz_set(dst_node->nitems,src_node->nitems);
+    if (src_node->is_repeat) {
+        // rxe_repeat_make recomputes nitems from the subexpression, so the
+        // copy above is redundant here but harmless, and the clone starts at
+        // the first item rather than wherever the original happens to sit.
+        rxe_repeat_make(dst_node,src_node->rep_min,src_node->rep_max);
+    }
 }
 
 struct rxe *rxe_deep_clone(struct rxe *src_rxe)
@@ -254,7 +291,7 @@ struct rxe *rxe_deep_clone(struct rxe *src_rxe)
        mpz_set(dst_alt->start,src_alt->start);
        struct rxe_node *src_node;
        for ( src_node = src_alt->head ; src_node ; src_node = src_node->next ) {
-           rxe_node_deep_clone(dst_alt,src_node,0);
+           rxe_node_deep_clone(dst_alt,src_node);
        }
    }
    return dst_rxe;

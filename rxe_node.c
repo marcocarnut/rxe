@@ -15,6 +15,7 @@
  */
  
  #include "rxe.h"
+#include "repeat.h"
 
 struct rxe_node *rxe_new_node(struct rxe_alt *alt)
 {
@@ -22,9 +23,11 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->next = NULL;
     node->prev = alt->tail;
     mpz_init(node->nitems);
-    mpz_init(node->start);
     node->len = node->iterator = 0;
     node->is_backref = 0;
+    node->is_repeat = 0;
+    node->rep_min = node->rep_max = node->rep_count = 0;
+    node->rep_digit = NULL;
     node->str = NULL;
     node->rxe = NULL;
     alt->nnodes++;
@@ -44,6 +47,10 @@ void rxe_free_node_data(struct rxe_node *node)
         if (!node->is_backref) rxe_free(node->rxe);
         node->rxe = NULL;
     }
+    // A repetition owns one index per position it can occupy.
+    rxe_repeat_free(node);
+    node->is_repeat = 0;
+    node->rep_min = node->rep_max = node->rep_count = 0;
     // Keyed off the pointer, not the length: an empty character class still
     // allocates a (zero-length) block, and testing len left it behind.
     if (node->str) {
@@ -56,10 +63,7 @@ void rxe_free_node_data(struct rxe_node *node)
 void rxe_free_node(struct rxe_node *node)
 {
     rxe_free_node_data(node);
-    // rxe_new_node initialises both of these, so both have to be released
-    // here, exactly as rxe_free_alt does for the alternation's own pair.
     mpz_clear(node->nitems);
-    mpz_clear(node->start);
     rxe_mem_free(node);
 }
 

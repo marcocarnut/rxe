@@ -10,6 +10,13 @@ DONE SINCE 0.9.1
 - Flag to change the enumeration direction: (?L), (?-L) and -L.
 - Keyed permutation of the enumeration order: -k key, and the
   rxe_permutation_* entry points in rxe.h.
+- Closed-form counted repetition. "x{r0,r1}" is now a repeat count and one
+  index per position rather than one written-out copy per position per repeat
+  count, so the memory a repetition costs is the length of the string it
+  generates instead of the square of the largest repeat count.
+  [a-z]{1,20000} needed 26GB and was killed by the OOM killer; it now parses
+  in 3MB, and [a-z]{1,1000000} in 25MB. '?' is built by the same routine as
+  {0,1} instead of having its own copy of the construction.
 - make install now installs librxe.a and rxe.h, so the library can actually
   be linked against.
 - Fifteen correctness fixes, from an uninitialised status byte that made
@@ -31,16 +38,13 @@ SHORT TERM TO-DOs
   backreference compares case-insensitively. Exact copies are probably the
   more useful reading for generation, but the divergence should either be
   fixed or written down in the manual page.
-- Code refactoring
-  > split handle_repeats in two functions: the first parses/validates
-    the paramaters, the second does the actual work
-  > simplify the ? quantifier using the above function as a special case {0,1}
-    (note: since the ? quantifier and handle_repeats have twice now had the
-    same bug fixed separately -- clearing the node's own characters, and
-    inheriting the enumeration direction -- this is worth more than it looks)
+- rxenum truncates a generated string at 100 characters (MAXSTRLEN) and says
+  nothing about having done so. That was academic while a repetition of more
+  than a few thousand could not be built at all; it is not any more, since
+  'a{1,100000}' now parses happily and then prints the wrong answer for every
+  element past the hundredth. Grow the buffer to fit, or refuse to truncate
+  silently.
 - Error handling
-  > handle_repeats still signals failure by writing a status code into the
-    mpz_t it was given for the result. Clean that up.
   > More descriptive error messages pointing to the probable location.
     This needs no structural change: str is in scope at all twenty-seven
     places an error is raised, so it only wants a field for the offset and a
@@ -48,39 +52,43 @@ SHORT TERM TO-DOs
     rxe_parse skips a leading ^, so offsets must be relative to the original
     argument or the caret sits one character off. Where a nested parse
     propagates its status upward, the inner position has to win, or every
-    error inside a group reports the position of the group. And five sites
-    do not set rxe->status at all, smuggling the code through the mpz_t
-    meant for the result -- an mpz_t can carry a number but not a position,
-    so those paths cannot report one until the smuggling above is fixed.
-    The two items are therefore one job, and cheaper done together.
+    error inside a group reports the position of the group. And several
+    helpers signal failure by returning NULL and leave the caller to decide
+    which status that meant, so the place that knows where the trouble was
+    is not the place that records what it was. parse_repeat_params now takes
+    the status by pointer instead, which is the shape the rest should follow;
+    it used to be the worst of them, returning the code inside the mpz_t it
+    had been given for the result.
 
 
 LONG-TERM TO-DOs
 ================
 
-> Replace the node-cloning repetition with closed-form counted nodes.
-  handle_repeats currently materialises {r0,r1} by cloning the node once per
-  repetition per count, which costs O(m^2) memory: a{1,2000} takes 316MB and
-  a{1,20000} would want about 30GB. A repetition node carrying a count
-  instead makes the cardinality a geometric series and the seek a division.
-
 > Enumerate infinite sets. Keep reporting that the set is infinite, but
   still map integers onto its members, so * and + stop being a hard error.
-  Each unbounded quantifier is an N-valued dimension; the finite part stays
-  the mixed-radix numeral it is today, and a pairing function spreads one
-  index across the dimensions. Best done together with the closed-form
-  repetition above rather than after it: an unbounded quantifier is just a
-  counted repetition whose upper bound is infinite, so the two are one
-  change to the same arithmetic.
+  This is now the next thing to do, and much of it is already built: a
+  repetition node carries rep_min and rep_max and walks the repeat counts
+  in ascending order, subtracting each block from the index as it passes.
+  An unbounded quantifier is that same node with rep_max removed, and 'a*'
+  is 'a{0,}'.
 
-> Permute the enumeration order under a key. A keyed bijection on [0,N)
-  applied to the index before seeking gives a different, deterministic,
-  repeatable order -- enough to randomise a brute-force search without
-  losing the ability to resume it. A small Feistel network over the index
-  with cycle walking is the standard construction. This touches nothing but
-  the index, so it can be done at any point, independently of everything
-  above, and it subsumes -r: a permutation visits every member exactly once
-  instead of sampling with replacement.
+  What is left is the part the finite case never had to answer. The block
+  walk terminates today because the counts run out; unbounded, it terminates
+  because the blocks grow, which they only do when the repeated
+  subexpression has two or more members -- 'a*' has one string per count and
+  cannot be reached by that route at all, though its mapping is just the
+  identity. Cardinality stops being a number, so nitems needs a value meaning
+  infinite that propagates through the products and sums without pretending
+  to be large. And two unbounded quantifiers in one expression are two
+  dimensions, each infinite, so the single index has to be spread across them
+  by a pairing function rather than by place value.
+
+  Note that ordering has a real choice in it. Enumerating 'a*b*' as
+  "", "a", "b", "ab", "aab", "aabb" -- shortlex, shortest first and
+  alphabetically within a length -- is the useful reading, and is what the
+  Cantor pairing gives if the dimensions are walked by total length. Simply
+  making the first quantifier the more significant digit would never reach
+  the second one at all.
 
 > Abstract the arithmetic behind a base-type shim, so the width can be
   chosen at build time: GMP for unbounded cardinalities as now, or
@@ -116,9 +124,9 @@ LONG-TERM TO-DOs
 
 > JIT compiler, and a GPU back end. The parse tree is the intermediate
   representation and a code generator consumes it, so neither requires the
-  tree to change. Worth doing after the closed-form repetition rework, both
-  because the tree settles then and because today a JIT would have to
-  compile the two million nodes that a{1,2000} expands into.
+  tree to change. The closed-form repetition rework has happened, which
+  removes the reason to wait: a JIT would have had to compile the two
+  million nodes a{1,2000} used to expand into, and now compiles one.
 
   The GPU case has a shape the JIT case does not. A GPU wants independent
   work per thread, and rxe_iterate carries sequentially, so it does not
@@ -133,8 +141,9 @@ LONG-TERM TO-DOs
   be chasing a moving target through the repetition rework.
 
 > Binary tree over alternations, to replace the linear scan in rxe_seek.
-  Deferred, and possibly not worth doing: 20,000 hand-written alternatives
-  already parse and seek in 0.02s, and enumerate in full in 0.02s. The only
-  place large alternation counts arise in practice is handle_repeats, which
-  builds one alternation per repeat count -- and the closed-form rework
-  above removes them. Revisit only if this ever shows up in a profile.
+  Deferred, and now probably not worth doing at all: 20,000 hand-written
+  alternatives already parse and seek in 0.02s, and enumerate in full in
+  0.02s. The one place large alternation counts used to arise in practice
+  was handle_repeats, which built one alternation per repeat count, and the
+  closed-form rework has removed them. Revisit only if a profile ever says
+  otherwise.

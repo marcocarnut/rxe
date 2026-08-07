@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c
-HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c
+HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -14,20 +14,22 @@ rxenum: rxenum.o librxe.a rxe.h
 
 rxenum.o: rxenum.c rxe.h
 
-rxe.o: rxe.c rxe.h parse.h
+rxe.o: rxe.c rxe.h parse.h repeat.h
 
 rxe_alt.o: rxe_alt.c rxe_alt.h rxe_node.h rxe.h
 
-rxe_node.o: rxe_node.c rxe_node.h rxe.h
+rxe_node.o: rxe_node.c rxe_node.h repeat.h rxe.h
 
 bkreftbl.o: bkreftbl.c bkreftbl.h rxe.h
 
-parse.o: parse.c parse.h rxe_node.h rxe_alt.h rxe.h
+parse.o: parse.c parse.h rxe_node.h rxe_alt.h repeat.h rxe.h
 
 permute.o: permute.c rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o
+repeat.o: repeat.c repeat.h rxe.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
