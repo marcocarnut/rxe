@@ -30,6 +30,10 @@ PATTERNS = [
     # alternation
     r"(a|bc)(d|ef)", r"(ab|cd){2}", r"(a|b)(c|d)(e|f)", r"(?:ab|c)d",
     r"a|", r"|a", r"a||b", r"xy|zw",
+    # a quantifier after a group, which used to be read as a second one
+    # stacked on whatever came before it
+    r"a?(x)?", r"(a)?(x)?", r"[ab]?(x)?", r"(a|b)?(c)?d", r"(ab)?(cd)?",
+    r"x{1,2}(y|z)?", r"[ab]{2}(c)?",
     # optional and zero-repeat forms
     r"a?", r"(a)?", r"(ab)?", r"a{0,2}", r"(a){0,2}", r"M{0,3}",
     r"a?b?c", r"[ab]?[cd]?", r"(a|b)?c", r"M{0,2}(X|Y)",
@@ -74,6 +78,7 @@ INFINITE = [
     # what makes reachable at all
     (r"(\d+,)*", 4, 1300), (r"(ab,)*", 6, 200), (r"([ab]+,)*", 4, 400),
     (r"(a*){2}", 6, 200), (r"(a*)?", 6, 200), (r"(a*|b){1,2}", 4, 200),
+    (r"a+(x)*", 6, 200), (r"[ab]+(-[ab]+)*", 4, 400),
     # backreferences tie two positions' lengths together, so these keep the
     # diagonal order rather than being refused. Still a bijection onto the
     # whole set, which is what the checks below actually test.

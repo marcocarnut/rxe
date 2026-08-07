@@ -528,6 +528,27 @@ t_error '*a'         'nothing before quantifier'
 t_rc 1 -k x 'a*'
 t_rc 1 -r   'a*'
 
+echo "== #21 a quantifier after a group is its own =="
+# 'quantifier' guards against 'a**', but it was not cleared when a group was
+# parsed, so every 'a+(b)*' was refused as a second quantifier stacked on the
+# first. Perl reads all of these without complaint, and the shapes are
+# ordinary: a hyphenated word, a chord name, an optional suffix.
+t_count '[a-z]+(-[a-z]+)*'          'infinite'
+t_count '[A-G][#b]?(maj|min|dim|aug)?' '105'
+t_enum  'a?(x)?'                    '/x/a/ax/'
+t_enum  '(a)?(x)?'                  '/x/a/ax/'
+t_enum  'a{2}(x)?'                  'aa/aax/'
+t_enum  '[ab]?(x)?'                 '/x/a/ax/b/bx/'
+t_enum  '(a|b)?(c)?d'               'd/cd/ad/acd/bd/bcd/'
+t_enum  '(ab)?(cd)?'                '/cd/ab/abcd/'
+t_opts  'a/aa/ax/'   -e -c 3 'a+(x)*'
+# The cases it is actually there to catch must still be refused, as Perl does.
+t_error 'a**'       'nested quantifiers'
+t_error 'a?{2}'     'nested quantifiers'
+t_error '(a)*{2}'   'nested quantifiers'
+t_error 'a{2}{3}'   'nested quantifiers'
+t_error 'a+*'       'nested quantifiers'
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"

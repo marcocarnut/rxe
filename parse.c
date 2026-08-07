@@ -269,6 +269,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           str2 = handle_recursion(str,n,alt,rxe);
                           if (!str2) return parse_done(x,n,p,str);
                           str = str2;
+                          quantifier = 0;
                           break;
                       }
                       if (*str==':') str++;
@@ -301,6 +302,13 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           rxe->status = sub_rxe->status;
                           return parse_done(x,n,p,str);
                       }
+                      // A group is an element like any other, so a quantifier
+                      // after it is its own and not a second one stacked on
+                      // whatever came before. Without this, every construct of
+                      // the form 'a+(b)*' was refused as nested quantifiers --
+                      // '[a-z]+(-[a-z]+)*', a hyphenated word, among them --
+                      // while Perl reads them all without complaint.
+                      quantifier = 0;
                       break;
             // ---------------- Universal quantifiers --------------
             // 'a*' is 'a{0,}' and 'a+' is 'a{1,}'. They used to be a hard
