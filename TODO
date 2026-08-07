@@ -8,6 +8,8 @@ DONE SINCE 0.9.1
   of it under AddressSanitizer, UndefinedBehaviorSanitizer and
   LeakSanitizer, with leak detection on.
 - Flag to change the enumeration direction: (?L), (?-L) and -L.
+- Keyed permutation of the enumeration order: -k key, and the
+  rxe_permutation_* entry points in rxe.h.
 - make install now installs librxe.a and rxe.h, so the library can actually
   be linked against.
 - Fifteen correctness fixes, from an uninitialised status byte that made
