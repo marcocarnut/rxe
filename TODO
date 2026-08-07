@@ -38,12 +38,11 @@ SHORT TERM TO-DOs
   backreference compares case-insensitively. Exact copies are probably the
   more useful reading for generation, but the divergence should either be
   fixed or written down in the manual page.
-- rxenum truncates a generated string at 100 characters (MAXSTRLEN) and says
-  nothing about having done so. That was academic while a repetition of more
-  than a few thousand could not be built at all; it is not any more, since
-  'a{1,100000}' now parses happily and then prints the wrong answer for every
-  element past the hundredth. Grow the buffer to fit, or refuse to truncate
-  silently.
+- rxenum still truncates a generated string at MAXSTRLEN, now 2048 rather
+  than 100, and still says nothing about having done so. Nothing sensible
+  reaches that, but a wide repetition can: 'a{1,100000}' is counted and
+  seeked correctly and then printed wrong past the 2048th element. Either
+  size the buffer from the expression or say when the answer was cut.
 - Error handling
   > More descriptive error messages pointing to the probable location.
     This needs no structural change: str is in scope at all twenty-seven

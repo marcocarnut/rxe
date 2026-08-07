@@ -27,7 +27,13 @@
 #define ENUM_ONCE                    1
 #define ENUM_NUMBER                  2
 
-#define MAXSTRLEN                  100
+// Longest element this program will print. Anything longer is truncated, and
+// silently, which is why the buffer is far larger than the hundred bytes it
+// held while a repetition of more than a few thousand could not be built at
+// all. Half a page: nothing sensible reaches it, and it still costs one stack
+// frame rather than an allocation.
+
+#define MAXSTRLEN                 2048
 
 /* -------------------------- Global Declarations ------------------------- */
 
