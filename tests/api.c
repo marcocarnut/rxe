@@ -107,6 +107,39 @@ int main(void)
     check("RXE_DOTALL admits all 256 bytes", "256", buf);
     rxe_free(rxe);
 
+    // 7. The keyed permutation. It must be a bijection on [0,N): feeding it
+    //    every index in range has to give back every index in range, once.
+    //    Note this runs before any rxe_parse in a fresh process would have
+    //    initialised the allocator, which is deliberate -- rxe_permutation_new
+    //    used to segfault when it was the first entry point called.
+    {
+        unsigned long n = 1000, k;
+        mpz_t dom, i, out;
+        mpz_init_set_ui(dom, n);
+        mpz_init(i);
+        mpz_init(out);
+        struct rxe_permutation *perm = rxe_permutation_new(dom, "a key");
+        char *seen = calloc(n, 1);
+        unsigned long dup = 0, oor = 0, missing = 0;
+        for (k = 0; k < n; k++) {
+            mpz_set_ui(i, k);
+            rxe_permutation_map(out, perm, i);
+            if (mpz_cmp_ui(out, n) >= 0) { oor++; continue; }
+            if (seen[mpz_get_ui(out)]++) dup++;
+        }
+        for (k = 0; k < n; k++) if (!seen[k]) missing++;
+        check_int("permutation stays in range", 0, oor);
+        check_int("permutation repeats nothing", 0, dup);
+        check_int("permutation misses nothing", 0, missing);
+        free(seen);
+        rxe_permutation_free(perm);
+        // A null permutation is the identity, so callers need no special case.
+        mpz_set_ui(i, 42);
+        rxe_permutation_map(out, NULL, i);
+        check_int("a null permutation is the identity", 42, mpz_get_ui(out));
+        mpz_clear(dom); mpz_clear(i); mpz_clear(out);
+    }
+
     printf("api: %s\n", failures ? "FAILURES ABOVE" : "all checks passed");
     return failures ? 1 : 0;
 }

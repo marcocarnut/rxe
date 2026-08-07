@@ -172,6 +172,18 @@ void rxe_free(struct rxe *rxe);
 
 void *kmalloc(size_t size, const char *file, int line);
 
+// A keyed permutation of the integer mapping, so a set can be walked in an
+// order that depends on a key while every member is still visited exactly
+// once. See permute.c. Pass an index in [0, domain) to rxe_permutation_map
+// and seek to what comes back.
+
+struct rxe_permutation;
+
+struct rxe_permutation *rxe_permutation_new(const mpz_t domain, const char *key);
+void rxe_permutation_free(struct rxe_permutation *perm);
+void rxe_permutation_map(mpz_t result, struct rxe_permutation *perm,
+                         const mpz_t index);
+
 /* ------------------------ Macro-Defined Functions ----------------------- */
 
 #define NEW(n,type) ((type *)kmalloc(sizeof(type)*(n),__FILE__,__LINE__))

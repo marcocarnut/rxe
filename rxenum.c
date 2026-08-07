@@ -35,7 +35,8 @@
 
 void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep);
 void die(int code, char *msg, ...);
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep);
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
+               char sep, struct rxe_permutation *perm);
 int mpz_len(mpz_t x);
 
 /* ------------------------------ Main Program ---------------------------- */
@@ -43,7 +44,7 @@ int mpz_len(mpz_t x);
 int main(int argc, char **argv)
 {
     if (argc<2) {
-        die(0,"Usage: rxenum [-isLnezr] [-c count] [-f from] [-t to] <regex>\n");
+        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] <regex>\n");
     }
     int flags = 0;
     int do_enumerate = 0;
@@ -52,13 +53,14 @@ int main(int argc, char **argv)
     int have_from = 0;
     int have_to = 0;
     int have_random = 0;
+    char *key = NULL;
     char sep = ',';
     mpz_t from,to,count;
     mpz_init(from);
     mpz_init(to);
     mpz_init(count);
     for (;;) {
-        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -87,6 +89,9 @@ int main(int argc, char **argv)
                       break;
             case 'r': have_random = 1;
                       break;
+            case 'k': key = optarg;
+                      do_enumerate = 1;
+                      break;
             case ',':
             case '_':
             case '.': sep = o;
@@ -105,6 +110,13 @@ int main(int argc, char **argv)
         fprintf(stderr,"%s\n",rxe_error_message(rxe));
         exit(1);
     }
+
+    if (have_random && key)
+        die(1,"-r and -k are mutually exclusive: -k already visits every "
+              "member exactly once\n");
+
+    struct rxe_permutation *perm = NULL;
+    if (key) perm = rxe_permutation_new(rxe->nitems,key);
 
     if (have_random) {
         if (!mpz_sgn(rxe->nitems))
@@ -130,7 +142,7 @@ int main(int argc, char **argv)
         mpz_init(zero);
         for (;;) {
             mpz_urandomm(from,state,rxe->nitems);
-            enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep);
+            enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep,NULL);
             mpz_sub_ui(count,count,1);
             if (!mpz_sgn(count)) {
                 mpz_clear(zero);
@@ -158,7 +170,7 @@ int main(int argc, char **argv)
         // An empty set enumerates to nothing at all; there is no element to
         // seek to, so skip straight past.
         if (mpz_sgn(rxe->nitems))
-            enumerate(rxe,options,offset,from,count,sep);
+            enumerate(rxe,options,offset,from,count,sep,perm);
     } else {
         print_grouped(stdout,NULL,rxe->nitems,"\n",sep);
         // The logarithms are meaningless for an empty set, and log(0) is
@@ -181,6 +193,7 @@ int main(int argc, char **argv)
         }
     }
     //rxe_backref_table_free(rxe->brt);
+    rxe_permutation_free(perm);
     rxe_free(rxe);
     mpz_clear(from);
     mpz_clear(to);
@@ -188,7 +201,8 @@ int main(int argc, char **argv)
     return 0;
 }
 
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep)
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
+               char sep, struct rxe_permutation *perm)
 {
     mpz_t final;
     mpz_init(final);
@@ -216,7 +230,16 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
     mpz_mul(step2,step2,q);
     if (!mpz_sgn(step2)) mpz_set_ui(step2,1000);
     mpz_sub_ui(from,from,offset);
-    if (rxe_seek(rxe,from)) die(100,"seek past end");
+    // With a permutation the odometer cannot simply be stepped: consecutive
+    // output positions are scattered across the set, so each one is reached
+    // by seeking to the permuted index. rxe_permutation_map is the identity
+    // when perm is NULL, so the unpermuted path is unchanged.
+    mpz_t idx,target;
+    mpz_init_set(idx,from);
+    mpz_init(target);
+    if (perm && mpz_cmp(idx,rxe->nitems)>=0) die(100,"seek past end");
+    rxe_permutation_map(target,perm,idx);
+    if (rxe_seek(rxe,target)) die(100,"seek past end");
     for (;;) {
          char str[MAXSTRLEN+1];
          rxe_current(str,MAXSTRLEN,rxe);
@@ -232,7 +255,14 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
             }
          }
          printf("%s\n",str);
-         if (!rxe_next(rxe)) break;
+         if (perm) {
+             mpz_add_ui(idx,idx,1);
+             if (mpz_cmp(idx,rxe->nitems)>=0) break;
+             rxe_permutation_map(target,perm,idx);
+             if (rxe_seek(rxe,target)) break;
+         } else {
+             if (!rxe_next(rxe)) break;
+         }
          if (mpz_sgn(cnt)) {
              mpz_sub_ui(cnt,cnt,1);
              if (!mpz_sgn(cnt)) break;
@@ -240,6 +270,8 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
          if (flags & ENUM_ONCE) break;
     }
     // -r calls this once per sample, so leaving these behind accumulated.
+    mpz_clear(idx);
+    mpz_clear(target);
     mpz_clear(final);
     mpz_clear(count);
     mpz_clear(step1);

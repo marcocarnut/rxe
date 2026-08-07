@@ -157,6 +157,13 @@ computes the element count (see option
 \) plus one.  Implies \fB-e\fR.
 .TP
 .B
+\-k key
+Walk the set in an order that depends on
+.B key
+instead of in index order, visiting every member exactly once. See
+PERMUTED ORDER below. Implies \fB-e\fR, and cannot be combined with \fB-r\fR.
+.TP
+.B
 \-r
 Randomly choose an element of the set. You can get several random choices
 by setting
@@ -221,6 +228,44 @@ not affected by this flag. To reverse them, write them the other way round.
 Note that L is not a Perl flag. Every inline flag Perl defines is lower
 case, so an upper case letter cannot collide with one; lower case l was not
 available, Perl having given it to locale rules in version 5.14.
+
+.SH PERMUTED ORDER
+.B \-k
+composes the integer mapping with a keyed permutation of the integers, so
+the set is enumerated in a scattered but perfectly reproducible order:
+
+.RS
+rxenum -k hunter2 -e '[a-c][x-z]'
+.br
+cx az by bz cy cz ay ax bx
+.RE
+
+The same key always gives the same order, and a different key gives a
+different one. Because it is a permutation rather than a sample, every
+member appears exactly once: unlike
+.B -r
+it cannot repeat itself and cannot miss anything.
+
+The numbering still addresses this order, so a run can be resumed. Element
+zero of the run above is "cx", and:
+
+.RS
+rxenum -k hunter2 -z -f 4 '[a-c][x-z]'
+.br
+cy
+.RE
+
+which is the fifth line printed. That makes it practical to randomise a
+brute force search and still stop and continue it later, or to split one
+across several machines by handing each a range of indices.
+
+The permutation is built from a Feistel network over the index, walked back
+into range when it lands outside. It is not a cipher and does not try to be:
+it exists to spread the search order, not to withstand somebody who wants to
+recover the key. The key is folded to 64 bits however long it is.
+
+The order produced by a given key is fixed and is treated as part of the
+interface, since reproducibility is the whole point of using a key.
 
 .SH OTHER EXAMPLES
 .TP

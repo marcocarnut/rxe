@@ -61,6 +61,10 @@ void rxe_set_alloc(
     rxe_mem_alloc = malloc_func;
     rxe_mem_free = free_func;
     rxe_mem_alloc_failed = fail_func;
+    // Counts as initialising. Without this, a caller who installed its own
+    // allocator had it quietly replaced by the default one the first time
+    // rxe_parse ran, which made the whole hook pointless.
+    rxe_initialized = 1;
 }
 
 // Returns the first alternation that contributes any string at all. An
@@ -273,6 +277,10 @@ void rxe_free(struct rxe *rxe)
 
 void *kmalloc(size_t size, const char *file, int line)
 {
+    // Any public entry point can be the first one called -- creating a
+    // permutation before parsing anything, for instance -- so the allocator
+    // has to be in place here rather than only in rxe_parse.
+    if (!rxe_initialized) rxe_init();
     void *p = rxe_mem_alloc(size);
     if (p) return p;
     // The hook is expected not to return, but nothing enforces that, and

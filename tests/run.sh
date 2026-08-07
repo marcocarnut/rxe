@@ -370,6 +370,32 @@ t_count '(?L)((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)' '4,294,967,296'
 t_opts  'DEAD BEEF /'    -z -f 3735928559 '([0-9A-F]{4} ){2}'
 t_opts  'FEEB DAED /' -L -z -f 3735928559 '([0-9A-F]{4} ){2}'
 
+echo "== #18 keyed permutation of the enumeration order =="
+# A permutation, not a sample: the same members, each exactly once.
+check "permuted run holds exactly the plain set" \
+      "$("$RXENUM" -e '[a-z]{2}' | sort | md5sum)" \
+      "$("$RXENUM" -k hunter2 -e '[a-z]{2}' | sort | md5sum)"
+check "permuted run visits 676 members, all distinct" "676 676" \
+      "$("$RXENUM" -k hunter2 -e '[a-z]{2}' | wc -l | tr -d ' ') \
+$("$RXENUM" -k hunter2 -e '[a-z]{2}' | sort -u | wc -l | tr -d ' ')"
+# The exact order is pinned deliberately. Callers rely on a key reproducing a
+# run, so changing the construction is a breaking change and should fail here.
+t_opts 'cx/az/by/bz/cy/cz/ay/ax/bx/' -k hunter2 -e '[a-c][x-z]'
+t_opts 'cz/cx/bz/ay/ax/by/az/bx/cy/' -k other   -e '[a-c][x-z]'
+# Indexing addresses the permuted order, so a run can be resumed.
+t_opts 'cx/' -k hunter2 -z -f 0 '[a-c][x-z]'
+t_opts 'cy/' -k hunter2 -z -f 4 '[a-c][x-z]'
+t_opts 'bx/' -k hunter2 -z -f 8 '[a-c][x-z]'
+# Degenerate domains still have to work.
+t_opts 'a/'  -k hunter2 -e 'a'
+t_opts 'aa/' -k hunter2 -e '(a)\1'
+# -k subsumes -r rather than combining with it.
+t_rc 1 -r -k x '[ab]'
+# It composes with the direction flag: same set, still every member once.
+check "(?L) and -k together still cover the set" \
+      "$("$RXENUM" -e '(?L)[ab]{3}' | sort | md5sum)" \
+      "$("$RXENUM" -k hunter2 -e '(?L)[ab]{3}' | sort | md5sum)"
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"
