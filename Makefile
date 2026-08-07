@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c
-HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c pair.c lens.c
+HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h pair.h lens.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -14,20 +14,26 @@ rxenum: rxenum.o librxe.a rxe.h
 
 rxenum.o: rxenum.c rxe.h
 
-rxe.o: rxe.c rxe.h parse.h
+rxe.o: rxe.c rxe.h parse.h repeat.h pair.h lens.h
 
 rxe_alt.o: rxe_alt.c rxe_alt.h rxe_node.h rxe.h
 
-rxe_node.o: rxe_node.c rxe_node.h rxe.h
+rxe_node.o: rxe_node.c rxe_node.h repeat.h rxe.h
 
 bkreftbl.o: bkreftbl.c bkreftbl.h rxe.h
 
-parse.o: parse.c parse.h rxe_node.h rxe_alt.h rxe.h
+parse.o: parse.c parse.h rxe_node.h rxe_alt.h repeat.h rxe.h
 
 permute.o: permute.c rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o
+repeat.o: repeat.c repeat.h rxe.h
+
+pair.o: pair.c pair.h rxe.h
+
+lens.o: lens.c lens.h repeat.h rxe_alt.h rxe.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
@@ -36,7 +42,7 @@ test: rxenum tests/api
 	sh tests/run.sh
 	./tests/api
 	@if command -v python3 >/dev/null 2>&1; then \
-	    python3 tests/oracle.py; \
+	    python3 tests/oracle.py && python3 tests/shortlex.py; \
 	else \
 	    echo "oracle: skipped, python3 not found"; \
 	fi
@@ -54,7 +60,8 @@ test-asan: rxenum-asan tests/api-asan
 	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
 	ASAN_OPTIONS=detect_leaks=1 ./tests/api-asan
 	@if command -v python3 >/dev/null 2>&1; then \
-	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/oracle.py; \
+	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/oracle.py && \
+	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/shortlex.py; \
 	fi
 
 clean:

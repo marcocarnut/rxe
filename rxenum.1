@@ -164,6 +164,11 @@ instead of in index order, visiting every member exactly once. See
 PERMUTED ORDER below. Implies \fB-e\fR, and cannot be combined with \fB-r\fR.
 .TP
 .B
+\-Q
+Print which order the set is enumerated in -- "shortlex", "diagonal" or
+"place value" -- and do nothing else. See ENUMERATION ORDER and INFINITE SETS.
+.TP
+.B
 \-r
 Randomly choose an element of the set. You can get several random choices
 by setting
@@ -228,6 +233,86 @@ not affected by this flag. To reverse them, write them the other way round.
 Note that L is not a Perl flag. Every inline flag Perl defines is lower
 case, so an upper case letter cannot collide with one; lower case l was not
 available, Perl having given it to locale rules in version 5.14.
+
+.SH INFINITE SETS
+The star and plus metacharacters, and open-ended repetitions such as
+"a{1,}", describe sets with no largest member. There is no count to print,
+so \fBrxenum\fR says so:
+
+.RS
+rxenum 'a*'
+.br
+infinite
+.RE
+
+They are still enumerated, and still addressed by index, so everything but
+the counting works as it does for a finite set. Use \fB-c\fR to say how many
+elements you want:
+
+.RS
+rxenum -e -c 5 '[ab]+'
+.br
+a b aa ab ba
+.RE
+
+The mapping is a bijection onto the whole set: every member is reached after
+finitely many steps, and \fB-f\fR addresses the same order, so a run can be
+stopped and resumed exactly as a finite one can.
+
+.RS
+rxenum -z -f 1000 'a*b*'
+.br
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbb
+.RE
+
+Members come out shortest first. Within a length, the more significant
+positions take as much of it as they can before the less significant ones do,
+and within a given division the ordinary place value applies:
+
+.RS
+rxenum -e -c 10 'a*b*'
+.br
+(empty) a b aa ab bb aaa aab abb bbb
+.RE
+
+That order is what makes an infinite set practical rather than merely
+enumerable. \fBrxenum\fR works out how many members an expression has of each
+length rather than in total, which a cardinality cannot say, and then walks
+the lengths in turn. The counts are worked out only as far as they are asked
+for, so an expression such as "[a-z]{1,20000}a*" costs nothing until you
+enumerate strings twenty thousand characters long.
+
+A comma-separated list is the shape where this tells:
+
+.RS
+rxenum -e -c 6 '(\\d+,)*'
+.br
+(empty) 0, 1, 2, 3, 4,
+.RE
+
+with the first two-element list at index 1,111, after the one empty string,
+the ten one-digit lists, the hundred two-digit ones and the thousand
+three-digit ones.
+
+One shape is refused: an unbounded repetition whose body can match nothing at
+all, as in "(a*)*" or "(a?)+". Such an expression derives the empty string
+infinitely many ways, so the number of members of a given length is not a
+number and there is nothing to count. Perl's matcher refuses an empty loop
+body for the same reason. The restriction is narrow, and deliberately so:
+"(\\d+,)*" spends at least two characters per repetition and is perfectly
+countable.
+
+A backreference is the exception to all of the above. Its length is whatever
+the group it names turned out to be, so the positions of a concatenation stop
+being independent and their lengths can no longer be counted separately. Such
+an expression is enumerated in a different order -- a diagonal walk over the
+unbounded quantifiers, which still reaches every member in finite time but
+not shortest first.
+
+.B -r
+and
+.B -k
+both need a finite set to work over and report an error otherwise.
 
 .SH PERMUTED ORDER
 .B \-k
@@ -301,10 +386,10 @@ A backreference to a group repeated a fixed number of times refers to the
 last repetition, as in Perl. So "([ab]){2}\\1" gives aaa, abb, baa and bbb.
 
 A backreference to a group repeated a variable number of times, such as
-"([ab]){1,2}\\1", is rejected. Each repeat count is enumerated as a separate
-alternation, and a backreference cannot name which one is in play, so no
-single answer would be correct. Reformulate it, for instance as
-"([ab])\\1|([ab]){2}\\2", to say explicitly which repetition you mean.
+"([ab]){1,2}\\1", is currently rejected, because the number of repetitions is
+not fixed and so neither is which one the backreference should copy.
+Reformulate it, for instance as "([ab])\\1|([ab]){2}\\2", to say explicitly which
+repetition you mean.
 
 To emulate Perl behavior, two sucessive quantifiers (say, "a?{2}") gives
 an error. And again just like Perl, you can easily work around it by using
@@ -312,11 +397,6 @@ subexpressions, say, "(a?){2}".
 
 .SH LIMITATIONS
 Works only in 8-bit characters and ASCII. No Unicode support.
-
-Does not handle infinite sets, even when they are enumerable. This also
-means that the universal quantifiers (the star and plus metacharacters)
-will cause the program to croak 'infinite'. Same for open-ended repetitions
-such as "a{1,}".
 
 Neither detects nor skips duplicates:
 
@@ -331,6 +411,10 @@ rxenum -n '(a?){2}'
 .br
 4 aa
 .RE
+
+A generated element is truncated at 2048 characters, without saying so. Wide
+and unbounded repetitions are counted and seeked correctly but cannot be
+printed in full past that: "a{1,100000}" and "a*" both hit it.
 
 POSIX character classes are currently unimplemented, as are many backslash
 special characters. Named backreferences are also currently unimplemented.

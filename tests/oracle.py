@@ -41,6 +41,49 @@ PATTERNS = [
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]
 
+# Sets with no largest member. The whole set cannot be compared, so a prefix
+# of the enumeration is checked instead: every element must be a member, and
+# between them they must cover every member short enough to be reached, which
+# is what catches a mapping that skips part of the set rather than merely
+# ordering it oddly.
+# Sets with no largest member, each with the length up to which coverage is
+# checked and how many elements to look at. The whole set cannot be compared,
+# so a prefix of the enumeration is checked instead: every element must be a
+# member, and between them they must reach every member up to that length.
+#
+# The prefix needed grows sharply with the number of unbounded quantifiers,
+# because the pairing is nested and each level squares the index: reaching all
+# of '[ab]*[cd]*[ef]*' up to three characters wants index 7259, where the same
+# thing over two dimensions wants 420. That is a property of the diagonal
+# walk, not a defect -- everything is still reached in finite time -- but it
+# is why the depths below are set per pattern instead of globally.
+
+INFINITE = [
+    # one unbounded quantifier
+    (r"a*", 6, 200), (r"a+", 6, 200), (r"[ab]*", 5, 200), (r"[ab]+", 5, 200),
+    (r"a{3,}", 8, 200), (r"[ab]{2,}", 5, 200),
+    (r"xa*y", 6, 200), (r"x[ab]*y", 4, 200), (r"[ab]*c", 5, 200),
+    (r"c[ab]*", 5, 200), (r"(ab|c)*", 4, 200), (r"(a|b)+", 5, 200),
+    (r"x(a*)y", 6, 200), (r"a|b*", 6, 200), (r"b*|a", 6, 200),
+    # two, so the index is one Cantor pairing
+    (r"a*b*", 5, 400), (r"[ab]*[cd]*", 3, 600), (r"(a*)(b*)", 5, 400),
+    (r"a?b*", 5, 400), (r"a{2,}b{2,}", 6, 400), (r"a*|b*", 5, 400),
+    # three, so it is nested twice
+    (r"a*b*c*", 4, 800), (r"[ab]*[cd]*[ef]*", 2, 600),
+    # a repetition whose body is itself unbounded, which counting by length is
+    # what makes reachable at all
+    (r"(\d+,)*", 4, 1300), (r"(ab,)*", 6, 200), (r"([ab]+,)*", 4, 400),
+    (r"(a*){2}", 6, 200), (r"(a*)?", 6, 200), (r"(a*|b){1,2}", 4, 200),
+    # backreferences tie two positions' lengths together, so these keep the
+    # diagonal order rather than being refused. Still a bijection onto the
+    # whole set, which is what the checks below actually test.
+    (r"([ab]+)\1", 4, 200), (r"([0-9]+)-\1", 3, 200), (r"(a)\1a*", 6, 200),
+]
+
+# rxenum prints at most this many characters of an element and says nothing
+# about having cut it, so anything at the limit is not evidence either way.
+MAXSTRLEN = 2048
+
 
 def run(args):
     p = subprocess.run([RXENUM] + args, capture_output=True, text=True, env=ENV)
@@ -61,6 +104,63 @@ def brute_force(pat, alphabet, maxlen):
         for p in itertools.product(alphabet, repeat=n)
         if re.fullmatch(pat, "".join(p))
     }
+
+
+def check_infinite(pat, maxlen, prefix):
+    """Returns a list of failure messages for one infinite pattern."""
+    bad = []
+    rc, out = run(["-e", "-c", str(prefix), pat])
+    if rc != 0:
+        return [f"FAIL  {pat}: exited {rc}"]
+    gen = out.split("\n")[:-1]
+    if len(gen) != prefix:
+        bad.append(f"FAIL  {pat}: asked for {prefix}, got {len(gen)}")
+
+    # 1. soundness -- everything produced is really a member. Elements at the
+    #    print limit were cut short and are not the library's answer.
+    wrong = [g for g in gen
+             if len(g) < MAXSTRLEN and not re.fullmatch(pat, g)]
+    if wrong:
+        bad.append(f"FAIL  {pat}: generated non-members {wrong[:5]}")
+
+    # 2. completeness -- nothing short is skipped. A mapping may visit the set
+    #    in any order it likes, but it must visit all of it, and an off-by-one
+    #    in the block walk or a pairing that is not onto shows up here as a
+    #    member that never appears however far you enumerate.
+    alphabet = sorted({c for g in gen for c in g})
+    if alphabet and len(alphabet) ** (maxlen + 1) <= 200000:
+        missing = sorted(brute_force(pat, alphabet, maxlen) - set(gen))
+        if missing:
+            bad.append(f"FAIL  {pat}: never reached {missing[:5]}"
+                       f" (of {len(missing)}) within {prefix}")
+
+    # 3. random access agrees with sequential iteration
+    for i in (0, 1, len(gen) // 3, len(gen) - 1):
+        rc, out = run(["-z", "-f", str(i), pat])
+        if rc != 0 or out.rstrip("\n") != gen[i]:
+            bad.append(f"FAIL  {pat}: -f {i} gave {out.rstrip(chr(10))!r},"
+                       f" expected {gen[i]!r}")
+            break
+
+    # 4. shortest first, where that is claimed. The whole point of counting
+    #    by length is that the lengths come out non-decreasing, so this is the
+    #    property to check rather than any particular sequence.
+    rc, out = run(["-Q", pat])
+    if rc == 0 and out.strip() == "shortlex":
+        lens = [len(g) for g in gen]
+        for i in range(1, len(lens)):
+            if lens[i] < lens[i - 1]:
+                bad.append(f"FAIL  {pat}: element {i} has length {lens[i]}"
+                           f" after one of length {lens[i-1]}")
+                break
+
+    # 5. there is no cardinality to report, and it must say so rather than
+    #    report the size of the finite part
+    rc, out = run(["-~", pat])
+    if out.split("\n")[0].strip() != "infinite":
+        bad.append(f"FAIL  {pat}: counted {out.split(chr(10))[0]!r},"
+                   f" want 'infinite'")
+    return bad
 
 
 def main():
@@ -112,8 +212,17 @@ def main():
             print(f"FAIL  {pat}: -r produced {out.rstrip(chr(10))!r}, not a member")
             failures += 1
 
-    print(f"\noracle: {len(PATTERNS) - failures} of {len(PATTERNS)} patterns clean")
-    return 1 if failures else 0
+    inf_failures = 0
+    for pat, maxlen, prefix in INFINITE:
+        bad = check_infinite(pat, maxlen, prefix)
+        for line in bad:
+            print(line)
+        if bad:
+            inf_failures += 1
+
+    total = len(PATTERNS) + len(INFINITE)
+    print(f"\noracle: {total - failures - inf_failures} of {total} patterns clean")
+    return 1 if failures or inf_failures else 0
 
 
 if __name__ == "__main__":

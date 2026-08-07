@@ -122,21 +122,19 @@ t_rc 0 '[A-Z]{8}'
 t_rc 0 '((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2)'
 
 echo "== #1 parse errors must report the right message, not a garbage table index =="
-t_error 'a*'       'infinite'
-t_error 'a+'       'infinite'
 t_error 'a{2}{3}'  'nested quantifiers'
 t_error '(ab'      'missing parentheses'
 t_error 'ab)'      'extraneous parentheses'
 t_error '?a'       'nothing before quantifier'
 t_error '[abc'     'unterminated character class'
 t_error '\1'       'invalid backreference'
-t_error '(a\1)'    'infinite'
+t_error '(a\1)'    'backreference to the group it is inside'
 t_error 'a{3,1}'   'bad repetition parameters'
-# Open-ended repetition denotes an infinite set. The RXE_INFINITE assignment
-# used to fall through into the bad-parameter check and be overwritten.
-t_error 'a{1,}'    'infinite'
-t_error 'a{0,}'    'infinite'
-t_error 'a{5,}'    'infinite'
+# Open-ended repetition denotes an infinite set. It used to be refused; it is
+# now enumerated, and the count reports that there is no count. See #19.
+t_count 'a{1,}'    'infinite'
+t_count 'a{0,}'    'infinite'
+t_count 'a{5,}'    'infinite'
 
 echo "== #2 backreferences must enumerate rather than double-free =="
 t_enum '(a)\1'              'aa/'
@@ -395,6 +393,136 @@ t_rc 1 -r -k x '[ab]'
 check "(?L) and -k together still cover the set" \
       "$("$RXENUM" -e '(?L)[ab]{3}' | sort | md5sum)" \
       "$("$RXENUM" -k hunter2 -e '(?L)[ab]{3}' | sort | md5sum)"
+
+echo "== #11 closed-form counted repetition =="
+# Repetitions used to be written out, one copy per position per repeat count,
+# which cost O(m^2) memory. These sizes could not be parsed at all before:
+# [a-z]{1,20000} wanted 26GB and was killed by the OOM killer.
+# sum(26^j, j=1..20000), computed independently in Python. 28,300 digits, so
+# it is pinned by its checksum rather than written out.
+rx20k=$("$RXENUM" -~ '[a-z]{1,20000}' | head -1)
+check "[a-z]{1,20000} has 28300 digits" '28300' "${#rx20k}"
+check "[a-z]{1,20000} counts correctly" '696a9232d95fe0ba2cccfbbbf96ed889' \
+      "$(printf '%s' "$rx20k" | md5sum | cut -d' ' -f1)"
+# rxenum caps a printed element at MAXSTRLEN, so stay inside it: the last of
+# these is exactly the longest element the program will print in full.
+check "a{1,100000} seeks to the 90th" "$(printf 'a%.0s' $(seq 1 90))" \
+      "$("$RXENUM" -z -f 89 'a{1,100000}' 2>&1)"
+check "a{1,100000} prints 2048 characters in full" \
+      "$(printf 'a%.0s' $(seq 1 2048))" \
+      "$("$RXENUM" -z -f 2047 'a{1,100000}' 2>&1)"
+check "[a-z]{1,20000} seeks into a set of 10^28000" 'ab' \
+      "$("$RXENUM" -z -f 27 '[a-z]{1,20000}' 2>&1)"
+# The mapping itself must not have moved: every one of these was checked
+# element for element against the written-out representation.
+t_enum 'a{2,3}'          'aa/aaa/'
+t_enum '[ab]{1,2}'       'a/b/aa/ab/ba/bb/'
+t_enum '(a|bc){0,2}'     '/a/bc/aa/abc/bca/bcbc/'
+t_enum '(a{1,2}){1,2}'   'a/aa/aa/aaa/aaa/aaaa/'
+t_enum '[ab]{0,2}[cd]{0,2}' '/c/d/cc/cd/dc/dd/a/ac/ad/acc/acd/adc/add/b/bc/bd/bcc/bcd/bdc/bdd/aa/aac/aad/aacc/aacd/aadc/aadd/ab/abc/abd/abcc/abcd/abdc/abdd/ba/bac/bad/bacc/bacd/badc/badd/bb/bbc/bbd/bbcc/bbcd/bbdc/bbdd/'
+# A repeat count of zero leaves nothing behind, and an impossible thing can
+# still be repeated zero times.
+t_enum 'a{0}b'           'b/'
+t_enum  '[^\x0-\xFF]{0,2}'  '/'
+t_count '[^\x0-\xFF]{1,2}'  '0'
+# '?' is now the same construction as {0,1} rather than a second copy of it.
+t_enum '(ab|c)?'         '/ab/c/'
+t_enum '[ab]?'           '/a/b/'
+t_enum '(a?){2}'         '/a/a/aa/'
+# Direction still reaches inside a repetition, including when the bare (?L)
+# that sets it appears after the repetition. This one did change: a bare flag
+# group is documented to govern the whole enclosing group, but the repetition
+# used to snapshot the direction when '{' was parsed and so missed it.
+t_enum '(?L)[ab]{1,3}'   'a/b/aa/ba/ab/bb/aaa/baa/aba/bba/aab/bab/abb/bbb/'
+t_enum '[01]{2}(?L)'     '00/10/01/11/'
+t_enum '[01]{2}'         '00/01/10/11/'
+# Self-consistency across the three ways of asking, for shapes the rework
+# touched.
+t_selfcheck '[ab]{0,3}'
+t_selfcheck '(a|bc){1,3}'
+t_selfcheck '(?L)[abc]{0,2}'
+t_selfcheck 'x(ab|c){0,2}y[de]?'
+t_selfcheck '([ab]{1,2}){0,2}'
+
+echo "== #19 sets with no largest member =="
+# '*', '+' and '{n,}' used to be refused outright. There is still no
+# cardinality to report, and the count says so rather than printing the size
+# of the finite part.
+t_count 'a*'        'infinite'
+t_count 'a+'        'infinite'
+t_count 'a{5,}'     'infinite'
+t_count '[ab]*'     'infinite'
+t_count 'x(a*)y'    'infinite'
+t_count 'a|b*'      'infinite'
+t_rc 0 'a*'
+t_rc 0 -e -c 3 'a*'
+# One unbounded quantifier is the repeat counts walked without an upper bound.
+t_opts '/a/aa/aaa/aaaa/'      -e -c 5 'a*'
+t_opts 'a/aa/aaa/aaaa/aaaaa/' -e -c 5 'a+'
+t_opts 'aaaaa/aaaaaa/'        -e -c 2 'a{5,}'
+t_opts 'a/b/aa/ab/ba/bb/'     -e -c 6 '[ab]+'
+t_opts 'xy/xay/xaay/'         -e -c 3 'xa*y'
+t_opts 'xy/xay/xaay/'         -e -c 3 'x(a*)y'
+t_opts 'b/ab/aab/'            -e -c 3 'a*b'
+# Repeating something that matches nothing is finite after all: only the empty
+# run exists, and only when zero repetitions are allowed.
+t_count '[^\x0-\xFF]*'     '1'
+t_enum  '[^\x0-\xFF]*'     '/'
+t_count '[^\x0-\xFF]+'     '0'
+# Two of them are two dimensions, spread over the one index by a pairing
+# function. The order is pinned: it is the interface, as with -k.
+t_opts '/a/b/aa/ab/bb/aaa/aab/abb/bbb/' -e -c 10 'a*b*'
+t_opts '/a/b/aa/ab/bb/'                 -e -c 6 '(a*)(b*)'
+t_opts 'aabb/aaabb/aabbb/aaaabb/'       -e -c 4 'a{2,}b{2,}'
+t_opts '0@a/0@b/0@c/0@d/0@e/0@f/'       -e -c 6 '[0-9]+@[a-z]+'
+# Endless alternations are dovetailed above the finite ones rather than laid
+# end to end, which would mean the second never started.
+t_opts '/a/b/bb/bbb/'   -e -c 5 'a|b*'
+t_opts '/b/a/bb/bbb/'   -e -c 5 'b*|a'
+t_opts '//a/b/aa/'      -e -c 5 'a*|b*'
+# Direction still reaches inside.
+t_opts '/a/b/aa/ba/ab/bb/' -e -c 7 '(?L)[ab]*'
+# Seeking is independent of iterating, and there is no end to run past.
+t_opts 'aaaaaaaaaa/'       -z -f 10 'a*'
+t_opts 'aab/'              -z -f 2  'a*b'
+t_opts 'abb/'              -z -f 8  'a*b*'
+t_rc 0 -z -f 100000 'a*b*'
+# Repeating something endless without limit is refused rather than answered
+# wrongly. See the TODO.
+t_error '(a*)*'      'unbounded repetition of a possibly empty expression'
+t_error '(a*)+'      'unbounded repetition of a possibly empty expression'
+t_error '(a?)+'      'unbounded repetition of a possibly empty expression'
+t_error '((a|)b*)*'  'unbounded repetition of a possibly empty expression'
+# Zero repetitions of one is the empty string and nothing else.
+t_count '(a*){0}'    '1'
+t_enum  '(a*){0}'    '/'
+# A body that always spends at least one character is countable by length,
+# and this is the shape that matters: a comma-separated list.
+t_count '(\d+,)*'    'infinite'
+t_opts  '/0,/1,/2,/3,/4,/'  -e -c 6 '(\d+,)*'
+# Counting by length is what makes this reachable: the first two-element list
+# sits at index 1,111 -- lengths 0,2,3 hold 1+10+100 members and length 4 holds
+# 1000 one-element lists before the two-element ones start. Under the diagonal
+# pairing the same string sat at 349, but a five-element list sat at 5.8e18.
+t_opts  '000,/'  -e -z -f 111  '(\d+,)*'
+t_opts  '0,0,/'  -e -z -f 1111 '(\d+,)*'
+# Deep seeks must be arithmetic, not a walk. Under the diagonal pairing a
+# five-element list sat at 5.8e18 and could not be reached at all.
+t_opts  '2,415,789,/'          -e -z -f 2000000000 '(\d+,)*'
+t_opts  '587145910526315789,/' -e -z -f 1000000000000000000 '(\d+,)*'
+t_opts  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbb/' -e -z -f 1000 'a*b*'
+check "(\d+,)* has 1100 members of length 4" '1100' \
+      "$("$RXENUM" -e -c 1300 '(\d+,)*' | awk 'length($0)==4' | wc -l | tr -d ' ')"
+# A bounded repetition of an endless body is countable too: the bound limits
+# how many dimensions there are, and each is finite once the length is fixed.
+t_count '(a*){2}'    'infinite'
+t_opts  '/a/a/aa/aa/aa/'    -e -c 6 '(a*){2}'
+t_opts  '//a/aa/aaa/'       -e -c 5 '(a*)?'
+t_error 'a**'        'nested quantifiers'
+t_error '*a'         'nothing before quantifier'
+# -k and -r need a domain to work over and there is not one.
+t_rc 1 -k x 'a*'
+t_rc 1 -r   'a*'
 
 echo "== known divergences, still open =="
 

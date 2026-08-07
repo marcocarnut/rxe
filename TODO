@@ -10,6 +10,27 @@ DONE SINCE 0.9.1
 - Flag to change the enumeration direction: (?L), (?-L) and -L.
 - Keyed permutation of the enumeration order: -k key, and the
   rxe_permutation_* entry points in rxe.h.
+- Infinite sets. '*', '+' and '{n,}' used to be a hard error; they are now
+  enumerated and addressed by index like anything else, with only the
+  counting reporting that there is no count. rxe_is_infinite() is the entry
+  point.
+- Shortest-member-first order for them, by counting an expression's members
+  of each length rather than in total (lens.c). That is what makes an
+  infinite set walkable rather than merely enumerable, and what lets a
+  repetition whose body is itself unbounded work at all: '(\d+,)*', a
+  comma-separated list, has its first two-element list at index 1,111, where
+  the diagonal pairing this replaced put a five-element one at 5.8e18. The
+  counts are computed lazily, so a finite part of the expression costs
+  nothing until the enumeration is long enough to reach it. Finite
+  expressions keep place value and are untouched. rxe_is_shortlex() says
+  which order an expression got, and 'rxenum -Q' reports it.
+- Closed-form counted repetition. "x{r0,r1}" is now a repeat count and one
+  index per position rather than one written-out copy per position per repeat
+  count, so the memory a repetition costs is the length of the string it
+  generates instead of the square of the largest repeat count.
+  [a-z]{1,20000} needed 26GB and was killed by the OOM killer; it now parses
+  in 3MB, and [a-z]{1,1000000} in 25MB. '?' is built by the same routine as
+  {0,1} instead of having its own copy of the construction.
 - make install now installs librxe.a and rxe.h, so the library can actually
   be linked against.
 - Fifteen correctness fixes, from an uninitialised status byte that made
@@ -31,16 +52,12 @@ SHORT TERM TO-DOs
   backreference compares case-insensitively. Exact copies are probably the
   more useful reading for generation, but the divergence should either be
   fixed or written down in the manual page.
-- Code refactoring
-  > split handle_repeats in two functions: the first parses/validates
-    the paramaters, the second does the actual work
-  > simplify the ? quantifier using the above function as a special case {0,1}
-    (note: since the ? quantifier and handle_repeats have twice now had the
-    same bug fixed separately -- clearing the node's own characters, and
-    inheriting the enumeration direction -- this is worth more than it looks)
+- rxenum still truncates a generated string at MAXSTRLEN, now 2048 rather
+  than 100, and still says nothing about having done so. Nothing sensible
+  reaches that, but a wide repetition can: 'a{1,100000}' is counted and
+  seeked correctly and then printed wrong past the 2048th element. Either
+  size the buffer from the expression or say when the answer was cut.
 - Error handling
-  > handle_repeats still signals failure by writing a status code into the
-    mpz_t it was given for the result. Clean that up.
   > More descriptive error messages pointing to the probable location.
     This needs no structural change: str is in scope at all twenty-seven
     places an error is raised, so it only wants a field for the offset and a
@@ -48,39 +65,50 @@ SHORT TERM TO-DOs
     rxe_parse skips a leading ^, so offsets must be relative to the original
     argument or the caret sits one character off. Where a nested parse
     propagates its status upward, the inner position has to win, or every
-    error inside a group reports the position of the group. And five sites
-    do not set rxe->status at all, smuggling the code through the mpz_t
-    meant for the result -- an mpz_t can carry a number but not a position,
-    so those paths cannot report one until the smuggling above is fixed.
-    The two items are therefore one job, and cheaper done together.
+    error inside a group reports the position of the group. And several
+    helpers signal failure by returning NULL and leave the caller to decide
+    which status that meant, so the place that knows where the trouble was
+    is not the place that records what it was. parse_repeat_params now takes
+    the status by pointer instead, which is the shape the rest should follow;
+    it used to be the worst of them, returning the code inside the mpz_t it
+    had been given for the result.
 
 
 LONG-TERM TO-DOs
 ================
 
-> Replace the node-cloning repetition with closed-form counted nodes.
-  handle_repeats currently materialises {r0,r1} by cloning the node once per
-  repetition per count, which costs O(m^2) memory: a{1,2000} takes 316MB and
-  a{1,20000} would want about 30GB. A repetition node carrying a count
-  instead makes the cardinality a geometric series and the seek a division.
+> Count lengths through a backreference. A backreference's length is
+  whatever the group it names turned out to be, so the positions of a
+  concatenation are no longer independent and the convolution the length
+  counts are built from does not describe the set. Such an expression falls
+  back to the diagonal pairing: still a bijection onto the whole set, still
+  reaching everything in finite time, but not shortest first.
+  rxe_is_shortlex() reports which order an expression got and the test suite
+  applies the ordering checks only where it says shortlex.
 
-> Enumerate infinite sets. Keep reporting that the set is infinite, but
-  still map integers onto its members, so * and + stop being a hard error.
-  Each unbounded quantifier is an N-valued dimension; the finite part stays
-  the mixed-radix numeral it is today, and a pairing function spreads one
-  index across the dimensions. Best done together with the closed-form
-  repetition above rather than after it: an unbounded quantifier is just a
-  counted repetition whose upper bound is infinite, so the two are one
-  change to the same arithmetic.
+  Two ways to fix it. The narrow one folds a group and the backreferences to
+  it into a single composite position, whose length distribution is the
+  group's stretched by the number of copies: '([ab]+)\1' has count[2l] equal
+  to the group's count[l]. That is exact and cheap, and covers the shapes
+  people write, but only when the group and its backreferences sit in the
+  same concatenation -- '((a+)x)\2' names a group nested inside another
+  position and does not fold.
 
-> Permute the enumeration order under a key. A keyed bijection on [0,N)
-  applied to the index before seeking gives a different, deterministic,
-  repeatable order -- enough to randomise a brute-force search without
-  losing the ability to resume it. A small Feistel network over the index
-  with cycle walking is the standard construction. This touches nothing but
-  the index, so it can be done at any point, independently of everything
-  above, and it subsumes -r: a permutation visits every member exactly once
-  instead of sampling with replacement.
+  The general one carries the lengths already chosen for referenced groups
+  through the split search as extra state, which is a dimension of the
+  dynamic programming per referenced group: O(positions * L^(k+1)) for k of
+  them. Fine for the one or two that occur in practice, and it subsumes the
+  fold.
+
+> Order strictly by lexicographic rank within a length, rather than by how
+  the length divides among the positions. Within one length the current order
+  takes the splits in turn -- the most significant position taking as much as
+  it can first -- and applies place value inside each. For 'a*b*' that is the
+  same thing as alphabetical, which is why the examples look clean; for
+  '[ab]*[cd]*' it is not, giving aa, ab, ba, bb, ac rather than aa, ab, ac,
+  ad, ba. Fixing it means comparing characters rather than counting members,
+  which is a different kind of question from the one the counts answer, and
+  it is not obvious it is worth the cost.
 
 > Abstract the arithmetic behind a base-type shim, so the width can be
   chosen at build time: GMP for unbounded cardinalities as now, or
@@ -116,9 +144,9 @@ LONG-TERM TO-DOs
 
 > JIT compiler, and a GPU back end. The parse tree is the intermediate
   representation and a code generator consumes it, so neither requires the
-  tree to change. Worth doing after the closed-form repetition rework, both
-  because the tree settles then and because today a JIT would have to
-  compile the two million nodes that a{1,2000} expands into.
+  tree to change. The closed-form repetition rework has happened, which
+  removes the reason to wait: a JIT would have had to compile the two
+  million nodes a{1,2000} used to expand into, and now compiles one.
 
   The GPU case has a shape the JIT case does not. A GPU wants independent
   work per thread, and rxe_iterate carries sequentially, so it does not
@@ -133,8 +161,9 @@ LONG-TERM TO-DOs
   be chasing a moving target through the repetition rework.
 
 > Binary tree over alternations, to replace the linear scan in rxe_seek.
-  Deferred, and possibly not worth doing: 20,000 hand-written alternatives
-  already parse and seek in 0.02s, and enumerate in full in 0.02s. The only
-  place large alternation counts arise in practice is handle_repeats, which
-  builds one alternation per repeat count -- and the closed-form rework
-  above removes them. Revisit only if this ever shows up in a profile.
+  Deferred, and now probably not worth doing at all: 20,000 hand-written
+  alternatives already parse and seek in 0.02s, and enumerate in full in
+  0.02s. The one place large alternation counts used to arise in practice
+  was handle_repeats, which built one alternation per repeat count, and the
+  closed-form rework has removed them. Revisit only if a profile ever says
+  otherwise.

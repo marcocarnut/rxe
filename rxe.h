@@ -36,10 +36,17 @@
 // sets live in different fields, so testing one against the other is a
 // mistake that should not be able to look plausible.
 
+// The rep_max of a repetition with no upper bound, as in 'a*', 'a+' or
+// 'a{3,}'. Such a repetition is infinite unless the thing it repeats matches
+// nothing at all, in which case only the empty run exists.
+
+#define RXE_REP_UNBOUNDED            (-1)
+
 #define RXE_FLAG_CLOSED_BRACKET      0x0100
 #define RXE_FLAG_HAS_BKRTABLE        0x0200
 #define RXE_FLAG_VARIABLE_REPEAT     0x0400
 #define RXE_FLAG_LEFT_TO_RIGHT       0x0800
+#define RXE_FLAG_SHORTLEX            0x1000
 
 /* -------------------------- Global Declarations ------------------------- */
 
@@ -52,6 +59,10 @@
 #define RXE_STATUS_LIST(X)                                                     \
     X(RXE_OK,                           "")                                    \
     X(RXE_INFINITE,                     "infinite")                            \
+    X(RXE_RECURSIVE_BACKREF,                                                   \
+      "backreference to the group it is inside")                               \
+    X(RXE_NESTED_UNBOUNDED,                                                    \
+      "unbounded repetition of a possibly empty expression")                   \
     X(RXE_TOO_MANY_PARENS,              "extraneous parentheses")              \
     X(RXE_TOO_LITTLE_PARENS,            "missing parentheses")                 \
     X(RXE_LONE_QUANTIFIER,              "nothing before quantifier")           \
@@ -92,39 +103,82 @@ enum rxe_parse_status {
 struct rxe;         // forward definitions needed due to the recursive...
 struct rxe_node;    // ...nature of the data structures
 
+// How many members an expression has of each length, rather than in total.
+//
+// A cardinality is enough to walk a finite set, because place value can order
+// it. It is not enough to walk an infinite one in a useful order: the members
+// have to come out shortest first, and that means being able to ask how many
+// there are of each length rather than how many there are altogether.
+//
+// count[L] is how many members have length exactly L, and is meaningful for L
+// up to 'max'. Nothing is computed until it is asked for, and then only as far
+// as it was asked, which is what keeps this affordable: enumerating the first
+// few thousand members of '[a-z]{1,20000}a*' asks about lengths up to a dozen
+// or so and never touches the twenty thousand.
+
+struct rxe_lens {
+    int    max;                   // counts known for lengths 0..max, -1 if none
+    int    alloc;                 // entries allocated in count
+    mpz_t *count;                 // count[L] members of length exactly L
+};
+
 // An alternation node, arranged as a doubly linked list with head and tail
 // anchors in 'struct rxe'.
 
 struct rxe_alt {
     int nnodes;                   // Number of nodes in this alternation
-    mpz_t nitems;                 // Total number of items in the set
+    int ninf;                     // How many of its nodes are infinite
+    struct rxe_lens lens;         // Members by length, over all its nodes
+    mpz_t nitems;                 // Number of items, counting finite nodes only
     mpz_t start;                  // Start point in the integer mapping
     struct rxe_node *curr;        // Current node being iterated
     struct rxe_node *head;        // Start of the linked list of nodes
     struct rxe_node *tail;        // End of the linked list of nodes
     struct rxe_alt  *prev;        // Pointer to the next alternation
     struct rxe_alt  *next;        // Pointer to the previous alternation
+    struct rxe      *owner;       // The expression this belongs to
 };
 
-// A single node, representing a character class, a subexpression or a
-// backreference. The characters comprising the class are in a dynamically
-// allocated string pointed to by 'str'. This string is not null-terminated;
-// instead, the number of characters it holds is in 'len'. The routines must
-// be prepared for the possibility that 'str' might be NULL. A subexpression
-// or backreference is pointed to by the 'rxe' field. If it is a backref, the
-// flag back is_backref shall be true. Nodes are arranged as a doubly linked
-// list with head and tail anchors in 'struct rxe_alt'.
+// A single node, representing a character class, a subexpression, a
+// backreference or a repetition. The characters comprising the class are in a
+// dynamically allocated string pointed to by 'str'. This string is not
+// null-terminated; instead, the number of characters it holds is in 'len'.
+// The routines must be prepared for the possibility that 'str' might be NULL.
+// A subexpression or backreference is pointed to by the 'rxe' field. If it is
+// a backref, the flag is_backref shall be true. Nodes are arranged as a
+// doubly linked list with head and tail anchors in 'struct rxe_alt'.
+//
+// A repetition node has is_repeat set. It holds a single copy of the repeated
+// subexpression in 'rxe' and repeats it between rep_min and rep_max times,
+// which is why 'rxe' alone cannot give the node's cardinality: for every other
+// kind of node the two coincide, but here the node's own nitems is the sum of
+// a geometric series over the subexpression's. Its state is the repeat count
+// currently selected and one index per position, rather than one materialised
+// copy of the subexpression per position: repeating a subexpression of
+// cardinality b between 0 and m times has m+1 alternations holding m(m+1)/2
+// copies between them, so writing them out cost quadratic memory and put a
+// ceiling of a few thousand on m. See repeat.c.
 
 struct rxe_node {
     int   len;                    // Number of chars in *str
     char *str;                    // string with possible characters
     mpz_t nitems;                 // No of items in this set and its subsets
-    mpz_t start;                  // Start point in the integer mapping
     int   iterator;               // Current item being iterated
     int   is_backref;             // True if this node is a backreference
+    int   is_repeat;              // True if this node is a repetition
+    int   is_inf;                 // True if this node has no largest member
+    int   rep_min;                // Fewest repetitions, when is_repeat
+    int   rep_max;                // Most repetitions, or RXE_REP_UNBOUNDED
+    int   rep_count;              // Repetitions currently selected
+    int   rep_alloc;              // How many rep_digit entries are live
+    mpz_t *rep_digit;             // One index into rxe per position
+    int   *rep_len;               // That position's length, in length order
+    struct rxe_lens lens;         // Members of this node by length
+    struct rxe_lens rest;         // ...of every node less significant than it
     struct rxe *rxe;              // Pointer to a subexpression or backref
     struct rxe_node *prev;        // Pointer to the next node
     struct rxe_node *next;        // Pointer to the previous node
+    struct rxe_alt  *owner;       // The alternation this belongs to
 };
 
 // A backreference table. All subexpressions point to it, but only the root
@@ -141,11 +195,14 @@ struct rxe_backref_table {
 
 struct rxe {
     int nalts;                     // number of alternations in the linked list
+    int ninf;                      // how many of them have no largest member
     enum rxe_parse_status status;  // error code returned during parsing
     struct rxe_alt *head;          // start of the linked list of alternations
     struct rxe_alt *tail;          // end of the linked list of alternations
     struct rxe_alt *curr;          // current item being iterated
-    mpz_t nitems;                  // number of items in the set
+    mpz_t nitems;                  // items in the set, finite alternations only
+    mpz_t index;                   // index the expression currently sits at
+    struct rxe_lens lens;          // Members by length, over all its alternations
     struct rxe_backref_table *brt; // backreferences table (only on root node)
     int flags;                     // miscellaneous flags
 };
@@ -160,13 +217,27 @@ struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
 const char *rxe_error_message(struct rxe *rxe);
 
+// Non-zero when the expression describes an infinite set. rxe->nitems then
+// counts only the part of it that is finite, and is not the size of the set;
+// there is no largest index, and rxe_seek accepts any.
+
+int rxe_is_infinite(struct rxe *rxe);
+
+// Non-zero when the expression is enumerated shortest member first. True of
+// every infinite expression whose lengths can be counted; a backreference
+// ties two positions' lengths together and defeats that, and such an
+// expression falls back to the diagonal order instead. Finite expressions are
+// enumerated by place value as they always were and report zero.
+
+int rxe_is_shortlex(struct rxe *rxe);
+
 char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);
 int rxe_seek(struct rxe *rxe, mpz_t pos);
 
 void rxe_init(void);
 struct rxe *rxe_new(void);
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow);
+void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node);
 struct rxe *rxe_deep_clone(struct rxe *src_rxe);
 void rxe_free(struct rxe *rxe);
 

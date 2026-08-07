@@ -22,6 +22,9 @@
 #include "rxe_alt.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
+#include "repeat.h"
+#include "pair.h"
+#include "lens.h"
 #include "parse.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
@@ -81,6 +84,56 @@ static struct rxe_alt *rxe_first_alt(struct rxe *rxe)
     return NULL;
 }
 
+int rxe_is_infinite(struct rxe *rxe)
+{
+    return rxe && rxe->ninf > 0;
+}
+
+int rxe_is_shortlex(struct rxe *rxe)
+{
+    return rxe && (rxe->flags & RXE_FLAG_SHORTLEX) != 0;
+}
+
+// A backreference's length is whatever the group it names turned out to be,
+// so the positions of a concatenation stop being independent and the
+// convolution the length counts are built from no longer describes the set.
+// Rather than refuse such an expression, it keeps the diagonal order.
+
+static int tree_has_backref(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    struct rxe_node *node;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        for ( node = alt->head ; node ; node = node->next ) {
+            // Do not follow a backreference: it points at a group owned
+            // elsewhere in the tree, and following it would go round in
+            // circles.
+            if (node->is_backref) return 1;
+            if (node->rxe && tree_has_backref(node->rxe)) return 1;
+        }
+    return 0;
+}
+
+static void mark_shortlex(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    struct rxe_node *node;
+    rxe->flags |= RXE_FLAG_SHORTLEX;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        for ( node = alt->head ; node ; node = node->next )
+            if (node->rxe && !node->is_backref) mark_shortlex(node->rxe);
+}
+
+// The i-th alternation that has no largest member, counted in written order.
+
+static struct rxe_alt *rxe_nth_inf_alt(struct rxe *rxe, unsigned long i)
+{
+    struct rxe_alt *alt;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        if (alt->ninf && !i--) return alt;
+    return NULL;
+}
+
 char *rxe_current(char *str, int maxlen, struct rxe *rxe)
 {
     if (maxlen<=0) return str;
@@ -89,7 +142,36 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
     struct rxe_node *node;
     if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
-        if (node->rxe) {
+        if (node->is_repeat) {
+            // One copy of the subexpression stands in for every position, so
+            // it has to be seeked to each position's index in turn. Rendering
+            // in string order also means the subexpression is left holding the
+            // final repetition, which is what a later backreference into it
+            // should see. The digits are stored by position rather than by
+            // significance, so this walks them in string order whichever way
+            // round the odometer runs.
+            int i;
+            int shortlex = rxe->flags & RXE_FLAG_SHORTLEX;
+            for ( i = 0 ; i < node->rep_count ; i++ ) {
+                char *new_str;
+                // An unbounded repetition can select a run far longer than
+                // the caller's buffer -- 'a*' at index a billion is a billion
+                // characters -- so stop as soon as there is no room, rather
+                // than generating the rest of it to throw away.
+                if (maxlen <= 0) break;
+                // Addressed by the length it takes and its place among the
+                // members of that length, rather than by one index into the
+                // body's whole ordering, which an endless body does not have
+                // in a useful order.
+                if (shortlex
+                        ? rxe_seek_at_length(node->rxe,node->rep_len[i],
+                                             node->rep_digit[i])
+                        : rxe_seek(node->rxe,node->rep_digit[i])) break;
+                new_str = rxe_current(str,maxlen,node->rxe);
+                maxlen -= new_str - str;
+                str = new_str;
+            }
+        } else if (node->rxe) {
             char *new_str = rxe_current(str,maxlen,node->rxe);
             maxlen -= new_str - str;
             str = new_str;
@@ -109,8 +191,15 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
 int rxe_iterate(struct rxe *rxe)
 {
     if (!rxe || !rxe->curr) return 1;
+    if (rxe->ninf) {
+        // No odometer walks this. The order over the endless dimensions is a
+        // diagonal, not place value, so the only way to step is to address
+        // the next index and seek to it. There is always a next one, which is
+        // why an infinite expression never carries out.
+        mpz_add_ui(rxe->index,rxe->index,1);
+        return rxe_seek(rxe,rxe->index);
+    }
     struct rxe_alt *alt = rxe->curr;
-    if (!alt) return 1;
     // Which end of the alternation carries first: the last node is the least
     // significant digit by default, so that enumeration counts the way an
     // ordinary numeral does.
@@ -119,7 +208,9 @@ int rxe_iterate(struct rxe *rxe)
     int carry = 1;
     if (node) {
         while (carry) {
-            if (node->rxe && !node->is_backref) {
+            if (node->is_repeat) {
+                carry = rxe_repeat_iterate(node,l2r);
+            } else if (node->rxe && !node->is_backref) {
                 carry = rxe_iterate(node->rxe);
             }
             if (carry) {
@@ -145,54 +236,133 @@ int rxe_iterate(struct rxe *rxe)
     return carry;
 }
 
-int rxe_seek(struct rxe *rxe, mpz_t pos)
+// Select the item at 'pos' within one alternation.
+//
+// The finite positions are the digits of a numeral, as they always were.
+// Positions with no largest member cannot be digits -- place value needs
+// every radix but the most significant to be finite -- so they are lifted out
+// above the numeral and the leftover is spread across them by a pairing
+// function. With one such position, which is much the commonest case, that
+// spreading is the identity and this is the old code with the division done
+// one step earlier.
+
+static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
 {
-    if (!rxe) return 1;
-    mpz_t q,r,p,n;
+    struct rxe_node *node;
+    mpz_t *dim = NULL;
+    mpz_t q,r,n,p;
+    int rc = 0, i = 0;
     mpz_init(q);
     mpz_init(r);
     mpz_init(n);
     mpz_init_set(p,pos);
-    struct rxe_alt *alt;
-    struct rxe_node *node = NULL;
-    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
-    // FIXME: Performance: this is slow if the number of alternations is large.
-    // We should enumerate this into an array and binary search it instead.
-    // Also, as an enhancement, we should add a flag to allow left-to-right
-    // instead of right-to-left associativity. This should be done on each
-    // subexpression so we can fine tune the order in which the sets will be
-    // enumerated.
-    for ( alt = rxe->tail ; alt ; alt = alt->prev ) {
-        if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
-        if (mpz_cmp(alt->start,pos)<=0) {
-            rxe->curr = alt;
-            node = l2r ? alt->head : alt->tail;
-            mpz_sub(p,p,alt->start);
-            break;
-        }
+    if (alt->ninf) {
+        // alt->nitems counts the finite positions only, and is at least one
+        // because an empty product is one, so this division is always safe.
+        mpz_tdiv_qr(q,p,p,alt->nitems);
+        dim = NEW(alt->ninf,mpz_t);
+        for (i=0;i<alt->ninf;i++) mpz_init(dim[i]);
+        rxe_unpair(dim,alt->ninf,q);
+        i = 0;
     }
-    for ( ; node ; node = l2r ? node->next : node->prev ) {
+    for ( node = l2r ? alt->head : alt->tail ; node ;
+          node = l2r ? node->next : node->prev ) {
         if (node->is_backref) continue;
-        mpz_set(n, node->rxe ? node->rxe->nitems : node->nitems);
-        // An impossible node cannot be indexed into. Alternations holding one
-        // are skipped above, so reaching this means the caller seeked into a
-        // set that has no such element; report failure rather than abort.
-        if (!mpz_sgn(n)) {
-            mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
-            return 1;
+        if (node->is_inf) {
+            // Takes a whole dimension rather than a digit's worth of the
+            // numeral, so no division happens here. The dimensions are handed
+            // out in order of significance, most significant first, because
+            // the pairing walks its diagonals with the first coordinate
+            // descending: giving that one to the most significant position
+            // makes 'a*b*' come out shortest first and alphabetically within
+            // a length -- "", a, b, aa, ab, bb -- which is the order the
+            // finite case would have produced had it been able to reach it.
+            mpz_t *d = &dim[alt->ninf-1-i];
+            if (node->is_repeat ? rxe_repeat_seek(node,*d,l2r)
+                                : rxe_seek(node->rxe,*d)) { rc = 1; break; }
+            i++;
+            continue;
         }
+        // A repetition is the one kind of node whose cardinality is not its
+        // subexpression's: it is the geometric sum over it.
+        mpz_set(n, node->rxe && !node->is_repeat ? node->rxe->nitems
+                                                 : node->nitems);
+        // An impossible node cannot be indexed into. Alternations holding one
+        // are skipped by the caller, so reaching this means the caller seeked
+        // into a set that has no such element; report failure rather than
+        // abort.
+        if (!mpz_sgn(n)) { rc = 1; break; }
         mpz_tdiv_qr(q,r,p,n);
         mpz_set(p,q);
-        if (node->rxe) {
+        if (node->is_repeat) {
+            if (rxe_repeat_seek(node,r,l2r)) { rc = 1; break; }
+        } else if (node->rxe) {
             rxe_seek(node->rxe,r);
-            mpz_set(n,node->rxe->nitems);
         } else {
             node->iterator = mpz_get_ui(r);
         }
     }
-    int past_end = (mpz_sgn(q)>0 && mpz_cmp_ui(n,1)>0) || mpz_sgn(p)>0;
-    mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
-    return past_end;
+    // Whatever the numeral could not absorb is an index past the last item.
+    // An alternation with an endless position has no last item, and its
+    // leftover went into the pairing rather than staying here.
+    if (!rc && mpz_sgn(p) > 0) rc = 1;
+    if (dim) {
+        for (i=0;i<alt->ninf;i++) mpz_clear(dim[i]);
+        rxe_mem_free(dim);
+    }
+    mpz_clear(q);
+    mpz_clear(r);
+    mpz_clear(n);
+    mpz_clear(p);
+    return rc;
+}
+
+int rxe_seek(struct rxe *rxe, mpz_t pos)
+{
+    if (!rxe || mpz_sgn(pos) < 0) return 1;
+    if (rxe->flags & RXE_FLAG_SHORTLEX) {
+        int rc = rxe_seek_shortlex(rxe,pos);
+        if (!rc) mpz_set(rxe->index,pos);
+        return rc;
+    }
+    struct rxe_alt *alt = NULL;
+    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
+    int rc;
+    mpz_t p;
+    mpz_init_set(p,pos);
+    if (rxe->ninf && mpz_cmp(pos,rxe->nitems) >= 0) {
+        // Past every finite alternation, so this is one of the endless ones.
+        // They are dovetailed rather than laid end to end: consecutive
+        // indices visit them in turn, because laying them end to end would
+        // mean the second never started.
+        mpz_t which;
+        mpz_init(which);
+        mpz_sub(p,pos,rxe->nitems);
+        mpz_tdiv_qr_ui(p,which,p,(unsigned long)rxe->ninf);
+        alt = rxe_nth_inf_alt(rxe,mpz_get_ui(which));
+        mpz_clear(which);
+    } else {
+        // A linear scan, which is slow when an expression has a great many
+        // alternations. It used to be the obvious thing to replace with a
+        // binary search, because a repetition wrote out one alternation per
+        // repeat count and so manufactured them by the thousand. Repetitions
+        // are counted rather than written out now, and hand-written
+        // alternations do not run to those numbers: 20,000 of them still seek
+        // in 0.02s. See the TODO.
+        for ( alt = rxe->tail ; alt ; alt = alt->prev ) {
+            if (alt->ninf) continue;               // indexed above, not here
+            if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
+            if (mpz_cmp(alt->start,pos)<=0) { mpz_sub(p,p,alt->start); break; }
+        }
+    }
+    if (!alt) { mpz_clear(p); return 1; }
+    rc = rxe_alt_seek(alt,p,l2r);
+    if (!rc) {
+        rxe->curr = alt;
+        mpz_set(rxe->index,pos);
+    }
+    mpz_clear(p);
+    return rc;
 }
 
 struct rxe *rxe_parse(const char *str, int flags)
@@ -203,6 +373,11 @@ struct rxe *rxe_parse(const char *str, int flags)
     rxe->flags |= RXE_FLAG_HAS_BKRTABLE;
     if (*str=='^') str++;
     parse(rxe,rxe->nitems,str,flags,0);
+    // Only an infinite expression is enumerated by length; a finite one is a
+    // numeral and keeps the order it has always had, which the radix
+    // conversion in the manual page depends on.
+    if (!rxe->status && rxe_is_infinite(rxe) && !tree_has_backref(rxe))
+        mark_shortlex(rxe);
     return rxe;
 }
 
@@ -212,22 +387,29 @@ struct rxe *rxe_new(void)
     struct rxe *rxe = NEW(1,struct rxe);
     rxe->head = rxe-> tail = rxe->curr = NULL;
     rxe->nalts = 0;
+    rxe->ninf = 0;
     rxe->status = RXE_OK;
     rxe->brt = NULL;
     rxe->flags = 0;
     mpz_init(rxe->nitems);
+    mpz_init(rxe->index);
+    rxe_lens_init(&rxe->lens);
     return rxe;
 }
 
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow)
+// The 'shallow' argument this used to take made the copy alias the original
+// subexpression rather than duplicating it, with ownership passing to whichever
+// of the two was reached first. Only the written-out repetition needed that,
+// and it no longer exists; nothing else could use it safely.
+
+void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
 {
     struct rxe_node *dst_node = rxe_new_node(alt);
     if (src_node->rxe) {
-        if (src_node->is_backref) {
-            dst_node->rxe = src_node->rxe;
-        } else {
-            dst_node->rxe = shallow ? src_node->rxe : rxe_deep_clone(src_node->rxe);
-        }
+        // A backreference names a subexpression owned elsewhere, so the copy
+        // points at the same one rather than duplicating it.
+        dst_node->rxe = src_node->is_backref ? src_node->rxe
+                                             : rxe_deep_clone(src_node->rxe);
     }
     if (src_node->len) {
         dst_node->len = src_node->len;
@@ -236,7 +418,14 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int sha
         memcpy(dst_node->str,src_node->str,dst_node->len);
     }
     dst_node->is_backref = src_node->is_backref;
+    dst_node->is_inf     = src_node->is_inf;
     mpz_set(dst_node->nitems,src_node->nitems);
+    if (src_node->is_repeat) {
+        // rxe_repeat_make recomputes nitems from the subexpression, so the
+        // copy above is redundant here but harmless, and the clone starts at
+        // the first item rather than wherever the original happens to sit.
+        rxe_repeat_make(dst_node,src_node->rep_min,src_node->rep_max);
+    }
 }
 
 struct rxe *rxe_deep_clone(struct rxe *src_rxe)
@@ -247,14 +436,16 @@ struct rxe *rxe_deep_clone(struct rxe *src_rxe)
    // among them -- but never the ownership bit: only the root owns the
    // backreference table, and this clone has none to free.
    dst_rxe->flags = src_rxe->flags & ~RXE_FLAG_HAS_BKRTABLE;
+   dst_rxe->ninf  = src_rxe->ninf;
    mpz_set(dst_rxe->nitems,src_rxe->nitems);
    for ( src_alt = src_rxe->head ; src_alt ; src_alt = src_alt->next ) {
        struct rxe_alt *dst_alt = rxe_new_alt(dst_rxe);
+       dst_alt->ninf = src_alt->ninf;
        mpz_set(dst_alt->nitems,src_alt->nitems);
        mpz_set(dst_alt->start,src_alt->start);
        struct rxe_node *src_node;
        for ( src_node = src_alt->head ; src_node ; src_node = src_node->next ) {
-           rxe_node_deep_clone(dst_alt,src_node,0);
+           rxe_node_deep_clone(dst_alt,src_node);
        }
    }
    return dst_rxe;
@@ -270,6 +461,8 @@ void rxe_free(struct rxe *rxe)
     if (rxe->flags & RXE_FLAG_HAS_BKRTABLE)
         rxe_backref_table_free(rxe->brt);
     mpz_clear(rxe->nitems);
+    mpz_clear(rxe->index);
+    rxe_lens_free(&rxe->lens);
     rxe_mem_free(rxe);
 }
 
