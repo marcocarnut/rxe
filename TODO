@@ -39,7 +39,18 @@ SHORT TERM TO-DOs
 - Error handling
   > handle_repeats still signals failure by writing a status code into the
     mpz_t it was given for the result. Clean that up.
-  > More descriptive error messages pointing to the probable location
+  > More descriptive error messages pointing to the probable location.
+    This needs no structural change: str is in scope at all twenty-seven
+    places an error is raised, so it only wants a field for the offset and a
+    helper that sets status and position together. Three things to watch.
+    rxe_parse skips a leading ^, so offsets must be relative to the original
+    argument or the caret sits one character off. Where a nested parse
+    propagates its status upward, the inner position has to win, or every
+    error inside a group reports the position of the group. And five sites
+    do not set rxe->status at all, smuggling the code through the mpz_t
+    meant for the result -- an mpz_t can carry a number but not a position,
+    so those paths cannot report one until the smuggling above is fixed.
+    The two items are therefore one job, and cheaper done together.
 
 
 LONG-TERM TO-DOs
@@ -69,7 +80,55 @@ LONG-TERM TO-DOs
   above, and it subsumes -r: a permutation visits every member exactly once
   instead of sampling with replacement.
 
-> JIT compiler
+> Abstract the arithmetic behind a base-type shim, so the width can be
+  chosen at build time: GMP for unbounded cardinalities as now, or
+  uint64_t / uint32_t for environments that cannot carry a bignum library.
+  That makes librxe dependency-free in its fixed-width form -- GMP is
+  currently the only dependency -- and puts it within reach of a
+  microcontroller. It is also the same abstraction the GPU work needs, a
+  kernel having to use fixed-width arithmetic regardless, so the two are one
+  mechanism rather than two.
+
+  Cheaper than it sounds. The library core uses only sixteen distinct mpz
+  operations (set, set_ui, init, clear, sgn, mul, add, add_ui, sub, tdiv_qr,
+  pow_ui, cmp, cmp_ui, get_ui, init_set, init_set_ui), and never assigns one
+  mpz_t to another: because mpz_t is an array type, GMP forced every
+  operation through a function call, which is exactly the style a swappable
+  base type requires. The port is largely mechanical renaming. The demo
+  program needs more than the library does -- formatting, random selection,
+  decimal parsing -- and would keep requiring GMP, or grow its own
+  fixed-width paths.
+
+  The real design question is overflow, not the wrappers. With GMP a
+  cardinality cannot overflow; with uint64_t it silently wraps, and the
+  threshold is lower than intuition suggests:
+
+      [A-Z]{13}         2,481,152,873,203,736,576   fits
+      [A-Z]{14}        64,509,974,703,297,150,976   overflows
+      [0-9A-Za-z]{10}     839,299,365,868,340,224   fits
+      [0-9A-Za-z]{11}  52,036,560,683,837,093,888   overflows
+
+  So thirteen upper-case letters fit in 64 bits and fourteen do not. The
+  shim has to saturate, or detect and report, rather than wrap; deciding
+  which, and where the check goes, is the work.
+
+> JIT compiler, and a GPU back end. The parse tree is the intermediate
+  representation and a code generator consumes it, so neither requires the
+  tree to change. Worth doing after the closed-form repetition rework, both
+  because the tree settles then and because today a JIT would have to
+  compile the two million nodes that a{1,2000} expands into.
+
+  The GPU case has a shape the JIT case does not. A GPU wants independent
+  work per thread, and rxe_iterate carries sequentially, so it does not
+  parallelise. rxe_seek is per-index and independent: one thread per index
+  is the natural kernel, and composes with the keyed permutation above as
+  seek(pi(base + t)). The random-access formulation the library already has
+  is what makes this possible at all.
+
+  Keep it in-tree behind a build flag until the tree representation settles.
+  The structures are already visible in rxe.h, but there is no documented
+  traversal contract and no stability promise, and a separate consumer would
+  be chasing a moving target through the repetition rework.
 
 > Binary tree over alternations, to replace the linear scan in rxe_seek.
   Deferred, and possibly not worth doing: 20,000 hand-written alternatives
