@@ -175,6 +175,11 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
             char *new_str = rxe_current(str,maxlen,node->rxe);
             maxlen -= new_str - str;
             str = new_str;
+        } else if (node->is_dict) {
+            // A dictionary member is a whole word, not a character. Copy as
+            // much of it as the buffer still holds.
+            const char *w = node->words[node->iterator];
+            while (*w && maxlen>0) { *str++ = *w++; maxlen--; }
         } else if (node->len) {
             // A node with no characters has nothing to contribute. Indexing
             // its str would read past a zero-length allocation.
@@ -214,7 +219,8 @@ int rxe_iterate(struct rxe *rxe)
                 carry = rxe_iterate(node->rxe);
             }
             if (carry) {
-                if (++node->iterator >= node->len) {
+                int bound = node->is_dict ? node->nwords : node->len;
+                if (++node->iterator >= bound) {
                     node->iterator = 0;
                     node = l2r ? node->next : node->prev;
                     if (!node) break;
@@ -419,6 +425,10 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
     }
     dst_node->is_backref = src_node->is_backref;
     dst_node->is_inf     = src_node->is_inf;
+    // A dictionary node borrows its words, so the copy borrows the same ones.
+    dst_node->is_dict    = src_node->is_dict;
+    dst_node->nwords     = src_node->nwords;
+    dst_node->words      = src_node->words;
     mpz_set(dst_node->nitems,src_node->nitems);
     if (src_node->is_repeat) {
         // rxe_repeat_make recomputes nitems from the subexpression, so the

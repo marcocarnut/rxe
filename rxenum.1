@@ -191,6 +191,14 @@ Uses the 'underscore' character as the thousands separator.
 .B
 \-~
 Use no thousands separator at all.
+.TP
+.B
+\-D dir
+Add
+.B dir
+to the list of directories searched for a "name.dict" word-dictionary file.
+May be given more than once; the current directory is always searched last.
+See DICTIONARIES below.
 
 .SH ENUMERATION ORDER
 By default the enumeration runs right to left: the last position in the
@@ -351,6 +359,51 @@ recover the key. The key is folded to 64 bits however long it is.
 
 The order produced by a given key is fixed and is treated as part of the
 interface, since reproducibility is the whole point of using a key.
+
+.SH DICTIONARIES
+A construct written "[:name:]" draws its members from a named dictionary
+rather than from a character range. Two kinds share the syntax.
+
+A POSIX class \-\- [:alpha:], [:digit:], [:alnum:], [:upper:], [:lower:],
+[:xdigit:], [:word:], [:space:], [:blank:], [:punct:], [:cntrl:], [:graph:]
+and [:print:] \-\- is a set of single characters, and behaves exactly like the
+character class it names. "[:digit:]{2}" is "[0-9]{2}".
+
+A word dictionary is a list of strings, one per member, read from a file
+"name.dict" \-\- one word per line \-\- in the current directory or in a
+directory named with
+.BR \-D .
+Each member is a whole word, so a repeated dictionary is a set of phrases:
+
+.RS
+printf 'apple\\nbanana\\ncherry\\ndate\\n' > fruit.dict
+.br
+rxenum \-e '[:fruit:]{2}'
+.br
+appleapple applebanana applecherry appledate bananaapple ...
+.RE
+
+with 16 members, each at its own index, so
+.B \-f
+reaches any of them directly. A dictionary composes with the rest of the
+syntax, and an unbounded one, "[:fruit:]+", is an infinite set enumerated
+shortest word first.
+
+The intended use is a structured keyspace made of real words. A BIP\-39
+passphrase, for instance, is twenty-four words from a fixed list of 2048:
+
+.RS
+rxenum '[:bip39en:]{24}'
+.br
+1,461,501,637,330,902,918,203,684,832,716,283,019,655,932,542,976
+.RE
+
+which is 2048^24, or exactly 2^264.
+
+A dictionary reference must close with ":]"; "[:digit" is an unterminated
+dictionary, and a name with no POSIX class and no file is an unknown one.
+POSIX classes inside a bracket expression, the "[[:digit:]]" form, are not
+recognised; write "[:digit:]" on its own, or the plain range.
 
 .SH OTHER EXAMPLES
 .TP

@@ -28,6 +28,9 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->is_backref = 0;
     node->is_repeat = 0;
     node->is_inf = 0;
+    node->is_dict = 0;
+    node->nwords = 0;
+    node->words = NULL;
     node->rep_min = node->rep_max = node->rep_count = 0;
     node->rep_alloc = 0;
     node->rep_digit = NULL;
@@ -54,6 +57,11 @@ void rxe_free_node_data(struct rxe_node *node)
         if (!node->is_backref) rxe_free(node->rxe);
         node->rxe = NULL;
     }
+    // A dictionary node only borrows its words from the registry, which owns
+    // them, so it clears the pointer without freeing anything.
+    node->is_dict = 0;
+    node->nwords = 0;
+    node->words = NULL;
     // A repetition owns one index per position it can occupy.
     rxe_repeat_free(node);
     node->is_repeat = 0;

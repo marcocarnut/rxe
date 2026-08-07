@@ -20,6 +20,8 @@
 #include <getopt.h>
 #include <stdarg.h>
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
 #include "rxe.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
@@ -45,6 +47,61 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
                char sep, struct rxe_permutation *perm);
 int mpz_len(mpz_t x);
 
+/* --------------------------- Dictionary Loading ------------------------- */
+
+// Where to look for a "name.dict" file: the directories named by -D, in
+// order, then the current one. A dictionary is a plain text file, one word
+// per line; trailing carriage returns and newlines are trimmed so a file
+// saved on either kind of system reads the same.
+
+#define MAX_DICT_DIRS 16
+static const char *dict_dirs[MAX_DICT_DIRS];
+static int         ndict_dirs;
+
+static char **load_dict_file(const char *path, int *nwords)
+{
+    FILE *fp = fopen(path,"rb");
+    if (!fp) return NULL;
+    int cap = 64, n = 0;
+    char **words = malloc(cap*sizeof(char *));
+    char line[1024];
+    while (fgets(line,sizeof(line),fp)) {
+        int len = strlen(line);
+        while (len && (line[len-1]=='\n' || line[len-1]=='\r')) line[--len]=0;
+        if (n==cap) { cap*=2; words = realloc(words,cap*sizeof(char *)); }
+        words[n] = malloc(len+1);
+        memcpy(words[n],line,len+1);
+        n++;
+    }
+    fclose(fp);
+    *nwords = n;
+    return words;
+}
+
+// The resolver the library calls when it meets an unknown [:name:]. Tries each
+// search directory in turn; registers the words with the library, which keeps
+// its own copy, so these can be freed straight away. Returns 1 if it found a
+// file, 0 otherwise -- which the library turns into "unknown dictionary".
+
+static int dict_resolver(const char *name)
+{
+    int d;
+    for (d = -1 ; d < ndict_dirs ; d++) {
+        char path[1024];
+        const char *dir = d < 0 ? "." : dict_dirs[d];
+        snprintf(path,sizeof(path),"%s/%s.dict",dir,name);
+        int nwords;
+        char **words = load_dict_file(path,&nwords);
+        if (!words) continue;
+        rxe_register_dict(name,(const char **)words,nwords);
+        int i;
+        for (i=0;i<nwords;i++) free(words[i]);
+        free(words);
+        return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------ Main Program ---------------------------- */
 
 int main(int argc, char **argv)
@@ -66,8 +123,13 @@ int main(int argc, char **argv)
     mpz_init(from);
     mpz_init(to);
     mpz_init(count);
+    rxe_set_dict_resolver(dict_resolver);
+    // Free the dictionary registry however the program leaves, so a run that
+    // exits early -- a random pick, an order query, an error -- does not leak
+    // it under a leak checker.
+    atexit(rxe_free_dicts);
     for (;;) {
-        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:Q");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:QD:");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -97,6 +159,9 @@ int main(int argc, char **argv)
             case 'r': have_random = 1;
                       break;
             case 'Q': report_order = 1;
+                      break;
+            case 'D': if (ndict_dirs < MAX_DICT_DIRS)
+                          dict_dirs[ndict_dirs++] = optarg;
                       break;
             case 'k': key = optarg;
                       do_enumerate = 1;

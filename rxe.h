@@ -78,7 +78,9 @@
       "stray non-digit characters in numeric constant")                        \
     X(RXE_UNTERMINATED_HEX_CONSTANT,    "unterminated hex constant")           \
     X(RXE_BACKREF_INTO_VARIABLE_REPEAT,                                        \
-      "backreference into a variably repeated group")
+      "backreference into a variably repeated group")                          \
+    X(RXE_UNTERMINATED_DICT,            "unterminated dictionary")             \
+    X(RXE_UNKNOWN_DICT,                 "unknown dictionary")
 
 enum rxe_parse_status {
 #define RXE_STATUS_ENUM_ENTRY(name,msg) name,
@@ -166,6 +168,9 @@ struct rxe_node {
     int   iterator;               // Current item being iterated
     int   is_backref;             // True if this node is a backreference
     int   is_repeat;              // True if this node is a repetition
+    int   is_dict;                // True if this node draws from a dictionary
+    int   nwords;                 // Number of words, when is_dict
+    char **words;                 // The words, borrowed from the registry
     int   is_inf;                 // True if this node has no largest member
     int   rep_min;                // Fewest repetitions, when is_repeat
     int   rep_max;                // Most repetitions, or RXE_REP_UNBOUNDED
@@ -242,6 +247,19 @@ struct rxe *rxe_deep_clone(struct rxe *src_rxe);
 void rxe_free(struct rxe *rxe);
 
 void *kmalloc(size_t size, const char *file, int line);
+
+// Named dictionaries, written [:name:] in a pattern. A word dictionary is a
+// list of strings, one per member, so '[:bip39en:]{24}' enumerates the
+// passphrases drawn from that word list. POSIX classes -- [:alpha:] and the
+// rest -- are recognised too, as ordinary single-character classes.
+//
+// The library does no file I/O, so a caller supplies the words: register one
+// by name outright, or install a resolver called the first time an unknown
+// name is seen, which may load and register it and return non-zero. rxenum's
+// resolver reads name.dict; a browser build registers its own.
+int  rxe_register_dict(const char *name, const char **words, int nwords);
+void rxe_set_dict_resolver(int (*resolver)(const char *name));
+void rxe_free_dicts(void);
 
 // A keyed permutation of the integer mapping, so a set can be walked in an
 // order that depends on a key while every member is still visited exactly

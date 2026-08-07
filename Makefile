@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c pair.c lens.c
-HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h pair.h lens.h
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c pair.c lens.c dict.c
+HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h pair.h lens.h dict.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -22,7 +22,7 @@ rxe_node.o: rxe_node.c rxe_node.h repeat.h rxe.h
 
 bkreftbl.o: bkreftbl.c bkreftbl.h rxe.h
 
-parse.o: parse.c parse.h rxe_node.h rxe_alt.h repeat.h rxe.h
+parse.o: parse.c parse.h rxe_node.h rxe_alt.h repeat.h dict.h rxe.h
 
 permute.o: permute.c rxe.h
 
@@ -32,8 +32,10 @@ pair.o: pair.c pair.h rxe.h
 
 lens.o: lens.c lens.h repeat.h rxe_alt.h rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o
+dict.o: dict.c dict.h rxe.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o dict.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o pair.o lens.o dict.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api

@@ -347,6 +347,16 @@ static void lens_node(struct rxe_node *node, int L)
         // reaching here means an ordinary subexpression.
         rxe_lens_rxe(node->rxe,L);
         for (i=from;i<=L;i++) lens_at(node->lens.count[i],&node->rxe->lens,i);
+    } else if (node->is_dict) {
+        // Each word contributes one member at its own length. A word is
+        // counted in the one call whose [from,L] range first covers its
+        // length, so a single pass over the words is correct.
+        int k;
+        for (k=0;k<node->nwords;k++) {
+            int wl = (int)strlen(node->words[k]);
+            if (wl >= from && wl <= L)
+                mpz_add_ui(node->lens.count[wl],node->lens.count[wl],1);
+        }
     } else if (node->len) {
         // A character class is one character long, whatever it holds.
         if (from <= 1 && L >= 1) mpz_set_ui(node->lens.count[1],node->len);
@@ -587,6 +597,19 @@ static int seek_node(struct rxe_node *node, int L, const mpz_t idx)
         return rxe_repeat_seek_at_length(node,L,idx,l2r);
     if (node->rxe)
         return rxe_seek_at_length(node->rxe,L,idx);
+    if (node->is_dict) {
+        // The idx-th word of exactly length L, counted in the order the words
+        // are stored -- the same order the finite path uses, so the two agree.
+        unsigned long want = mpz_get_ui(idx);
+        int k;
+        if (!mpz_fits_ulong_p(idx)) return 1;
+        for (k=0;k<node->nwords;k++) {
+            if ((int)strlen(node->words[k]) != L) continue;
+            if (want == 0) { node->iterator = k; return 0; }
+            want--;
+        }
+        return 1;
+    }
     if (node->len) {
         if (L != 1 || mpz_cmp_ui(idx,node->len) >= 0) return 1;
         node->iterator = (int)mpz_get_ui(idx);

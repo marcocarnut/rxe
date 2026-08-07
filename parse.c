@@ -18,6 +18,7 @@
 #include "rxe_alt.h"
 #include "repeat.h"
 #include "lens.h"
+#include "dict.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
 #include <string.h>
@@ -122,6 +123,7 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
 int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
                  enum rxe_parse_status *status);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
+const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
 const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
 const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
@@ -373,7 +375,18 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       quantifier = 1;
                       break;
             // ----------------- Character Classes -----------------
-            case '[': str2 = handle_character_class(rxe,alt,n,str,flags);
+            case '[': if (*str==':') {
+                          // '[:' introduces a dictionary, never a class whose
+                          // first member is a colon. handle_dictionary sets
+                          // the status itself, so a failure returns straight
+                          // out rather than through the class error below.
+                          str2 = handle_dictionary(rxe,alt,n,str,flags);
+                          if (!str2) return parse_done(x,n,p,str);
+                          str = str2;
+                          quantifier = 0;
+                          break;
+                      }
+                      str2 = handle_character_class(rxe,alt,n,str,flags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_CLASS;
                           return parse_done(x,n,p,str);
@@ -675,6 +688,9 @@ static struct rxe *demote_node(struct rxe_node *node, int flags)
     inner->str        = node->str;
     inner->rxe        = node->rxe;
     inner->is_backref = node->is_backref;
+    inner->is_dict    = node->is_dict;
+    inner->nwords     = node->nwords;
+    inner->words      = node->words;
     inner->is_inf     = node->is_inf;
     inner->is_repeat  = node->is_repeat;
     inner->rep_min    = node->rep_min;
@@ -690,6 +706,9 @@ static struct rxe *demote_node(struct rxe_node *node, int flags)
     node->str = NULL;
     node->rxe = NULL;
     node->is_backref = 0;
+    node->is_dict    = 0;
+    node->nwords     = 0;
+    node->words      = NULL;
     node->is_inf     = 0;
     node->is_repeat  = 0;
     node->rep_min = node->rep_max = node->rep_count = node->rep_alloc = 0;
@@ -738,6 +757,50 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
     if (!end) return NULL;
     if (!build_repeat(alt->tail,r0,r1,flags,status)) return NULL;
     return end;
+}
+
+// A [:name:] dictionary reference, 'str' pointing at the ':' just inside the
+// '['. A POSIX class name expands to an ordinary character class; any other
+// name is a word dictionary, resolved through the registry. Returns the
+// pointer past the closing ']', or NULL with rxe->status set.
+
+const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret,
+                              const char *str, int flags)
+{
+    const char *name = str+1;              // past the ':'
+    const char *end = name;
+    while (*end && !(end[0]==':' && end[1]==']')) end++;
+    if (!*end) { rxe->status = RXE_UNTERMINATED_DICT; return NULL; }
+    int len = (int)(end - name);
+    const char *posix = rxe_posix_class(name,len);
+    if (posix) {
+        // A single-character class: hand its body to the ordinary machinery,
+        // which builds a normal node and applies caseless and the rest. Its
+        // return points into the synthetic string; the real advance is past
+        // the "[:name:]" here.
+        int bl = (int)strlen(posix);
+        char *body = NEW(bl+2,char);
+        memcpy(body,posix,bl);
+        body[bl] = ']';
+        body[bl+1] = 0;
+        const char *r = handle_character_class(rxe,alt,ret,body,flags);
+        rxe_mem_free(body);
+        if (!r) return NULL;               // status already set
+        return end+2;                      // past the ":]"
+    }
+    char **words;
+    int nwords;
+    if (!rxe_lookup_dict(name,len,&words,&nwords)) {
+        rxe->status = RXE_UNKNOWN_DICT;
+        return NULL;
+    }
+    struct rxe_node *node = rxe_new_node(alt);
+    node->is_dict = 1;
+    node->words = words;                   // borrowed from the registry
+    node->nwords = nwords;
+    mpz_set_ui(node->nitems,nwords);
+    mpz_set_ui(ret,nwords);
+    return end+2;
 }
 
 const char *handle_character_class(

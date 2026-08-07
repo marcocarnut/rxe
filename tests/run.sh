@@ -558,6 +558,40 @@ t_error '(a)*{2}'   'nested quantifiers'
 t_error 'a{2}{3}'   'nested quantifiers'
 t_error 'a+*'       'nested quantifiers'
 
+echo "== dictionaries: POSIX classes and word lists =="
+# POSIX classes are single-character sets, so they are ordinary character
+# classes and must match the ranges they stand for.
+t_count '[:digit:]'          '10'
+t_count '[:alpha:]'          '52'
+t_count '[:alnum:]'          '62'
+t_count '[:xdigit:]'         '22'
+t_enum  '[:digit:]'          '0/1/2/3/4/5/6/7/8/9/'
+t_enum  '[:upper:]{2}'       "$("$RXENUM" -e '[A-Z]{2}' 2>&1 | tr '\n' '/')"
+t_error '[:nope:]'           'unknown dictionary'
+t_error '[:digit'            'unterminated dictionary'
+# A word dictionary is loaded from name.dict; -D says where to look. Build a
+# small one in the scratch directory the suite already owns.
+printf 'apple\nbanana\ncherry\ndate\n' > "$tmp/fruit.dict"
+D="-D $tmp"
+check "a word dictionary counts its words" '4' \
+      "$("$RXENUM" $D -~ '[:fruit:]' 2>&1 | head -1)"
+check "and enumerates them in file order" 'apple/banana/cherry/date/' \
+      "$("$RXENUM" $D -e '[:fruit:]' 2>&1 | tr '\n' '/')"
+# Repeated, it is a set of phrases: 4^2 of them, still addressable by index.
+check "a repeated dictionary is a product" '16' \
+      "$("$RXENUM" $D -~ '[:fruit:]{2}' 2>&1 | head -1)"
+check "the phrase at index 5 is bananabanana" 'bananabanana' \
+      "$("$RXENUM" $D -z -f 5 '[:fruit:]{2}' 2>&1)"
+check "a dictionary composes with the rest of the syntax" \
+      'apple-0/apple-1/banana-0/banana-1/cherry-0/cherry-1/date-0/date-1/' \
+      "$("$RXENUM" $D -e '[:fruit:][-][01]' 2>&1 | tr '\n' '/')"
+# Unbounded, it is an infinite set enumerated shortest word first.
+check "an unbounded dictionary is enumerated shortest first" \
+      'date/apple/banana/cherry/datedate/appledate/dateapple/bananadate/' \
+      "$("$RXENUM" $D -e -c 8 '[:fruit:]+' 2>&1 | tr '\n' '/')"
+check "[:fruit:]+ reports itself infinite" 'infinite' \
+      "$("$RXENUM" $D -~ '[:fruit:]+' 2>&1 | head -1)"
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"

@@ -45,6 +45,16 @@ PATTERNS = [
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]
 
+# POSIX classes, checked by translating [:name:] to the plain class it stands
+# for and comparing the two whole sets. Python's own [[:name:]] is only valid
+# inside brackets and means something different, so the translation, not
+# Python's parser, is the reference.
+POSIX = {
+    "[:digit:]": "[0-9]", "[:alpha:]": "[A-Za-z]", "[:alnum:]": "[0-9A-Za-z]",
+    "[:upper:]": "[A-Z]", "[:lower:]": "[a-z]", "[:xdigit:]": "[0-9A-Fa-f]",
+    "[:word:]": "[0-9A-Za-z_]"
+}
+
 # Sets with no largest member. The whole set cannot be compared, so a prefix
 # of the enumeration is checked instead: every element must be a member, and
 # between them they must cover every member short enough to be reached, which
@@ -217,6 +227,15 @@ def main():
             print(f"FAIL  {pat}: -r produced {out.rstrip(chr(10))!r}, not a member")
             failures += 1
 
+    posix_failures = 0
+    for dic, plain in POSIX.items():
+        for suffix in ("", "{2}"):
+            a = run(["-e", dic + suffix])[1]
+            b = run(["-e", plain + suffix])[1]
+            if a != b:
+                print(f"FAIL  {dic}{suffix} != {plain}{suffix}")
+                posix_failures += 1
+
     inf_failures = 0
     for pat, maxlen, prefix in INFINITE:
         bad = check_infinite(pat, maxlen, prefix)
@@ -225,9 +244,10 @@ def main():
         if bad:
             inf_failures += 1
 
-    total = len(PATTERNS) + len(INFINITE)
-    print(f"\noracle: {total - failures - inf_failures} of {total} patterns clean")
-    return 1 if failures or inf_failures else 0
+    total = len(PATTERNS) + len(INFINITE) + len(POSIX) * 2
+    clean = total - failures - inf_failures - posix_failures
+    print(f"\noracle: {clean} of {total} patterns clean")
+    return 1 if failures or inf_failures or posix_failures else 0
 
 
 if __name__ == "__main__":

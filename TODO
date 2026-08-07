@@ -31,6 +31,12 @@ DONE SINCE 0.9.1
   [a-z]{1,20000} needed 26GB and was killed by the OOM killer; it now parses
   in 3MB, and [a-z]{1,1000000} in 25MB. '?' is built by the same routine as
   {0,1} instead of having its own copy of the construction.
+- Named dictionaries, written [:name:]. POSIX classes ([:alpha:] and the
+  rest) are single-character sets that expand to ordinary character classes;
+  word dictionaries are lists of strings, so '[:bip39en:]{24}' is a set of
+  passphrases. The library does no file I/O -- a caller registers words by
+  name or installs a resolver -- so the same feature serves rxenum, which
+  reads name.dict files, and the browser build, which registers its own.
 - make install now installs librxe.a and rxe.h, so the library can actually
   be linked against.
 - Fifteen correctness fixes, from an uninitialised status byte that made
@@ -45,8 +51,10 @@ SHORT TERM TO-DOs
 - Write API documentation. rxe.h has the data structures commented but
   there is no account of the calling sequence: parse, seek, current,
   iterate, free. tests/api.c is currently the closest thing to one.
-- Implement missing things: POSIX character classes, \o, \g with negative
-  and named backreferences, \k, etc.
+- Implement missing things: \o, \g with negative and named backreferences,
+  \k, etc. POSIX classes are done as [:name:], but not yet the [[:name:]]
+  form inside a bracket expression, which would let them be mixed with other
+  characters in one class.
 - Decide the caseless backreference question. '(?i)(a)\1' generates
   {aa, AA}, while Perl's matcher accepts {aa, aA, Aa, AA}, since under /i a
   backreference compares case-insensitively. Exact copies are probably the

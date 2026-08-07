@@ -297,6 +297,45 @@ int main(void)
         rxe_free(rxe);
     }
 
+    // 15. Registered dictionaries. This is the path the browser build uses:
+    //     a caller registers words by name, the library keeps its own copy,
+    //     and [:name:] draws from them. No file I/O is involved.
+    {
+        const char *animals[] = { "cat", "dog", "ferret" };
+        struct rxe *rxe;
+        char buf[64];
+        mpz_t pos;
+        rxe_register_dict("animals", animals, 3);
+        rxe = rxe_parse("[:animals:]{2}", 0);
+        check_int("a registered dictionary parses", RXE_OK, rxe_error(rxe));
+        check_int("and is a product of its words", 9,
+                  (int)mpz_get_ui(rxe->nitems));
+        mpz_init_set_ui(pos, 5);          // dog then ferret: 1*3 + 2
+        check_int("seek into it succeeds", 0, rxe_seek(rxe, pos));
+        rxe_current(buf, sizeof(buf) - 1, rxe);
+        check("giving the right phrase", "dogferret", buf);
+        mpz_clear(pos);
+        rxe_free(rxe);
+
+        // A member longer than the caller's buffer is truncated, not
+        // overrun: ask for one character of room.
+        rxe = rxe_parse("[:animals:]", 0);
+        mpz_init_set_ui(pos, 2);          // ferret
+        rxe_seek(rxe, pos);
+        mpz_clear(pos);
+        rxe_current(buf, 3, rxe);
+        check("a long word is truncated to fit", "fer", buf);
+        rxe_free(rxe);
+
+        // An unknown name is an error, not a crash.
+        rxe = rxe_parse("[:nosuch:]", 0);
+        check_int("an unknown dictionary is refused",
+                  RXE_UNKNOWN_DICT, rxe_error(rxe));
+        rxe_free(rxe);
+
+        rxe_free_dicts();
+    }
+
     printf("api: %s\n", failures ? "FAILURES ABOVE" : "all checks passed");
     return failures ? 1 : 0;
 }
