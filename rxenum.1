@@ -101,6 +101,11 @@ Makes the dot quantifier really match all characters instead of "all but
 newline". Corresponds to the /s "single line" flag in Perl regexes.
 .TP
 .B
+\-L
+Enumerate left to right, so that the first position in the string varies
+fastest instead of the last. See ENUMERATION ORDER below.
+.TP
+.B
 \-e
 Enumerate the set, generating and printing the element instead of just
 counting them.
@@ -152,6 +157,13 @@ computes the element count (see option
 \) plus one.  Implies \fB-e\fR.
 .TP
 .B
+\-k key
+Walk the set in an order that depends on
+.B key
+instead of in index order, visiting every member exactly once. See
+PERMUTED ORDER below. Implies \fB-e\fR, and cannot be combined with \fB-r\fR.
+.TP
+.B
 \-r
 Randomly choose an element of the set. You can get several random choices
 by setting
@@ -175,14 +187,94 @@ Uses the 'underscore' character as the thousands separator.
 \-~
 Use no thousands separator at all.
 
+.SH ENUMERATION ORDER
+By default the enumeration runs right to left: the last position in the
+string is the least significant one, so it varies fastest, exactly as the
+last digit of an ordinary numeral does. That is what allows the mapping to
+be used for radix conversion:
+
+.RS
+rxenum -z -f 3735928559 '([0-9A-F]{4} ){2}'
+.br
+DEAD BEEF
+.RE
+
+The
+.B -L
+option, or the non-standard "(?L)" flag written inside the regex, reverses
+this so the first position varies fastest:
+
+.RS
+rxenum -L -z -f 3735928559 '([0-9A-F]{4} ){2}'
+.br
+FEEB DAED
+.RE
+
+The flag is inherited by subexpressions and by repetitions, and "(?-L)"
+turns it off again, so the direction can be chosen independently for any
+part of a regex:
+
+.RS
+rxenum -e '(?L)[ab](?-L:[cd][ef])'
+.br
+ace bce acf bcf ade bde adf bdf
+.RE
+
+Only the order changes. The set and its size are identical either way.
+
+Alternations are always enumerated in the order they are written and are
+not affected by this flag. To reverse them, write them the other way round.
+
+Note that L is not a Perl flag. Every inline flag Perl defines is lower
+case, so an upper case letter cannot collide with one; lower case l was not
+available, Perl having given it to locale rules in version 5.14.
+
+.SH PERMUTED ORDER
+.B \-k
+composes the integer mapping with a keyed permutation of the integers, so
+the set is enumerated in a scattered but perfectly reproducible order:
+
+.RS
+rxenum -k hunter2 -e '[a-c][x-z]'
+.br
+cx az by bz cy cz ay ax bx
+.RE
+
+The same key always gives the same order, and a different key gives a
+different one. Because it is a permutation rather than a sample, every
+member appears exactly once: unlike
+.B -r
+it cannot repeat itself and cannot miss anything.
+
+The numbering still addresses this order, so a run can be resumed. Element
+zero of the run above is "cx", and:
+
+.RS
+rxenum -k hunter2 -z -f 4 '[a-c][x-z]'
+.br
+cy
+.RE
+
+which is the fifth line printed. That makes it practical to randomise a
+brute force search and still stop and continue it later, or to split one
+across several machines by handing each a range of indices.
+
+The permutation is built from a Feistel network over the index, walked back
+into range when it lands outside. It is not a cipher and does not try to be:
+it exists to spread the search order, not to withstand somebody who wants to
+recover the key. The key is folded to 64 bits however long it is.
+
+The order produced by a given key is fixed and is treated as part of the
+interface, since reproducibility is the whole point of using a key.
+
 .SH OTHER EXAMPLES
 .TP
-((\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\.){3}(?2))
+((\\d|[1-9]\\d|1\\d\\d|2[0-4]\\d|25[0-5])\\.){3}(?2)
 Generates all 4,294,967,296 possible IPv4 addresses. Notice the usage of the
 (?2) construct to reuse the second parenthesized subexpression as a kind of
 "subroutine".
 .TP
-(([01]\d\d|2[0-4]\d|25[0-5]|\d{1,2})\.){3}(?2)
+(([01]\\d\\d|2[0-4]\\d|25[0-5]|\\d{1,2})\\.){3}(?2)
 Alternative formulation that also handles zero-padded numbers. Because of
 that, there are 17,944,209,936 items in this set instead of 4,294,967,296.
 
@@ -191,7 +283,28 @@ All regular expressions are assumed to be anchored, as if they were
 preceded by ^ and terminated by $. In fact, a ^ in the beginning is ignored,
 as is a dollar sign at the end. Anywhere else, they are treated as literals.
 
+The
+.B -i
+and
+.B -s
+flags can also be set inside the regex itself, either for the remainder of
+the enclosing group as in "(?i)abc", or for a single subexpression as in
+"(?i:abc)". A leading minus turns them off again, as in "(?-i)". A group
+that only sets flags does not count as a capturing group, so it does not
+consume a backreference number. The /m flag is accepted and ignored: it
+governs where ^ and $ match, and those are not honoured anywhere, as noted
+above.
+
 Absolute backreferences are supported, but relative ones are not.
+
+A backreference to a group repeated a fixed number of times refers to the
+last repetition, as in Perl. So "([ab]){2}\\1" gives aaa, abb, baa and bbb.
+
+A backreference to a group repeated a variable number of times, such as
+"([ab]){1,2}\\1", is rejected. Each repeat count is enumerated as a separate
+alternation, and a backreference cannot name which one is in play, so no
+single answer would be correct. Reformulate it, for instance as
+"([ab])\\1|([ab]){2}\\2", to say explicitly which repetition you mean.
 
 To emulate Perl behavior, two sucessive quantifiers (say, "a?{2}") gives
 an error. And again just like Perl, you can easily work around it by using

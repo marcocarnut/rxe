@@ -22,27 +22,58 @@
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
-#define RXE_CASELESS                 1
-#define RXE_DOTALL                   2
+// Parse options: the bitmask handed to rxe_parse(), and the same bits the
+// inline (?...) groups set and clear.
+
+#define RXE_CASELESS                 0x0001
+#define RXE_DOTALL                   0x0002
+#define RXE_LEFT_TO_RIGHT            0x0004
+
+// Flags recorded on the parse tree itself, in struct rxe's 'flags' field.
+// These used to be #defined in two separate .c files, out of sight of each
+// other and of the options above. They are now here, and deliberately
+// allocated from a range that does not overlap the parse options: the two
+// sets live in different fields, so testing one against the other is a
+// mistake that should not be able to look plausible.
+
+#define RXE_FLAG_CLOSED_BRACKET      0x0100
+#define RXE_FLAG_HAS_BKRTABLE        0x0200
+#define RXE_FLAG_VARIABLE_REPEAT     0x0400
+#define RXE_FLAG_LEFT_TO_RIGHT       0x0800
 
 /* -------------------------- Global Declarations ------------------------- */
 
+// Parse status codes paired with their messages, written down once. The enum
+// below and the message table in parse.c are both generated from this list, so
+// they cannot fall out of step. They previously could: the enum lived here and
+// the table there, and rxe_error_message() indexes the table with a value of
+// the enum. RXE_OK must stay first so that it is zero.
+
+#define RXE_STATUS_LIST(X)                                                     \
+    X(RXE_OK,                           "")                                    \
+    X(RXE_INFINITE,                     "infinite")                            \
+    X(RXE_TOO_MANY_PARENS,              "extraneous parentheses")              \
+    X(RXE_TOO_LITTLE_PARENS,            "missing parentheses")                 \
+    X(RXE_LONE_QUANTIFIER,              "nothing before quantifier")           \
+    X(RXE_NESTED_QUANTIFIERS,           "nested quantifiers")                  \
+    X(RXE_UNTERMINATED_LITERAL,         "unterminated literal")                \
+    X(RXE_UNTERMINATED_CLASS,           "unterminated character class")        \
+    X(RXE_UNTERMINATED_REPEAT,          "unterminated repetition")             \
+    X(RXE_UNTERMINATED_FLAGS,           "unterminated flags")                  \
+    X(RXE_BAD_REPETITION,               "bad repetition parameters")           \
+    X(RXE_UNIMPLEMENTED,                "unimplemented")                       \
+    X(RXE_INVALID_BACKREF,              "invalid backreference")               \
+    X(RXE_INVALID_CONSTANT,                                                    \
+      "stray non-digit characters in numeric constant")                        \
+    X(RXE_UNTERMINATED_HEX_CONSTANT,    "unterminated hex constant")           \
+    X(RXE_BACKREF_INTO_VARIABLE_REPEAT,                                        \
+      "backreference into a variably repeated group")
+
 enum rxe_parse_status {
-    RXE_OK = 0,                 // Must be zero
-    RXE_INFINITE,
-    RXE_TOO_MANY_PARENS,
-    RXE_TOO_LITTLE_PARENS,
-    RXE_LONE_QUANTIFIER,
-    RXE_NESTED_QUANTIFIERS,
-    RXE_UNTERMINATED_LITERAL,
-    RXE_UNTERMINATED_CLASS,
-    RXE_UNTERMINATED_REPEAT,
-    RXE_UNTERMINATED_FLAGS,
-    RXE_BAD_REPETITION,
-    RXE_UNIMPLEMENTED,
-    RXE_INVALID_BACKREF,
-    RXE_INVALID_CONSTANT,
-    RXE_UNTERMINATED_HEX_CONSTANT,
+#define RXE_STATUS_ENUM_ENTRY(name,msg) name,
+    RXE_STATUS_LIST(RXE_STATUS_ENUM_ENTRY)
+#undef RXE_STATUS_ENUM_ENTRY
+    RXE_NSTATUS                 // Must be last; counts the entries above
 };
 
 // ---- Main data structures
@@ -125,9 +156,9 @@ extern void (*rxe_mem_free)(void *);
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-struct rxe *rxe_parse(char *str, int flags);
+struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
-char *rxe_error_message(struct rxe *rxe);
+const char *rxe_error_message(struct rxe *rxe);
 
 char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);
@@ -139,7 +170,19 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int sha
 struct rxe *rxe_deep_clone(struct rxe *src_rxe);
 void rxe_free(struct rxe *rxe);
 
-void *kmalloc(size_t size, char *file, int line);
+void *kmalloc(size_t size, const char *file, int line);
+
+// A keyed permutation of the integer mapping, so a set can be walked in an
+// order that depends on a key while every member is still visited exactly
+// once. See permute.c. Pass an index in [0, domain) to rxe_permutation_map
+// and seek to what comes back.
+
+struct rxe_permutation;
+
+struct rxe_permutation *rxe_permutation_new(const mpz_t domain, const char *key);
+void rxe_permutation_free(struct rxe_permutation *perm);
+void rxe_permutation_map(mpz_t result, struct rxe_permutation *perm,
+                         const mpz_t index);
 
 /* ------------------------ Macro-Defined Functions ----------------------- */
 

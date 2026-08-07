@@ -35,7 +35,8 @@
 
 void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep);
 void die(int code, char *msg, ...);
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep);
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
+               char sep, struct rxe_permutation *perm);
 int mpz_len(mpz_t x);
 
 /* ------------------------------ Main Program ---------------------------- */
@@ -43,7 +44,7 @@ int mpz_len(mpz_t x);
 int main(int argc, char **argv)
 {
     if (argc<2) {
-        die(0,"Usage: rxenum [-isnezr] [-c count] [-f from] [-t to] <regex>\n");
+        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] <regex>\n");
     }
     int flags = 0;
     int do_enumerate = 0;
@@ -52,18 +53,21 @@ int main(int argc, char **argv)
     int have_from = 0;
     int have_to = 0;
     int have_random = 0;
+    char *key = NULL;
     char sep = ',';
     mpz_t from,to,count;
     mpz_init(from);
     mpz_init(to);
     mpz_init(count);
     for (;;) {
-        int o = getopt(argc,argv,"isenzf:t:c:r.,_~");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
                       break;
             case 's': flags |= RXE_DOTALL;
+                      break;
+            case 'L': flags |= RXE_LEFT_TO_RIGHT;
                       break;
             case 'n': options |= ENUM_NUMBER;
                       do_enumerate = 1;
@@ -85,6 +89,9 @@ int main(int argc, char **argv)
                       break;
             case 'r': have_random = 1;
                       break;
+            case 'k': key = optarg;
+                      do_enumerate = 1;
+                      break;
             case ',':
             case '_':
             case '.': sep = o;
@@ -104,27 +111,48 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    if (have_random && key)
+        die(1,"-r and -k are mutually exclusive: -k already visits every "
+              "member exactly once\n");
+
+    struct rxe_permutation *perm = NULL;
+    if (key) perm = rxe_permutation_new(rxe->nitems,key);
+
     if (have_random) {
+        if (!mpz_sgn(rxe->nitems))
+            die(1,"the set is empty, there is nothing to choose from\n");
         gmp_randstate_t state;
         gmp_randinit_mt(state);
         FILE *fp = fopen("/dev/urandom","rb");
-        if (!fp) die(1,"unable to open /dev/rrandom\n");
-        int n;
-        int size = mpz_size(rxe->nitems)+1;
-        for (n=0;n<32;n++) {
-            unsigned long int seed;
-            fread(&seed,1,sizeof(seed),fp);
-            gmp_randseed_ui(state,seed);
-        }
-        close(fp);
+        if (!fp) die(1,"unable to open /dev/urandom\n");
+        // Seed from one block of entropy. The loop this replaces called
+        // gmp_randseed_ui 32 times over, each call discarding the seed set by
+        // the one before, so only the final word ever had any effect.
+        unsigned char seed_bytes[32];
+        if (fread(seed_bytes,1,sizeof(seed_bytes),fp) != sizeof(seed_bytes))
+            die(1,"unable to read from /dev/urandom\n");
+        fclose(fp);
+        mpz_t seed;
+        mpz_init(seed);
+        mpz_import(seed,sizeof(seed_bytes),1,1,0,0,seed_bytes);
+        gmp_randseed(state,seed);
+        mpz_clear(seed);
         if (!mpz_sgn(count)) mpz_set_ui(count,1);
         mpz_t zero;
         mpz_init(zero);
         for (;;) {
             mpz_urandomm(from,state,rxe->nitems);
-            enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep);
+            enumerate(rxe,options|ENUM_ONCE,offset,from,zero,sep,NULL);
             mpz_sub_ui(count,count,1);
-            if (!mpz_sgn(count)) return 0;
+            if (!mpz_sgn(count)) {
+                mpz_clear(zero);
+                mpz_clear(from);
+                mpz_clear(to);
+                mpz_clear(count);
+                gmp_randclear(state);
+                rxe_free(rxe);
+                return 0;
+            }
         }
     }
     if (!have_from) mpz_set_ui(from,offset);
@@ -139,28 +167,42 @@ int main(int argc, char **argv)
     }
     
     if (do_enumerate) {
-        enumerate(rxe,options,offset,from,count,sep);
+        // An empty set enumerates to nothing at all; there is no element to
+        // seek to, so skip straight past.
+        if (mpz_sgn(rxe->nitems))
+            enumerate(rxe,options,offset,from,count,sep,perm);
     } else {
         print_grouped(stdout,NULL,rxe->nitems,"\n",sep);
-        double log_d = log(mpz_get_d(rxe->nitems));
-        int n, base[] = { 10, 2 };
-        int nbases = sizeof(base)/sizeof(base[0]);
-        for (n=0;n<nbases;n++) {
-            double l = log_d/log(base[n]);
-            mpz_t num,b;
-            mpz_init(num);
-            mpz_init_set_ui(b,base[n]);
-            mpz_pow_ui(num,b,l);
-            printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
-            printf("%2d^%g\n",base[n],l);
+        // The logarithms are meaningless for an empty set, and log(0) is
+        // -infinity, which mpz_pow_ui turns into a GMP abort.
+        if (mpz_sgn(rxe->nitems)) {
+            double log_d = log(mpz_get_d(rxe->nitems));
+            int n, base[] = { 10, 2 };
+            int nbases = sizeof(base)/sizeof(base[0]);
+            for (n=0;n<nbases;n++) {
+                double l = log_d/log(base[n]);
+                mpz_t num,b;
+                mpz_init(num);
+                mpz_init_set_ui(b,base[n]);
+                mpz_pow_ui(num,b,l);
+                printf("%s ", mpz_cmp(rxe->nitems,num) ? "~" : "=");
+                printf("%2d^%g\n",base[n],l);
+                mpz_clear(num);
+                mpz_clear(b);
+            }
         }
     }
     //rxe_backref_table_free(rxe->brt);
+    rxe_permutation_free(perm);
     rxe_free(rxe);
+    mpz_clear(from);
+    mpz_clear(to);
+    mpz_clear(count);
     return 0;
 }
 
-void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, char sep)
+void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
+               char sep, struct rxe_permutation *perm)
 {
     mpz_t final;
     mpz_init(final);
@@ -188,7 +230,16 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
     mpz_mul(step2,step2,q);
     if (!mpz_sgn(step2)) mpz_set_ui(step2,1000);
     mpz_sub_ui(from,from,offset);
-    if (rxe_seek(rxe,from)) die(100,"seek past end");
+    // With a permutation the odometer cannot simply be stepped: consecutive
+    // output positions are scattered across the set, so each one is reached
+    // by seeking to the permuted index. rxe_permutation_map is the identity
+    // when perm is NULL, so the unpermuted path is unchanged.
+    mpz_t idx,target;
+    mpz_init_set(idx,from);
+    mpz_init(target);
+    if (perm && mpz_cmp(idx,rxe->nitems)>=0) die(100,"seek past end");
+    rxe_permutation_map(target,perm,idx);
+    if (rxe_seek(rxe,target)) die(100,"seek past end");
     for (;;) {
          char str[MAXSTRLEN+1];
          rxe_current(str,MAXSTRLEN,rxe);
@@ -204,22 +255,43 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt, ch
             }
          }
          printf("%s\n",str);
-         if (!rxe_next(rxe)) break;
+         if (perm) {
+             mpz_add_ui(idx,idx,1);
+             if (mpz_cmp(idx,rxe->nitems)>=0) break;
+             rxe_permutation_map(target,perm,idx);
+             if (rxe_seek(rxe,target)) break;
+         } else {
+             if (!rxe_next(rxe)) break;
+         }
          if (mpz_sgn(cnt)) {
              mpz_sub_ui(cnt,cnt,1);
              if (!mpz_sgn(cnt)) break;
          }
          if (flags & ENUM_ONCE) break;
     }
+    // -r calls this once per sample, so leaving these behind accumulated.
+    mpz_clear(idx);
+    mpz_clear(target);
+    mpz_clear(final);
+    mpz_clear(count);
+    mpz_clear(step1);
+    mpz_clear(step2);
+    mpz_clear(q);
 }
 
 void print_grouped(FILE *fp, char *prefix, mpz_t x, char *suffix, char sep)
 {
-    int size = mpz_size(x)*21;
-    char str[size+1];
-    gmp_sprintf(str,"%*Zd",size,x);
     if (prefix) fprintf(fp,"%s",prefix);
     if (mpz_sgn(x)) {
+        // Pad the field out to a whole number of three-digit groups, so the
+        // loop below -- which counts groups from the left of the padded
+        // string -- breaks on real thousands boundaries. mpz_sizeinbase may
+        // overshoot by one digit; the extra padding is blank and is skipped.
+        // Sizing this from mpz_size() instead yielded a zero-length buffer
+        // for x==0, which gmp_sprintf then overran.
+        int size = ((mpz_sizeinbase(x,10)+2)/3)*3;
+        char str[size+1];
+        gmp_sprintf(str,"%*Zd",size,x);
         char *p = str;
         int   i = 2;
         int   f = 0;
@@ -245,9 +317,11 @@ int mpz_len(mpz_t x)
     int len = 0;
     for (;;) {
         len++;
-        if (mpz_cmp(r,x)>0) return len;
+        if (mpz_cmp(r,x)>0) break;
         mpz_mul_ui(r,r,10);
     }
+    mpz_clear(r);
+    return len;
 }
 
 /* ---------------------------- Support Routines -------------------------- */

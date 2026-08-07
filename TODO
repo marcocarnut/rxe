@@ -1,22 +1,140 @@
+DONE SINCE 0.9.1
+================
+
+- Unit tests. 'make test' runs tests/run.sh (one case per documented
+  behaviour and per bug that was once real), tests/api.c (the library entry
+  points, linked directly), and tests/oracle.py (brute-forces the alphabet
+  and compares whole sets against Python's re). 'make test-asan' repeats all
+  of it under AddressSanitizer, UndefinedBehaviorSanitizer and
+  LeakSanitizer, with leak detection on.
+- Flag to change the enumeration direction: (?L), (?-L) and -L.
+- Keyed permutation of the enumeration order: -k key, and the
+  rxe_permutation_* entry points in rxe.h.
+- make install now installs librxe.a and rxe.h, so the library can actually
+  be linked against.
+- Fifteen correctness fixes, from an uninitialised status byte that made
+  every parse report a garbage error, through a double free on any
+  backreference, to backreference numbering being off by one after every
+  (?:...) group. See the git log.
+
+
 SHORT TERM TO-DOs
 =================
 
-- Make an unit test
-- Write API documentation
+- Write API documentation. rxe.h has the data structures commented but
+  there is no account of the calling sequence: parse, seek, current,
+  iterate, free. tests/api.c is currently the closest thing to one.
 - Implement missing things: POSIX character classes, \o, \g with negative
   and named backreferences, \k, etc.
-- Add flag to change associativity direction
+- Decide the caseless backreference question. '(?i)(a)\1' generates
+  {aa, AA}, while Perl's matcher accepts {aa, aA, Aa, AA}, since under /i a
+  backreference compares case-insensitively. Exact copies are probably the
+  more useful reading for generation, but the divergence should either be
+  fixed or written down in the manual page.
 - Code refactoring
   > split handle_repeats in two functions: the first parses/validates
     the paramaters, the second does the actual work
   > simplify the ? quantifier using the above function as a special case {0,1}
-- Performance
-  > add binary tree to speed up regexes with large number of alternations
-  > Clean up error handling code
-  > More descriptive error messages pointing to the probable location
+    (note: since the ? quantifier and handle_repeats have twice now had the
+    same bug fixed separately -- clearing the node's own characters, and
+    inheriting the enumeration direction -- this is worth more than it looks)
+- Error handling
+  > handle_repeats still signals failure by writing a status code into the
+    mpz_t it was given for the result. Clean that up.
+  > More descriptive error messages pointing to the probable location.
+    This needs no structural change: str is in scope at all twenty-seven
+    places an error is raised, so it only wants a field for the offset and a
+    helper that sets status and position together. Three things to watch.
+    rxe_parse skips a leading ^, so offsets must be relative to the original
+    argument or the caret sits one character off. Where a nested parse
+    propagates its status upward, the inner position has to win, or every
+    error inside a group reports the position of the group. And five sites
+    do not set rxe->status at all, smuggling the code through the mpz_t
+    meant for the result -- an mpz_t can carry a number but not a position,
+    so those paths cannot report one until the smuggling above is fixed.
+    The two items are therefore one job, and cheaper done together.
+
 
 LONG-TERM TO-DOs
 ================
 
-> JIT compiler
+> Replace the node-cloning repetition with closed-form counted nodes.
+  handle_repeats currently materialises {r0,r1} by cloning the node once per
+  repetition per count, which costs O(m^2) memory: a{1,2000} takes 316MB and
+  a{1,20000} would want about 30GB. A repetition node carrying a count
+  instead makes the cardinality a geometric series and the seek a division.
 
+> Enumerate infinite sets. Keep reporting that the set is infinite, but
+  still map integers onto its members, so * and + stop being a hard error.
+  Each unbounded quantifier is an N-valued dimension; the finite part stays
+  the mixed-radix numeral it is today, and a pairing function spreads one
+  index across the dimensions. Best done together with the closed-form
+  repetition above rather than after it: an unbounded quantifier is just a
+  counted repetition whose upper bound is infinite, so the two are one
+  change to the same arithmetic.
+
+> Permute the enumeration order under a key. A keyed bijection on [0,N)
+  applied to the index before seeking gives a different, deterministic,
+  repeatable order -- enough to randomise a brute-force search without
+  losing the ability to resume it. A small Feistel network over the index
+  with cycle walking is the standard construction. This touches nothing but
+  the index, so it can be done at any point, independently of everything
+  above, and it subsumes -r: a permutation visits every member exactly once
+  instead of sampling with replacement.
+
+> Abstract the arithmetic behind a base-type shim, so the width can be
+  chosen at build time: GMP for unbounded cardinalities as now, or
+  uint64_t / uint32_t for environments that cannot carry a bignum library.
+  That makes librxe dependency-free in its fixed-width form -- GMP is
+  currently the only dependency -- and puts it within reach of a
+  microcontroller. It is also the same abstraction the GPU work needs, a
+  kernel having to use fixed-width arithmetic regardless, so the two are one
+  mechanism rather than two.
+
+  Cheaper than it sounds. The library core uses only sixteen distinct mpz
+  operations (set, set_ui, init, clear, sgn, mul, add, add_ui, sub, tdiv_qr,
+  pow_ui, cmp, cmp_ui, get_ui, init_set, init_set_ui), and never assigns one
+  mpz_t to another: because mpz_t is an array type, GMP forced every
+  operation through a function call, which is exactly the style a swappable
+  base type requires. The port is largely mechanical renaming. The demo
+  program needs more than the library does -- formatting, random selection,
+  decimal parsing -- and would keep requiring GMP, or grow its own
+  fixed-width paths.
+
+  The real design question is overflow, not the wrappers. With GMP a
+  cardinality cannot overflow; with uint64_t it silently wraps, and the
+  threshold is lower than intuition suggests:
+
+      [A-Z]{13}         2,481,152,873,203,736,576   fits
+      [A-Z]{14}        64,509,974,703,297,150,976   overflows
+      [0-9A-Za-z]{10}     839,299,365,868,340,224   fits
+      [0-9A-Za-z]{11}  52,036,560,683,837,093,888   overflows
+
+  So thirteen upper-case letters fit in 64 bits and fourteen do not. The
+  shim has to saturate, or detect and report, rather than wrap; deciding
+  which, and where the check goes, is the work.
+
+> JIT compiler, and a GPU back end. The parse tree is the intermediate
+  representation and a code generator consumes it, so neither requires the
+  tree to change. Worth doing after the closed-form repetition rework, both
+  because the tree settles then and because today a JIT would have to
+  compile the two million nodes that a{1,2000} expands into.
+
+  The GPU case has a shape the JIT case does not. A GPU wants independent
+  work per thread, and rxe_iterate carries sequentially, so it does not
+  parallelise. rxe_seek is per-index and independent: one thread per index
+  is the natural kernel, and composes with the keyed permutation above as
+  seek(pi(base + t)). The random-access formulation the library already has
+  is what makes this possible at all.
+
+  Keep it in-tree behind a build flag until the tree representation settles.
+  The structures are already visible in rxe.h, but there is no documented
+  traversal contract and no stability promise, and a separate consumer would
+  be chasing a moving target through the repetition rework.
+
+> Binary tree over alternations, to replace the linear scan in rxe_seek.
+  Deferred, and possibly not worth doing: 20,000 hand-written alternatives
+  already parse and seek in 0.02s, and enumerate in full in 0.02s. The only
+  place large alternation counts arise in practice is handle_repeats, which
+  builds one alternation per repeat count -- and the closed-form rework
+  above removes them. Revisit only if this ever shows up in a profile.

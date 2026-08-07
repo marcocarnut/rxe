@@ -23,8 +23,6 @@
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
 
-#define RXE_FLAG_CLOSED_BRACKET      1
-
 #define FLAG_SET                     1
 #define FLAG_RESET                   0
 
@@ -32,23 +30,20 @@
 
 // Status/error message strings
 
-char *rxe_status_msgs[] = {
-    "",
-    "infinite",
-    "extraneous parentheses",
-    "missing parentheses",
-    "nothing before quantifier",
-    "nested quantifiers",
-    "unterminated literal",
-    "unterminated character class",
-    "unterminated repetition",
-    "unterminated flags",
-    "bad repetition parameters",
-    "unimplemented",
-    "invalid backreference",
-    "stray non-digit characters in numeric constant",
-    "unterminated hex constant",
+const char *rxe_status_msgs[] = {
+#define RXE_STATUS_MSG_ENTRY(name,msg) msg,
+    RXE_STATUS_LIST(RXE_STATUS_MSG_ENTRY)
+#undef RXE_STATUS_MSG_ENTRY
 };
+
+// Both this table and the enum come from RXE_STATUS_LIST in rxe.h, so they
+// cannot disagree. The assert stays as a tripwire in case someone later
+// expands one of them by hand.
+
+_Static_assert(
+    sizeof(rxe_status_msgs)/sizeof(rxe_status_msgs[0]) == RXE_NSTATUS,
+    "rxe_status_msgs[] is out of sync with enum rxe_parse_status"
+);
 
 // Backslash-letter escape table.
 // Empty string means ignored, NULL means unimplemented, anything else is
@@ -56,7 +51,7 @@ char *rxe_status_msgs[] = {
 // Some escapes, like \x and \g, are hardcoded and handled before this table
 // is looked up.
 
-char *backslash_letters[] = {
+const char *backslash_letters[] = {
     "",                // \A: beginning of the string assertion, ignored
     "",                // \B: match at non word assertion, ignored
     NULL,              // \C: C language octet, unimplemented
@@ -119,13 +114,13 @@ char *backslash_letters[] = {
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth);
-char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str);
-char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, char *str, int flags);
-char *handle_flags(char *str, int *flags);
-char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
-char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
-char *handle_hex_char(struct rxe *rxe, char *str, char *chr);
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags);
+const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
+const char *handle_flags(const char *str, int *flags);
+const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
+const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe);
+const char *handle_hex_char(struct rxe *rxe, const char *str, char *chr);
 
 /* ------------------------------------------------------------------------ */
 
@@ -134,8 +129,12 @@ enum rxe_parse_status rxe_error(struct rxe *rxe)
     return rxe->status;
 }
 
-char *rxe_error_message(struct rxe *rxe)
+const char *rxe_error_message(struct rxe *rxe)
 {
+    // Indexing the table with an out-of-range status is what turned the
+    // uninitialised rxe->status into a segfault. Cheap to rule out for good.
+    if (!rxe || (unsigned)rxe->status >= (unsigned)RXE_NSTATUS)
+        return "unknown error";
     return rxe_status_msgs[rxe->status];
 }
 
@@ -149,61 +148,102 @@ char *rxe_error_message(struct rxe *rxe)
 // On success, returns a pointer to the character after the successfully
 // parsed (sub)expression. On error, the return value is undefined.
 
-char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
+// parse() leaves through eighteen separate points, most of them error paths.
+// Route every one of them through here so that none can forget to release the
+// accumulators.
+
+static const char *parse_done(mpz_t x, mpz_t n, mpz_t p, const char *str)
+{
+    mpz_clear(x);
+    mpz_clear(n);
+    mpz_clear(p);
+    return str;
+}
+
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth)
 {
     mpz_t x,n,p;
     mpz_init_set_ui(x,1);  // Multiplicative accumulator
     mpz_init_set_ui(n,1);  // Current number of elements
     mpz_init_set_ui(p,1);  // Previous n
     char c;
-    int i, newflags, quantifier = 0;
+    int i, newflags, is_flag_group, quantifier = 0;
     struct rxe_alt *alt = rxe_new_alt(rxe); 
     mpz_set(alt->start,ret);
+    // Direction is decided while parsing but consulted while enumerating, so
+    // unlike the other options it cannot just live in 'flags'; it has to be
+    // recorded on the subexpression itself. Inheriting it here is what makes
+    // (?L) apply to nested groups and (?-L:...) able to override it again.
+    if (flags & RXE_LEFT_TO_RIGHT) rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
     struct rxe_node *node;
-    char *str2,prev=0;
+    const char *str2;
+    char prev=0;
     for (;;) {
         switch (c = *str++) {
             // ---------------- Termination conditions ---------------
             // End of subexpression
             case ')': if (!depth) {
                           rxe->status = RXE_TOO_MANY_PARENS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // fall-thru
             // End of string
             case  0 : if (depth && !c) { 
                           rxe->status = RXE_TOO_LITTLE_PARENS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // fall-thru
             // Alternation: does not really finish; flushes partial
             // results, accumulates them and restarts
             case '|': mpz_mul(x,x,n);
+                      // x is now this alternation's cardinality. Record it:
+                      // enumeration needs to tell an alternation that matches
+                      // nothing (product zero) from one that matches only the
+                      // empty string (product one, no nodes).
+                      mpz_set(alt->nitems,x);
                       mpz_add(ret,ret,x);
-                      if (c != '|') return str;
-                      // Below runs for alternation only
-                      mpz_init_set_ui(x,1);
-                      mpz_init_set_ui(n,1);
-                      mpz_init_set_ui(p,1);
+                      if (c != '|') return parse_done(x,n,p,str);
+                      // Below runs for alternation only. These are already
+                      // live, so re-initialising them would orphan the limbs
+                      // they hold; just assign.
+                      mpz_set_ui(x,1);
+                      mpz_set_ui(n,1);
+                      mpz_set_ui(p,1);
                       alt = rxe_new_alt(rxe);
                       mpz_set(alt->start,ret);
                       break;
             // ------------------- Sub-expressions -----------------
             case '(': newflags = flags;
+                      // Only a group introduced by '?' can be one that merely
+                      // sets flags. Without this test an empty group '()' also
+                      // arrived at the branch below -- handle_flags returns
+                      // straight away when there is no '?' -- and was
+                      // discarded, so it captured nothing and consumed no
+                      // backreference number. Perl makes it a capturing group
+                      // that matches the empty string.
+                      is_flag_group = (*str=='?');
                       str2 = handle_flags(str,&newflags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_FLAGS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
-                      if (*str==')') {
+                      if (is_flag_group && *str==')') {
                           flags = newflags;
+                          // A bare (?L) or (?-L) governs the whole enclosing
+                          // group rather than just the rest of it. An odometer
+                          // is a single unit: there is no coherent way for the
+                          // direction to change partway along one.
+                          if (flags & RXE_LEFT_TO_RIGHT)
+                              rxe->flags |=  RXE_FLAG_LEFT_TO_RIGHT;
+                          else
+                              rxe->flags &= ~RXE_FLAG_LEFT_TO_RIGHT;
                           str++;
                           continue;
                       }
                       if (*str>='0' && *str<='9' && str[-1]=='?') {
                           str2 = handle_recursion(str,n,alt,rxe);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                           break;
                       }
@@ -212,7 +252,13 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       struct rxe *sub_rxe = rxe_new();
                       node = rxe_new_node(alt);
                       sub_rxe->brt = rxe->brt;
-                      rxe_backref_table_add(rxe->brt,sub_rxe);
+                      // Every group introduced by '?' -- (?:...) and (?i:...)
+                      // alike -- is non-capturing, so it must not take a
+                      // backreference number. Registering them shifted every
+                      // later \N by one: '(?:a)(b)\1' gave "aba" for what Perl
+                      // reads as "abb", and '(?:a)(b)\2' was accepted at all.
+                      if (!is_flag_group)
+                          rxe_backref_table_add(rxe->brt,sub_rxe);
                       str = parse(sub_rxe,n,str,newflags,depth+1);
                       node->rxe = sub_rxe;
                       mpz_set(node->rxe->nitems,n);
@@ -220,22 +266,22 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       sub_rxe->flags |= RXE_FLAG_CLOSED_BRACKET;
                       if (sub_rxe->status) {
                           rxe->status = sub_rxe->status;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       break;
             // ---------------- Universal quantifiers --------------
             case '*': rxe->status = RXE_INFINITE;
-                      return str;
+                      return parse_done(x,n,p,str);
             case '+': rxe->status = RXE_INFINITE;
-                      return str;
+                      return parse_done(x,n,p,str);
             // ------------------- Quantifiers ---------------------
             case '?': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       if (!alt->tail) {
                           rxe->status = RXE_LONE_QUANTIFIER;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       // FIXME: Split handle_repetitions into two functions,
                       // the first which only parses/validades the parameters
@@ -245,11 +291,22 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       mpz_add_ui(n,n,1);
                       mpz_set_ui(p,1);
                       struct rxe *new_rxe = rxe_new();
+                      if (flags & RXE_LEFT_TO_RIGHT)
+                          new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
                       struct rxe_alt *emp_alt = rxe_new_alt(new_rxe);
                       mpz_set(emp_alt->start,alt->tail->start);
+                      mpz_set_ui(emp_alt->nitems,1);   // matches the empty string
                       struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
                       rxe_node_deep_clone(new_alt,alt->tail,1);
                       mpz_add_ui(new_alt->start,alt->tail->start,1);
+                      // The clone has taken over this node's characters and
+                      // any subexpression, so drop them from the node itself.
+                      // Leaving both in place makes rxe_iterate step the
+                      // node's own characters as well as the alternation
+                      // below it, multiplying the set instead of replacing
+                      // it. handle_repeats does the same for {n,m}.
+                      alt->tail->rxe = NULL;
+                      rxe_free_node_data(alt->tail);
                       alt->tail->rxe = new_rxe;
                       mpz_set(new_alt->nitems,new_alt->tail->nitems);
                       mpz_add_ui(alt->tail->nitems,new_alt->nitems,1);
@@ -258,28 +315,28 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       break;
             case '{': if (quantifier) {
                           rxe->status = RXE_NESTED_QUANTIFIERS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       if (!alt->tail) {
                           rxe->status = RXE_LONE_QUANTIFIER;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
-                      str2 = handle_repeats(alt,n,p,str);
+                      str2 = handle_repeats(alt,n,p,str,flags);
                       if (!str2) {
                           rxe->status = mpz_get_ui(n);
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
                       mpz_mul(x,x,n);
-                      mpz_init_set_ui(n,1);
-                      mpz_init_set_ui(p,1);
+                      mpz_set_ui(n,1);   // already live; assign, do not re-init
+                      mpz_set_ui(p,1);
                       quantifier = 1;
                       break;
             // ----------------- Character Classes -----------------
             case '[': str2 = handle_character_class(rxe,alt,n,str,flags);
                       if (!str2) {
                           rxe->status = RXE_UNTERMINATED_CLASS;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       str = str2;
                       quantifier = 0;
@@ -294,13 +351,13 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
             // ----------------- Escaped Characters ----------------
            case '\\': if (!*str) {
                           rxe->status = RXE_UNTERMINATED_LITERAL;
-                          return str;
+                          return parse_done(x,n,p,str);
                       }
                       c = *str; prev='\\';
                       quantifier = 0;
                       if (c>='0' && c<='9') {
                           str2 = handle_backreferences(str,n,alt,rxe);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                           break;
                       }
@@ -309,15 +366,18 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                       // references, \g with named references, \k, etc.
                       if (c == 'x') {
                           str2 = handle_hex_char(rxe,str,&c);
-                          if (!str2) return str;
+                          if (!str2) return parse_done(x,n,p,str);
                           str = str2;
                       }
                       else if (c>='A' && c<='z') {
-                          char *p = backslash_letters[c-'A'];
-                          if (p) {
-                              if (c=p[0]) {
-                                  if (p[1]) {
-                                      handle_character_class(rxe,alt,n,p,0);
+                          // Named 'esc', not 'p': the outer accumulator is
+                          // called p, and shadowing it here hid it from the
+                          // cleanup call below.
+                          const char *esc = backslash_letters[c-'A'];
+                          if (esc) {
+                              if ((c=esc[0])) {   // assign, then test
+                                  if (esc[1]) {
+                                      handle_character_class(rxe,alt,n,esc,0);
                                       break;
                                   } // else fall thru
                               } else {
@@ -326,11 +386,12 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
                               }
                           } else {
                              rxe->status = RXE_UNIMPLEMENTED;
-                             return str;
+                             return parse_done(x,n,p,str);
                           }
                       }
                       // fall thru
             case '$': if (!*str && prev!='\\') continue;
+                      // fall-thru - a dollar anywhere else is a literal
              default: i = 1;
                       node = rxe_new_node(alt);
                       node->str = NEW(2,char);
@@ -353,7 +414,7 @@ char *parse(struct rxe *rxe, mpz_t ret, char *str, int flags, int depth)
     }
 }
 
-char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
+const char *handle_hex_char(struct rxe *rxe, const char *str, char *chr)
 {
     int val = 0;
     int done = 0;
@@ -371,12 +432,14 @@ char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
                 // fall-thru
             case 'A'...'F':
                 c -= 7;
+                // fall-thru
             case '0'...'9':
                 val = val * 16 + c-'0';
                 if (++ndigits==2) done = 1;
                 break;
             default:
                 str--;
+                // fall-thru
             case '}':
                 done = 1;
                 break;
@@ -394,7 +457,7 @@ char *handle_hex_char(struct rxe *rxe, char *str, char *chr)
     return str;
 }
 
-char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
+const char *handle_backreferences(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
 {
     int brnum = 0;
     int done = 0;
@@ -421,13 +484,17 @@ char *handle_backreferences(char *str, mpz_t n, struct rxe_alt *alt, struct rxe 
         rxe->status = RXE_INFINITE;
         return NULL;
     }
+    if (node->rxe->flags & RXE_FLAG_VARIABLE_REPEAT) {
+        rxe->status = RXE_BACKREF_INTO_VARIABLE_REPEAT;
+        return NULL;
+    }
     node->is_backref = 1;
     mpz_set_ui(node->nitems,1);
     mpz_set_ui(n,1);
     return str;
 }
 
-char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
+const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
 {
     int brnum = 0;
     int done = 0;
@@ -466,7 +533,7 @@ char *handle_recursion(char *str, mpz_t n, struct rxe_alt *alt, struct rxe *rxe)
     return str;
 }
 
-char *handle_flags(char *str, int *flags)
+const char *handle_flags(const char *str, int *flags)
 {
     if (*str != '?') return str;
     int dir = FLAG_SET;
@@ -475,10 +542,26 @@ char *handle_flags(char *str, int *flags)
         switch (*str++) {
             case  0 : return NULL;
       case '0'...'9': return --str;
-            case ')': return str;
+            // Back up onto the ')' so the caller can recognise a group that
+            // only sets flags, such as (?i). Returning past it made the caller
+            // read the group as a subexpression whose parenthesis never
+            // closed, reporting 'missing parentheses' for a valid regex.
+            case ')': return --str;
             case 'i': flag = RXE_CASELESS;
                       break;
-            case 'm': flag = RXE_DOTALL;
+            // Perl's /s is the one that makes the dot match everything. This
+            // arm used to be 'm', so (?s) did nothing and (?m) silently did
+            // what (?s) should.
+            case 's': flag = RXE_DOTALL;
+                      break;
+            // /m governs where ^ and $ match. Those are not honoured anywhere
+            // in a set enumerator -- the whole regex is implicitly anchored --
+            // so accepting it and doing nothing is the correct reading.
+            case 'm': break;
+            // Not a Perl flag. Perl's inline flags are all lower case, so an
+            // upper case letter cannot collide with one, now or later. Lower
+            // case 'l' was not available: Perl 5.14 gave it to locale rules.
+            case 'L': flag = RXE_LEFT_TO_RIGHT;
                       break;
             case '-': dir = FLAG_RESET;
                       break;
@@ -491,27 +574,34 @@ char *handle_flags(char *str, int *flags)
     return str;
 }
 
-char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
+const char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, const char *str, int flags)
 {
-    char *end = strchr(str,'}');
+    const char *end = strchr(str,'}');
     if (!end) {
         // FIXME: Use something else more elegant to return the status code
         mpz_set_ui(ret,RXE_UNTERMINATED_REPEAT);
         return NULL;
     }
-    *end = 0;
     if (*str<'0' || *str>'9') {
         // FIXME: Use something else more elegant to return the status code
         mpz_set_ui(ret,RXE_BAD_REPETITION);
         return NULL;
     }
+    // atoi stops at the closing brace on its own. The comma search must be
+    // bounded explicitly, though: this used to be done by writing a NUL over
+    // the '}' and restoring it afterwards, which made rxe_parse scribble on
+    // the caller's string and crash outright on a string literal.
     int r0  = atoi(str);
     int r1  = r0;
-    char *c = strchr(str,',');
+    const char *c = memchr(str,',',end-str);
     if (c) {
-        if (!c[1]) {
+        if (c+1 == end) {
+            // Nothing after the comma, as in a{1,}: an open-ended repetition,
+            // which denotes an infinite set. Must return here, or the
+            // non-digit check below overwrites this with a less accurate one.
             // FIXME: Use something else more elegant to return the status code
             mpz_set_ui(ret,RXE_INFINITE);
+            return NULL;
         }
         if (c[1]<'0' || c[1]>'9') {
             // FIXME: Use something else more elegant to return the status code
@@ -526,44 +616,61 @@ char *handle_repeats(struct rxe_alt *alt, mpz_t ret, mpz_t x, char *str)
         return NULL;
     }
     struct rxe_node *prev_node = alt->tail;
+    // A variable repetition builds one alternation per repeat count, each with
+    // a different number of clones. Only one of them can alias the original
+    // subexpression, so a later \N -- which resolves through that single alias
+    // -- would read from an alternation that is not the one being enumerated.
+    // Mark the subexpression so handle_backreferences can refuse it.
+    if (r0 != r1 && prev_node->rxe)
+        prev_node->rxe->flags |= RXE_FLAG_VARIABLE_REPEAT;
     struct rxe *new_rxe = rxe_new();
+    // The repeated copies live in an alternation of their own, so the
+    // direction has to reach this subexpression as well, or {n} would keep
+    // counting right to left inside a (?L) group.
+    if (flags & RXE_LEFT_TO_RIGHT) new_rxe->flags |= RXE_FLAG_LEFT_TO_RIGHT;
     int n;
     mpz_set_ui(ret,0);
-    mpz_t pp;
-    mpz_init(pp);
-    int shallow = 1;
+    // Declared out here and reused: initialising it inside the loop leaked one
+    // allocation per repeat count, which for a wide range is a great many.
+    mpz_t p;
+    mpz_init(p);
     for (n=r0;n<=r1;n++) {
         int m;
         struct rxe_alt *new_alt = rxe_new_alt(new_rxe);
-        mpz_t p;
-        mpz_init(p);
         mpz_pow_ui(p,x,n);
         mpz_add(new_alt->start,prev_node->start,ret);
         mpz_add(ret,ret,p);
         for (m=0;m<n;m++) {
-            rxe_node_deep_clone(new_alt,prev_node,shallow);
-            shallow = 0;
+            // Exactly one clone may alias the original subexpression rather
+            // than deep-copying it; it inherits ownership of it. Make that the
+            // *last* clone, so a \N resolving through the backreference table
+            // -- which still points at the original -- refers to the final
+            // repetition, as Perl does.
+            rxe_node_deep_clone(new_alt,prev_node,n==r1 && m==n-1);
         }
-        if (new_alt->tail) 
-            mpz_set(new_alt->nitems,new_alt->tail->nitems);
-        else
-            mpz_set_ui(new_alt->nitems,0);
-        mpz_set(pp,p);
+        // p is x^n, the cardinality of this repeat count. For n==0 that is 1,
+        // the empty string, which is a member and must not be mistaken for an
+        // alternation that matches nothing.
+        mpz_set(new_alt->nitems,p);
     }
+    mpz_clear(p);
     mpz_set(new_rxe->nitems,ret);
     mpz_set(prev_node->nitems,ret);
-    prev_node->rxe = NULL;
+    // Exactly one clone aliases the original subexpression and inherits it, so
+    // it must not be freed here. That clone only exists when at least one was
+    // made: for {0} the loop above bodies out without cloning anything, and
+    // this node then holds the only pointer to the subexpression.
+    if (r1 > 0) prev_node->rxe = NULL;
     rxe_free_node_data(prev_node);
     prev_node->rxe = new_rxe;
-    *end++ = '}';
-    return end;
+    return end+1;   // just past the '}'
 }
 
-char *handle_character_class(
-    struct rxe *rxe, 
-    struct rxe_alt *alt, 
-    mpz_t ret, 
-    char *str, 
+const char *handle_character_class(
+    struct rxe *rxe,
+    struct rxe_alt *alt,
+    mpz_t ret,
+    const char *str,
     int flags
 ) {
     int  count  = 0;
@@ -575,9 +682,35 @@ char *handle_character_class(
     int n,m;
     int range_start,range_finish;
     int do_range = 0;
+    // True until the first member has been consumed. Tracked separately from
+    // 'prev', which doubles as the low end of a pending range and which the
+    // '-' arm below deliberately leaves alone.
+    int at_start = 1;
     for (n=0;n<256;n++) used[n] = 0;
     for (;;) {
         c = *str++;
+        // A caret inverts the class only as its very first character. Anywhere
+        // else it is an ordinary member, so let it reach the default arm
+        // below. This is checked before the switch rather than inside it
+        // because the default arm cannot be reached by falling through the
+        // backslash case, which would misread an escaped caret. The first
+        // member position survives it, so "[^]]" is the class without ']'.
+        if (c=='^' && at_start && !invert) {
+            invert = 1;
+            prev = c;
+            continue;
+        }
+        int was_at_start = at_start;
+        at_start = 0;
+        // Perl and POSIX both read a ']' in the first member position as an
+        // ordinary member rather than the end of the class, so "[]]" holds
+        // ']' and a bare "[]" is unterminated rather than empty.
+        if (c==']' && was_at_start) {
+            count++;
+            used[(unsigned char)']'] = 1;
+            prev = c;
+            continue;
+        }
         // FIXME: Implement POSIX named character classes
         switch (c) {
              case  0 : // fall-thru
@@ -591,8 +724,6 @@ char *handle_character_class(
                        mpz_set_ui(node->nitems,count);
                        if (!c) return NULL;
                        return str;
-             case '^': if (!prev) invert = 1;
-                       break;
              case '-': if (*str == ']') {
                            count++; used['-']=1;
                            continue;
@@ -605,7 +736,7 @@ char *handle_character_class(
                        if (c=='b') {
                            c=8;
                        } else if (c=='x') {
-                           char *str2 = handle_hex_char(rxe,str,&c);
+                           const char *str2 = handle_hex_char(rxe,str,&c);
                            if (!str2) return str;
                            str = str2;
                        }

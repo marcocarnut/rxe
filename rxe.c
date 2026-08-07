@@ -22,13 +22,9 @@
 #include "rxe_alt.h"
 #include "rxe_node.h"
 #include "bkreftbl.h"
+#include "parse.h"
 
 /* ------------------------ Macro-Defined Constants ----------------------- */
-
-#define ENUM_ONCE                    1
-#define ENUM_NUMBER                  2
-
-#define RXE_FLAG_HAS_BKRTABLE        2
 
 /* -------------------------- Global Declarations ------------------------- */
 
@@ -36,26 +32,22 @@ int rxe_initialized;
 
 void *(*rxe_mem_alloc)(size_t);
 void (*rxe_mem_free)(void *);
-void (*rxe_mem_alloc_failed)(size_t size, char *file, int line);
+void (*rxe_mem_alloc_failed)(size_t size, const char *file, int line);
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node, int shallow);
-struct rxe *rxe_deep_clone(struct rxe *src_rxe);
-
-void kmalloc_failed(size_t size, char *file, int line);
+void kmalloc_failed(size_t size, const char *file, int line);
 
 void rxe_set_alloc(
     void * (*malloc_func)(size_t),
     void (*free_func)(void *),
-    void (*fail_func)(size_t size, char *file, int line)
+    void (*fail_func)(size_t size, const char *file, int line)
 );
 
 /* ------------------------------------------------------------------------ */
 
 void rxe_init(void)
 {
-    int n;
     rxe_initialized = 1;
     rxe_set_alloc(malloc,free,kmalloc_failed);
 }
@@ -63,26 +55,47 @@ void rxe_init(void)
 void rxe_set_alloc(
     void * (*malloc_func)(size_t),
     void (*free_func)(void *),
-    void (*fail_func)(size_t size, char *file, int line)
+    void (*fail_func)(size_t size, const char *file, int line)
 )
 {
     rxe_mem_alloc = malloc_func;
     rxe_mem_free = free_func;
     rxe_mem_alloc_failed = fail_func;
+    // Counts as initialising. Without this, a caller who installed its own
+    // allocator had it quietly replaced by the default one the first time
+    // rxe_parse ran, which made the whole hook pointless.
+    rxe_initialized = 1;
+}
+
+// Returns the first alternation that contributes any string at all. An
+// alternation whose product is zero holds an impossible node -- an empty
+// character class, say -- and matches nothing, so enumeration must step over
+// it. This is distinct from an alternation with no nodes, whose product is
+// one because it matches the empty string.
+
+static struct rxe_alt *rxe_first_alt(struct rxe *rxe)
+{
+    struct rxe_alt *alt;
+    for ( alt = rxe->head ; alt ; alt = alt->next )
+        if (mpz_sgn(alt->nitems)) return alt;
+    return NULL;
 }
 
 char *rxe_current(char *str, int maxlen, struct rxe *rxe)
 {
-    if (maxlen<=0) return;
+    if (maxlen<=0) return str;
     str[0] = 0;
     struct rxe_alt *alt = rxe->curr;
     struct rxe_node *node;
+    if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
         if (node->rxe) {
             char *new_str = rxe_current(str,maxlen,node->rxe);
             maxlen -= new_str - str;
             str = new_str;
-        } else {
+        } else if (node->len) {
+            // A node with no characters has nothing to contribute. Indexing
+            // its str would read past a zero-length allocation.
             if (maxlen>0) {
                 *str++ = node->str[node->iterator];
                 maxlen--;
@@ -98,7 +111,11 @@ int rxe_iterate(struct rxe *rxe)
     if (!rxe || !rxe->curr) return 1;
     struct rxe_alt *alt = rxe->curr;
     if (!alt) return 1;
-    struct rxe_node *node = alt->tail;
+    // Which end of the alternation carries first: the last node is the least
+    // significant digit by default, so that enumeration counts the way an
+    // ordinary numeral does.
+    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
+    struct rxe_node *node = l2r ? alt->head : alt->tail;
     int carry = 1;
     if (node) {
         while (carry) {
@@ -108,7 +125,7 @@ int rxe_iterate(struct rxe *rxe)
             if (carry) {
                 if (++node->iterator >= node->len) {
                     node->iterator = 0;
-                    node = node->prev;
+                    node = l2r ? node->next : node->prev;
                     if (!node) break;
                 } else {
                     carry = 0;
@@ -117,12 +134,12 @@ int rxe_iterate(struct rxe *rxe)
         }
     }
     if (carry) {
-        alt = alt->next;
+        do { alt = alt->next; } while (alt && !mpz_sgn(alt->nitems));
         if (alt) {
             rxe->curr = alt;
             carry = 0;
         } else {
-            rxe->curr = rxe->head;
+            rxe->curr = rxe_first_alt(rxe);
         }
     }
     return carry;
@@ -130,7 +147,7 @@ int rxe_iterate(struct rxe *rxe)
 
 int rxe_seek(struct rxe *rxe, mpz_t pos)
 {
-    if (!rxe) return;
+    if (!rxe) return 1;
     mpz_t q,r,p,n;
     mpz_init(q);
     mpz_init(r);
@@ -138,6 +155,7 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     mpz_init_set(p,pos);
     struct rxe_alt *alt;
     struct rxe_node *node = NULL;
+    int l2r = rxe->flags & RXE_FLAG_LEFT_TO_RIGHT;
     // FIXME: Performance: this is slow if the number of alternations is large.
     // We should enumerate this into an array and binary search it instead.
     // Also, as an enhancement, we should add a flag to allow left-to-right
@@ -145,17 +163,24 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
     // subexpression so we can fine tune the order in which the sets will be
     // enumerated.
     for ( alt = rxe->tail ; alt ; alt = alt->prev ) {
+        if (!mpz_sgn(alt->nitems)) continue;   // matches nothing; skip it
         if (mpz_cmp(alt->start,pos)<=0) {
             rxe->curr = alt;
-            node = alt->tail;
+            node = l2r ? alt->head : alt->tail;
             mpz_sub(p,p,alt->start);
             break;
         }
     }
-    for ( ; node ; node = node->prev ) {
+    for ( ; node ; node = l2r ? node->next : node->prev ) {
         if (node->is_backref) continue;
         mpz_set(n, node->rxe ? node->rxe->nitems : node->nitems);
-        assert(mpz_sgn(n)!=0);
+        // An impossible node cannot be indexed into. Alternations holding one
+        // are skipped above, so reaching this means the caller seeked into a
+        // set that has no such element; report failure rather than abort.
+        if (!mpz_sgn(n)) {
+            mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
+            return 1;
+        }
         mpz_tdiv_qr(q,r,p,n);
         mpz_set(p,q);
         if (node->rxe) {
@@ -165,12 +190,12 @@ int rxe_seek(struct rxe *rxe, mpz_t pos)
             node->iterator = mpz_get_ui(r);
         }
     }
-    if (mpz_sgn(q)>0 && mpz_cmp_ui(n,1)>0 || mpz_sgn(p)>0) 
-        return 1;
-    return 0;
+    int past_end = (mpz_sgn(q)>0 && mpz_cmp_ui(n,1)>0) || mpz_sgn(p)>0;
+    mpz_clear(q); mpz_clear(r); mpz_clear(n); mpz_clear(p);
+    return past_end;
 }
 
-struct rxe *rxe_parse(char *str, int flags)
+struct rxe *rxe_parse(const char *str, int flags)
 {
     if (!rxe_initialized) rxe_init();
     struct rxe *rxe = rxe_new();
@@ -187,6 +212,7 @@ struct rxe *rxe_new(void)
     struct rxe *rxe = NEW(1,struct rxe);
     rxe->head = rxe-> tail = rxe->curr = NULL;
     rxe->nalts = 0;
+    rxe->status = RXE_OK;
     rxe->brt = NULL;
     rxe->flags = 0;
     mpz_init(rxe->nitems);
@@ -217,6 +243,10 @@ struct rxe *rxe_deep_clone(struct rxe *src_rxe)
 {
    struct rxe *dst_rxe = rxe_new();
    struct rxe_alt *src_alt;
+   // Carry the subexpression's own flags across -- the enumeration direction
+   // among them -- but never the ownership bit: only the root owns the
+   // backreference table, and this clone has none to free.
+   dst_rxe->flags = src_rxe->flags & ~RXE_FLAG_HAS_BKRTABLE;
    mpz_set(dst_rxe->nitems,src_rxe->nitems);
    for ( src_alt = src_rxe->head ; src_alt ; src_alt = src_alt->next ) {
        struct rxe_alt *dst_alt = rxe_new_alt(dst_rxe);
@@ -245,14 +275,21 @@ void rxe_free(struct rxe *rxe)
 
 /* ---------------------------- Support Routines -------------------------- */
 
-void *kmalloc(size_t size, char *file, int line)
+void *kmalloc(size_t size, const char *file, int line)
 {
+    // Any public entry point can be the first one called -- creating a
+    // permutation before parsing anything, for instance -- so the allocator
+    // has to be in place here rather than only in rxe_parse.
+    if (!rxe_initialized) rxe_init();
     void *p = rxe_mem_alloc(size);
     if (p) return p;
+    // The hook is expected not to return, but nothing enforces that, and
+    // falling off the end of a non-void function is undefined behaviour.
     if (rxe_mem_alloc_failed) rxe_mem_alloc_failed(size,file,line);
+    return NULL;
 }
 
-void kmalloc_failed(size_t size, char *file, int line)
+void kmalloc_failed(size_t size, const char *file, int line)
 {
     fprintf(stderr,"Can't get %d bytes of memory at %s line %d.",
         (int)size,file,line);

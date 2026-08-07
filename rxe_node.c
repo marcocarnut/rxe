@@ -37,12 +37,17 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
 
 void rxe_free_node_data(struct rxe_node *node)
 {
+    // A backreference node only aliases the subexpression it refers to; the
+    // node that parsed that subexpression owns it and will free it. Freeing
+    // it here too would be a double free.
     if (node->rxe) {
-        rxe_free(node->rxe);
+        if (!node->is_backref) rxe_free(node->rxe);
         node->rxe = NULL;
     }
-    if (node->len) {
-        free(node->str);
+    // Keyed off the pointer, not the length: an empty character class still
+    // allocates a (zero-length) block, and testing len left it behind.
+    if (node->str) {
+        rxe_mem_free(node->str);
         node->len = 0;
         node->str = NULL;
     }
@@ -51,6 +56,10 @@ void rxe_free_node_data(struct rxe_node *node)
 void rxe_free_node(struct rxe_node *node)
 {
     rxe_free_node_data(node);
+    // rxe_new_node initialises both of these, so both have to be released
+    // here, exactly as rxe_free_alt does for the alternation's own pair.
+    mpz_clear(node->nitems);
+    mpz_clear(node->start);
     rxe_mem_free(node);
 }
 

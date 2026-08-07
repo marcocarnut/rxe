@@ -16,6 +16,7 @@
  
 #include "rxe.h"
 #include "rxe_alt.h"
+#include "rxe_node.h"
 
 struct rxe_alt *rxe_new_alt(struct rxe *rxe)
 {
