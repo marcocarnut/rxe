@@ -1,7 +1,7 @@
 /* [KSC4]-------------------------------------------------------------------[]
  * 
  *  rxenum - Count size and enumerate sets specified as regular expressions
- *           Version 0.9 by kiko at postcogito dot org on 2011-12-23
+ *           Version 1.0.0 by kiko at postcogito dot org, first released 2011
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License

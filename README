@@ -1,7 +1,7 @@
 README
 ======
 
-This is librxe version 0.9.1, a library to enumerate sets described by
+This is librxe version 1.0.0, a library to enumerate sets described by
 regular expressions. It comes with a demo program called 'rxenum'.
 
 INSTALLATION INSTRUCTIONS
