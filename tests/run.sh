@@ -592,6 +592,40 @@ check "an unbounded dictionary is enumerated shortest first" \
 check "[:fruit:]+ reports itself infinite" 'infinite' \
       "$("$RXENUM" $D -~ '[:fruit:]+' 2>&1 | head -1)"
 
+echo "== backslash shorthands inside a character class =="
+# \d \w \s and their negations mean the same in [ ] as they do bare. '[\d]'
+# used to read as the literal letter 'd'.
+t_count '[\d]'    '10'
+t_enum  '[\d]'    '0/1/2/3/4/5/6/7/8/9/'
+check "[\\w] equals [A-Za-z0-9_]" \
+      "$("$RXENUM" -e '[A-Za-z0-9_]' 2>&1 | tr '\n' '/')" \
+      "$("$RXENUM" -e '[\w]' 2>&1 | tr '\n' '/')"
+# \s is the two bytes it stands for at top level, space and tab, cross-checked
+# against the same class written in hex.
+check "[\\s] equals [\\x09\\x20]" \
+      "$("$RXENUM" -e '[\x09\x20]' 2>&1 | tr '\n' '/')" \
+      "$("$RXENUM" -e '[\s]' 2>&1 | tr '\n' '/')"
+# The negated shorthands are the complements, and the class's own leading ^
+# composes with them: [^\d] is the non-digits, [^\D] the digits back again.
+t_count '[\D]'    '246'
+t_count '[\W]'    '193'
+t_count '[\S]'    '254'
+t_count '[^\d]'   '246'
+t_count '[^\D]'   '10'
+t_count '[\d\D]'  '256'
+# A shorthand sits beside ordinary members and ranges in one class.
+t_enum  '[a-c\d]' '0/1/2/3/4/5/6/7/8/9/a/b/c/'
+t_count '[\w\s]'  '65'
+# Control-character escapes are their bytes, not the letters, and can bound a
+# range: \t (0x09) through \r (0x0d) is five bytes.
+t_count '[\t-\r]' '5'
+check "[\\n] is the newline byte, matching [\\x0a]" \
+      "$("$RXENUM" -e '[\x0a]' 2>&1)" \
+      "$("$RXENUM" -e '[\n]' 2>&1)"
+# An escaped metacharacter is still just that literal.
+t_enum  '[\.]'    './'
+t_enum  '[\]]'    ']/'
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"

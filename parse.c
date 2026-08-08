@@ -803,6 +803,42 @@ const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret,
     return end+2;
 }
 
+// Mark, in used[], the members of a bracket-class body such as "0-9]" or
+// "^ \t]" -- the strings backslash_letters holds for \d, \w, \s and their
+// negations. Only what those bodies contain is handled: literal bytes, a-b
+// ranges, and a leading ^ that inverts the whole set. count is advanced for
+// each byte newly added, so the caller's running tally and the outer negation
+// stay correct.
+static void class_mark_body(const char *body, char *used, int *count)
+{
+    char set[256];
+    int  i, inv = 0, do_range = 0;
+    unsigned char prev = 0;
+
+    for (i = 0; i < 256; i++) set[i] = 0;
+    if (*body == '^') { inv = 1; body++; }
+    for (; *body && *body != ']'; body++) {
+        unsigned char ch = (unsigned char)*body;
+        if (ch == '-' && prev && body[1] && body[1] != ']') {
+            do_range = 1;
+            continue;
+        }
+        if (do_range) {
+            for (i = prev; i <= ch; i++) set[i] = 1;
+            do_range = 0;
+            prev = 0;
+        } else {
+            set[ch] = 1;
+            prev = ch;
+        }
+    }
+    for (i = 0; i < 256; i++)
+        if ((set[i] ^ inv) && !used[i]) {
+            used[i] = 1;
+            (*count)++;
+        }
+}
+
 const char *handle_character_class(
     struct rxe *rxe,
     struct rxe_alt *alt,
@@ -871,11 +907,28 @@ const char *handle_character_class(
             case '\\': c = *str++;
                        if (!c) return NULL;
                        if (c=='b') {
-                           c=8;
+                           c=8;                    // backspace, not word-boundary
                        } else if (c=='x') {
                            const char *str2 = handle_hex_char(rxe,str,&c);
                            if (!str2) return str;
                            str = str2;
+                       } else if (c>='A' && c<='z') {
+                           // The same table the top level uses, so \d, \w, \s
+                           // and their negations mean the same inside [ ] as
+                           // they do bare -- '[\d]' was silently reading as the
+                           // letter 'd'.
+                           const char *esc = backslash_letters[c-'A'];
+                           if (esc && esc[0] && esc[1]) {
+                               // A whole class body: a shorthand like \d or \W.
+                               // Merge its members; it is a set, not a range end.
+                               class_mark_body(esc,used,&count);
+                               prev = 0; do_range = 0;
+                               continue;
+                           }
+                           if (esc && esc[0])
+                               c = esc[0];         // a control char: \n \t \r ...
+                           // else an assertion ("") or unimplemented (NULL):
+                           // leave c as the escaped letter, as before.
                        }
                        // fall-thru
               default: range_start  = (do_range ? prev : c)&0xFF;

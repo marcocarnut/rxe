@@ -27,6 +27,10 @@ ENV = dict(os.environ, MALLOC_PERTURB_=os.environ.get("MALLOC_PERTURB_", "42"))
 PATTERNS = [
     # plain products and classes
     r"[ab]{3}", r"x[0-9]{2}y", r"[0-9]{1,2}", r"[a-c]{1,3}", r"[ab]",
+    # backslash shorthands inside a class, which Python reads the same way as
+    # long as the members stay printable -- so \d and \w, not the negated
+    # forms whose members include the newline that the line protocol splits on
+    r"[\d]", r"[\w]", r"[\d\w]", r"[a-c\d]", r"[\dx]", r"[\w]{2}", r"([\d])\1",
     # alternation
     r"(a|bc)(d|ef)", r"(ab|cd){2}", r"(a|b)(c|d)(e|f)", r"(?:ab|c)d",
     r"a|", r"|a", r"a||b", r"xy|zw",
