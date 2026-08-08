@@ -4,6 +4,19 @@ README
 This is librxe version 1.0.0, a library to enumerate sets described by
 regular expressions. It comes with a demo program called 'rxenum'.
 
+
+LIVE DEMO
+=========
+
+To see what the library does without building anything, try it in a browser:
+
+    https://rxenum.postcogito.org
+
+That is librxe compiled to WebAssembly with an interactive front end -- the
+same C, not a reimplementation. The port and its sources live in the sibling
+jsrxe project.
+
+
 INSTALLATION INSTRUCTIONS
 =========================
 
