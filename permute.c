@@ -170,6 +170,13 @@ void rxe_permutation_map(
     // With one member there is nowhere to permute to, and cycle walking would
     // have to go all the way round its cycle to discover that.
     if (mpz_cmp_ui(perm->domain,1) <= 0) { mpz_set_ui(result,0); return; }
+    // The permutation is defined only on [0, domain). An index past the set --
+    // a caller paging beyond the end -- has no image: the Feistel is a
+    // bijection on its own power-of-two domain, so cycle walking from a value
+    // the set does not contain can loop without ever falling below domain.
+    // Return it unchanged rather than spin; a seek at that index then reports
+    // past-the-end as it should.
+    if (mpz_cmp(index,perm->domain) >= 0) { mpz_set(result,index); return; }
     mpz_set(result,index);
     do {
         feistel(result,perm,result);

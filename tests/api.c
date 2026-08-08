@@ -138,6 +138,26 @@ int main(void)
         mpz_set_ui(i, 42);
         rxe_permutation_map(out, NULL, i);
         check_int("a null permutation is the identity", 42, mpz_get_ui(out));
+        // Out of contract but must not hang: an index past the domain has no
+        // image, so the map returns it unchanged rather than cycle-walking a
+        // value the set does not contain. The boundary index (== domain) is the
+        // dangerous one -- it can be a fixed point of the Feistel and once spun
+        // forever. If the guard regresses, this test times out rather than
+        // reporting, which is the point.
+        {
+            mpz_t small;
+            mpz_init_set_ui(small, 3);
+            struct rxe_permutation *sp = rxe_permutation_new(small, "k");
+            mpz_set_ui(i, 50);
+            rxe_permutation_map(out, sp, i);
+            check_int("an out-of-range index is returned unchanged", 50,
+                      (int)mpz_get_ui(out));
+            mpz_set_ui(i, 3);
+            rxe_permutation_map(out, sp, i);
+            check_int("the boundary index does not hang", 3, (int)mpz_get_ui(out));
+            rxe_permutation_free(sp);
+            mpz_clear(small);
+        }
         mpz_clear(dom); mpz_clear(i); mpz_clear(out);
     }
 
