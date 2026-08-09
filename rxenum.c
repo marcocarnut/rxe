@@ -58,6 +58,12 @@ int mpz_len(mpz_t x);
 static const char *dict_dirs[MAX_DICT_DIRS];
 static int         ndict_dirs;
 
+// The render buffer's size, and so the longest member a line of output can
+// hold before it is truncated. This is the display width, distinct from the
+// library's rxe_max_member cap on what may be built at all: a member can be
+// legal to materialise yet longer than one wants printed. Settable with -w.
+static int str_width = MAXSTRLEN;
+
 static char **load_dict_file(const char *path, int *nwords)
 {
     FILE *fp = fopen(path,"rb");
@@ -107,7 +113,7 @@ static int dict_resolver(const char *name)
 int main(int argc, char **argv)
 {
     if (argc<2) {
-        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] [-M bytes] <regex>\n");
+        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] [-M bytes] [-w width] <regex>\n");
     }
     int flags = 0;
     int do_enumerate = 0;
@@ -129,7 +135,7 @@ int main(int argc, char **argv)
     // it under a leak checker.
     atexit(rxe_free_dicts);
     for (;;) {
-        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:QD:M:");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:QD:M:w:");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -167,6 +173,9 @@ int main(int argc, char **argv)
                       do_enumerate = 1;
                       break;
             case 'M': rxe_set_max_member(strtoul(optarg,NULL,10));
+                      break;
+            case 'w': str_width = atoi(optarg);
+                      if (str_width < 1) die(1,"-w needs a positive width\n");
                       break;
             case ',':
             case '_':
@@ -383,9 +392,10 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
         }
         die(100,"seek past end");
     }
+    char *str = malloc((size_t)str_width + 1);
+    if (!str) die(1,"out of memory for a %d-byte render buffer\n",str_width);
     for (;;) {
-         char str[MAXSTRLEN+1];
-         rxe_current(str,MAXSTRLEN,rxe);
+         rxe_current(str,str_width,rxe);
          if (flags & ENUM_NUMBER) {
             printf("%*s",nd,"");
             print_grouped(stdout,NULL,count," ",sep);
@@ -412,6 +422,7 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
              if (!mpz_sgn(cnt)) break;
          }
     }
+    free(str);
     // -r calls this once per sample, so leaving these behind accumulated.
     mpz_clear(idx);
     mpz_clear(target);
