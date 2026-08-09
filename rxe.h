@@ -84,7 +84,9 @@
     X(RXE_UNTERMINATED_DICT,            "unterminated dictionary")             \
     X(RXE_UNKNOWN_DICT,                 "unknown dictionary")                  \
     X(RXE_BAD_CHOOSE,                   "bad combinatorial parameters")        \
-    X(RXE_CHOOSE_INFINITE,              "combinatorial choice over an infinite set")
+    X(RXE_CHOOSE_INFINITE,              "combinatorial choice over an infinite set") \
+    X(RXE_BAD_SHUFFLE,                  "unterminated shuffle key")            \
+    X(RXE_SHUFFLE_INFINITE,             "shuffle key over an infinite set")
 
 enum rxe_parse_status {
 #define RXE_STATUS_ENUM_ENTRY(name,msg) name,
@@ -174,7 +176,9 @@ struct rxe_node {
     int   is_repeat;              // True if this node is a repetition
     int   is_comb;                // True if this is a combination/permutation
     int   comb_perm;              // When is_comb: 1 ordered (perm), 0 unordered
-    mpz_t comb_index;             // When is_comb: current linear index, for iterate
+    mpz_t comb_index;             // When is_comb or is_shuffle: current index
+    int   is_shuffle;             // True if this group carries a shuffle key
+    struct rxe_permutation *shuffle; // The keyed permutation, when is_shuffle
     int   is_dict;                // True if this node draws from a dictionary
     int   nwords;                 // Number of words, when is_dict
     char **words;                 // The words, borrowed from the registry
@@ -277,6 +281,18 @@ struct rxe_permutation;
 
 struct rxe_permutation *rxe_permutation_new(const mpz_t domain, const char *key);
 void rxe_permutation_free(struct rxe_permutation *perm);
+struct rxe_permutation *rxe_permutation_clone(const struct rxe_permutation *perm);
+
+// A per-subexpression shuffle, written '(?~key:re)': the group's own index is
+// passed through a keyed permutation before it is seeked into, so its members
+// come out reordered by the key while every other position is untouched. Built
+// on the same permutation the whole-set '-k' uses, over the group's own
+// cardinality. See permute.c.
+void rxe_shuffle_make(struct rxe_node *node, const char *key, int keylen);
+int  rxe_shuffle_seek(struct rxe_node *node, const mpz_t pos);
+int  rxe_shuffle_iterate(struct rxe_node *node);
+void rxe_shuffle_free(struct rxe_node *node);
+
 void rxe_permutation_map(mpz_t result, struct rxe_permutation *perm,
                          const mpz_t index);
 

@@ -660,6 +660,29 @@ t_error '{{2}}'      'nothing before quantifier'
 t_error '(a|b){{2,}}'  'bad combinatorial parameters'
 t_error '(a|b){{2,1}}' 'bad combinatorial parameters'
 
+echo "== per-subexpression shuffle, (?~key:re) =="
+# The group's members come out permuted by the key, but it is the same set: a
+# bijection, so the count, the membership and seek-equals-iteration are all
+# unchanged and only the order moves. The permutation is pure integer
+# arithmetic, so a given key gives a fixed order across builds and libcs.
+t_count '(?~k:[a-z]{3})'  '17,576'
+t_enum  '(?~x:[0-9])'     '8/3/9/4/6/0/2/5/1/7/'
+check "(?~k:[0-9]) is a permutation of [0-9]" \
+      "$("$RXENUM" -e '[0-9]' | sort | tr '\n' '/')" \
+      "$("$RXENUM" -e '(?~k:[0-9])' | sort | tr '\n' '/')"
+# Different keys reorder differently; the same key is reproducible.
+check "different keys give different orders" 'different' \
+      "$([ "$("$RXENUM" -e '(?~a:[0-9])')" = "$("$RXENUM" -e '(?~b:[0-9])')" ] \
+        && echo same || echo different)"
+# It is local to its field and composes with a quantifier like any group.
+t_count 'A(?~k:[xy])B'    '2'
+t_count '(?~k:[a-c]){2}'  '9'
+t_selfcheck '(?~seed:[a-e]{2})'
+t_selfcheck 'x(?~k:(cat|dog|fish))y'
+# It needs a finite set to permute, and a key it can find the end of.
+t_error '(?~k:a*)'   'shuffle key over an infinite set'
+t_error '(?~key)'    'unterminated shuffle key'
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"

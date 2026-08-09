@@ -181,6 +181,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
     mpz_init_set_ui(p,1);  // Previous n
     char c;
     int i, newflags, is_flag_group, quantifier = 0;
+    const char *shuffle_key; int shuffle_key_len = 0;
     struct rxe_alt *alt = rxe_new_alt(rxe); 
     mpz_set(alt->start,ret);
     // Direction is decided while parsing but consulted while enumerating, so
@@ -246,6 +247,26 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       break;
             // ------------------- Sub-expressions -----------------
             case '(': newflags = flags;
+                      shuffle_key = NULL;
+                      // '(?~key:re)' is the per-subexpression shuffle: the group
+                      // is non-capturing and carries a key whose permutation
+                      // reorders its members. The key runs to the first colon;
+                      // everything else is an ordinary group.
+                      if (str[0]=='?' && str[1]=='~') {
+                          // The key runs to the first colon, but not across a
+                          // parenthesis or the end -- those mean the colon is
+                          // missing, not that the key contains them.
+                          const char *ke = str+2;
+                          while (*ke && *ke!=':' && *ke!='(' && *ke!=')') ke++;
+                          if (*ke!=':') {
+                              rxe->status = RXE_BAD_SHUFFLE;
+                              return parse_done(x,n,p,str);
+                          }
+                          shuffle_key = str+2;
+                          shuffle_key_len = (int)(ke-(str+2));
+                          is_flag_group = 1;    // non-capturing, like (?:...)
+                          str = ke+1;
+                      } else {
                       // Only a group introduced by '?' can be one that merely
                       // sets flags. Without this test an empty group '()' also
                       // arrived at the branch below -- handle_flags returns
@@ -281,6 +302,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           break;
                       }
                       if (*str==':') str++;
+                      }   // end else (ordinary group)
                       mpz_set_ui(n,0);
                       struct rxe *sub_rxe = rxe_new();
                       node = rxe_new_node(alt);
@@ -309,6 +331,16 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       if (sub_rxe->status) {
                           rxe->status = sub_rxe->status;
                           return parse_done(x,n,p,str);
+                      }
+                      // Attach the shuffle now that the group's cardinality is
+                      // known. It reorders a finite set; an infinite one has no
+                      // finite domain to permute over.
+                      if (shuffle_key) {
+                          if (node->is_inf) {
+                              rxe->status = RXE_SHUFFLE_INFINITE;
+                              return parse_done(x,n,p,str);
+                          }
+                          rxe_shuffle_make(node,shuffle_key,shuffle_key_len);
                       }
                       // A group is an element like any other, so a quantifier
                       // after it is its own and not a second one stacked on

@@ -224,6 +224,33 @@ def check_choose(bexpr, base):
     return bad
 
 
+# A '(?~key:re)' shuffle must be a bijection: exactly the members of 're', each
+# once, only reordered. Checked over several keys against the base's own set.
+SHUFFLE = ["[0-9]", "[a-z]", "(cat|dog|fish|bird)", "[a-c]{2}", "M{0,3}"]
+
+
+def check_shuffle(base):
+    natural, err = enumerate_pattern(base)
+    if err:
+        return [f"FAIL  {base}: {err}"]
+    nset = set(natural)
+    bad = []
+    for key in ("", "alpha", "bravo", "secret42"):
+        pat = f"(?~{key}:{base})"
+        gen, err = enumerate_pattern(pat)
+        if err:
+            bad.append(f"FAIL  {pat}: {err}")
+            continue
+        if set(gen) != nset or len(gen) != len(natural):
+            bad.append(f"FAIL  {pat}: not a bijection of {base}")
+            continue
+        for i in (0, len(gen) // 2, len(gen) - 1):
+            if gen and run(["-z", "-f", str(i), pat])[1].rstrip("\n") != gen[i]:
+                bad.append(f"FAIL  {pat}: seek {i} disagrees with iteration")
+                break
+    return bad
+
+
 def main():
     failures = 0
     for pat in PATTERNS:
@@ -298,10 +325,21 @@ def main():
         if bad:
             choose_failures += 1
 
-    total = len(PATTERNS) + len(INFINITE) + len(POSIX) * 2 + len(CHOOSE)
-    clean = total - failures - inf_failures - posix_failures - choose_failures
+    shuffle_failures = 0
+    for base in SHUFFLE:
+        bad = check_shuffle(base)
+        for line in bad:
+            print(line)
+        if bad:
+            shuffle_failures += 1
+
+    total = (len(PATTERNS) + len(INFINITE) + len(POSIX) * 2
+             + len(CHOOSE) + len(SHUFFLE))
+    clean = (total - failures - inf_failures - posix_failures
+             - choose_failures - shuffle_failures)
     print(f"\noracle: {clean} of {total} patterns clean")
-    return 1 if failures or inf_failures or posix_failures or choose_failures else 0
+    return 1 if (failures or inf_failures or posix_failures
+                 or choose_failures or shuffle_failures) else 0
 
 
 if __name__ == "__main__":
