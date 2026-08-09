@@ -167,7 +167,7 @@ static int comb_decode(struct rxe_node *node, const mpz_t pos)
     }
     node->rep_count = size;
     if (size > 0) {
-        rxe_repeat_reserve(node,size);
+        if (rxe_repeat_reserve(node,size)) { mpz_clear(j); mpz_clear(c); return 1; }
         if (node->comb_perm) decode_perm(node->rep_digit,*n,size,j);
         else                 decode_comb(node->rep_digit,*n,size,j);
     }

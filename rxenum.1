@@ -199,6 +199,34 @@ Add
 to the list of directories searched for a "name.dict" word-dictionary file.
 May be given more than once; the current directory is always searched last.
 See DICTIONARIES below.
+.TP
+.B
+\-M bytes
+Cap a single rendered member at
+.B bytes
+(default one mebibyte); a member that would exceed it is refused with
+.RB \(dq "member too large to materialize" \(dq
+rather than built.
+.B "\-M 0"
+lifts the cap.
+This bounds one line of output, never the set: the cardinality stays whatever
+it is, and
+.B -z
+still counts and
+.B -f
+still seeks past the cap.
+A fixed repetition above a hard ceiling of a hundred million is refused
+outright, at parse, since it can neither be built nor represent a useful count.
+.TP
+.B
+\-w width
+Size the render buffer to
+.B width
+bytes (default 2048); a member longer than this is truncated on output, though
+it is still counted and seeked in full. Raise it to print longer members, up to
+whatever
+.B -M
+allows to be built in the first place.
 
 .SH ENUMERATION ORDER
 By default the enumeration runs right to left: the last position in the

@@ -553,7 +553,7 @@ int rxe_repeat_seek_at_length(struct rxe_node *node, int L, const mpz_t idx,
         int n = L/fixed_m;
         if (L % fixed_m || n < node->rep_min) return 1;
         if (node->rep_max != RXE_REP_UNBOUNDED && n > node->rep_max) return 1;
-        rxe_repeat_reserve(node,n);
+        if (rxe_repeat_reserve(node,n)) return 1;
         node->rep_count = n;
         mpz_init(b);
         mpz_init(q);
@@ -582,7 +582,7 @@ int rxe_repeat_seek_at_length(struct rxe_node *node, int L, const mpz_t idx,
     mpz_init_set(c.r,idx);
     rep_walk(node,L,&c,rep_seek_visit);
     if (!c.found) { mpz_clear(c.r); return 1; }
-    rxe_repeat_reserve(node,c.n);
+    if (rxe_repeat_reserve(node,c.n)) { mpz_clear(c.r); return 1; }
     node->rep_count = c.n;
     rc = seek_rep_positions(node,c.n,L,c.r,l2r);
     mpz_clear(c.r);

@@ -38,6 +38,28 @@ void *(*rxe_mem_alloc)(size_t);
 void (*rxe_mem_free)(void *);
 void (*rxe_mem_alloc_failed)(size_t size, const char *file, int line);
 
+// The cap on a single rendered member, and a latch the render path raises when
+// it hits the cap. The cap defends the host whether or not a front-end reads
+// the latch: an over-cap member is simply not built, so nothing can allocate
+// the gigabytes it would have needed. The latch is only how a front-end learns
+// that a member came back truncated, so it can report RXE_TOO_BIG rather than
+// pass off a stub as the real thing. Reset it before an operation, read it
+// after; rxe_check_overflow does both.
+size_t rxe_max_member = RXE_DEFAULT_MAX_MEMBER;
+int    rxe_member_overflow;
+
+void rxe_set_max_member(size_t bytes)
+{
+    rxe_max_member = bytes;
+}
+
+int rxe_check_overflow(void)
+{
+    int was = rxe_member_overflow;
+    rxe_member_overflow = 0;
+    return was;
+}
+
 /* -------------------------- Function Prototypes ------------------------- */
 
 void kmalloc_failed(size_t size, const char *file, int line);
@@ -160,7 +182,11 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
             // round the odometer runs.
             int i;
             int shortlex = rxe->flags & RXE_FLAG_SHORTLEX;
-            for ( i = 0 ; i < node->rep_count ; i++ ) {
+            // Never read past what was allocated: a repetition whose reserve
+            // was refused for exceeding the cap holds fewer digits than its
+            // count, and the run it stands for cannot be rendered whole.
+            if (node->rep_count > node->rep_alloc) rxe_member_overflow = 1;
+            for ( i = 0 ; i < node->rep_count && i < node->rep_alloc ; i++ ) {
                 char *new_str;
                 // An unbounded repetition can select a run far longer than
                 // the caller's buffer -- 'a*' at index a billion is a billion

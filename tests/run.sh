@@ -683,6 +683,33 @@ t_selfcheck 'x(?~k:(cat|dog|fish))y'
 t_error '(?~k:a*)'   'shuffle key over an infinite set'
 t_error '(?~key)'    'unterminated shuffle key'
 
+echo "== safety limits =="
+# A fixed repetition beyond the hard ceiling is refused at parse, before it can
+# overflow the int it is read into and drive a wild allocation.
+t_error '\d{100000001}'    'member too large to materialize'
+t_error '\d{999999999999}' 'member too large to materialize'
+# Under the ceiling but over the default per-member byte cap: the set is legal
+# and countable, only its members are too long to build. The cap is soft -- it
+# stops materialisation, not counting -- so -z still names the size.
+t_first 'member too large to materialize' -c 1 '\d{2000000}'
+t_rc 1 -c 1 '\d{2000000}'
+check "counting survives an over-cap member" '1' \
+      "$("$RXENUM" -z '\d{2000000}' 2>&1 | head -1 | cut -c1)"
+# The cap moves: -M lowers it until an ordinary member is refused, and -M 0
+# lifts it so the same over-default member builds again.
+t_first 'member too large to materialize' -M 100 -c 1 '\d{200}'
+t_rc 0 -M 0 -c 1 '\d{2000000}'
+# A member comfortably under the cap is untouched.
+t_rc 0 -c 1 '\d{2000}'
+# The render buffer is a display width, not a build limit: -w truncates output
+# without touching the count, and raising it prints a longer member in full.
+t_first '00000' -w 5 -c 1 '\d{20}'
+t_rc 1 -w 0 -c 1 'abc'
+check "-w truncates to its width" '5' \
+      "$("$RXENUM" -w 5 -c 1 '\d{20}' | head -1 | tr -d '\n' | wc -c | tr -d ' ')"
+check "raising -w prints the full member" '3000' \
+      "$("$RXENUM" -w 4000 -c 1 '\d{3000}' | head -1 | tr -d '\n' | wc -c | tr -d ' ')"
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"
