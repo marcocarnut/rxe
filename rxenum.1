@@ -322,6 +322,50 @@ and
 .B -k
 both need a finite set to work over and report an error otherwise.
 
+.SH COMBINATIONS AND PERMUTATIONS
+A nonstandard quantifier, written with doubled braces, treats the preceding
+subexpression as a set and generates the ways of choosing from it. If the
+subexpression has
+.I n
+members, then
+.RS
+.TP
+.B (re){{x}}
+is every unordered choice of
+.I x
+of them, C(n,x) in number;
+.TP
+.B (re){{x,y}}
+is every unordered choice of between
+.I x
+and
+.I y
+of them;
+.TP
+.B (re){{x!}}
+and
+.B (re){{x,y!}}
+are the same, ordered: the permutations P(n,x), or the sum of them over a
+range;
+.TP
+.B (re){{*}}
+is every permutation of all
+.I n
+members, n! in number.
+.RE
+.PP
+For example, "[a-z]{{3}}" is the 2600 sets of three distinct letters, against
+the 17576 that "[a-z]{3}" allows with repetition and order; "(l|i|s|t|e|n){{*}}"
+is the 720 orderings of those six letters. A choice is unordered members
+rendered in ascending index order, so "(a|b|c){{2}}" is ab, ac, bc. Like every
+other set here it is counted and seeked in closed form -- a combination through
+the combinatorial number system, a permutation through the factorial one -- so
+random access into it costs no more than into any other.
+.PP
+The construct needs a finite set to choose from; a choice over an infinite one
+is refused. It keeps the diagonal enumeration order rather than being walked
+shortest first.
+
 .SH PERMUTED ORDER
 .B \-k
 composes the integer mapping with a keyed permutation of the integers, so

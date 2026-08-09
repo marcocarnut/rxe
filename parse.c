@@ -17,6 +17,7 @@
 #include "rxe.h"
 #include "rxe_alt.h"
 #include "repeat.h"
+#include "comb.h"
 #include "lens.h"
 #include "dict.h"
 #include "rxe_node.h"
@@ -122,6 +123,11 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
                            int flags, enum rxe_parse_status *status);
 int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
                  enum rxe_parse_status *status);
+static const char *parse_choose_params(const char *str, int *lo, int *hi,
+                                       int *perm, int *star,
+                                       enum rxe_parse_status *status);
+static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
+                        int star, int flags, enum rxe_parse_status *status);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
@@ -355,11 +361,24 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                           rxe->status = RXE_LONE_QUANTIFIER;
                           return parse_done(x,n,p,str);
                       }
-                      // The status used to be smuggled back inside 'n', the
-                      // mpz_t meant for the result, for want of anywhere else
-                      // to put it. There is somewhere else now.
-                      str2 = handle_repeats(alt,str,flags,&rxe->status);
-                      if (!str2) return parse_done(x,n,p,str);
+                      // '{{' is the nonstandard combinatorial quantifier: all
+                      // combinations or permutations of the preceding set. A
+                      // single '{' is an ordinary repetition. The status used
+                      // to be smuggled back inside 'n', the mpz_t meant for the
+                      // result, for want of anywhere else to put it. There is
+                      // somewhere else now.
+                      if (*str == '{') {
+                          int c_lo,c_hi,c_perm,c_star;
+                          str2 = parse_choose_params(str+1,&c_lo,&c_hi,&c_perm,
+                                                     &c_star,&rxe->status);
+                          if (!str2) return parse_done(x,n,p,str);
+                          if (!build_choose(alt->tail,c_lo,c_hi,c_perm,c_star,
+                                            flags,&rxe->status))
+                              return parse_done(x,n,p,str);
+                      } else {
+                          str2 = handle_repeats(alt,str,flags,&rxe->status);
+                          if (!str2) return parse_done(x,n,p,str);
+                      }
                       str = str2;
                       // All three quantifiers land here. An endless one has no
                       // cardinality to fold into the product: it is a
@@ -757,6 +776,69 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
     if (!end) return NULL;
     if (!build_repeat(alt->tail,r0,r1,flags,status)) return NULL;
     return end;
+}
+
+// The parameters of a '{{...}}' combinatorial quantifier, 'str' pointing just
+// past the second '{'. Forms: '*' (all permutations), 'N', 'N,M' (combinations
+// of a size or a range) and the same with a trailing '!' (ordered, i.e.
+// permutations). Returns the pointer past the closing '}}', or NULL with the
+// status set.
+static const char *parse_choose_params(const char *str, int *lo, int *hi,
+                                       int *perm, int *star,
+                                       enum rxe_parse_status *status)
+{
+    const char *p = str;
+    *perm = 0; *star = 0; *lo = 0; *hi = 0;
+    if (*p == '*') {
+        *star = 1; *perm = 1; p++;
+    } else {
+        if (*p < '0' || *p > '9') { *status = RXE_BAD_CHOOSE; return NULL; }
+        long v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v*10 + (*p-'0'); if (v > 1000000000L) v = 1000000000L; p++;
+        }
+        *lo = *hi = (int)v;
+        if (*p == ',') {
+            p++;
+            if (*p < '0' || *p > '9') { *status = RXE_BAD_CHOOSE; return NULL; }
+            long w = 0;
+            while (*p >= '0' && *p <= '9') {
+                w = w*10 + (*p-'0'); if (w > 1000000000L) w = 1000000000L; p++;
+            }
+            *hi = (int)w;
+        }
+    }
+    if (*p == '!') { *perm = 1; p++; }
+    if (p[0] != '}' || p[1] != '}') { *status = RXE_BAD_CHOOSE; return NULL; }
+    if (!*star && *lo > *hi) { *status = RXE_BAD_CHOOSE; return NULL; }
+    return p + 2;
+}
+
+// Turn the preceding node into a combination or permutation over its members.
+// Like build_repeat, it demotes whatever the node holds into a subexpression
+// first so the choice has one thing to index into. The base must be finite.
+static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
+                        int star, int flags, enum rxe_parse_status *status)
+{
+    if (node->is_inf ||
+        (node->rxe && !node->is_backref && rxe_is_infinite(node->rxe))) {
+        *status = RXE_CHOOSE_INFINITE;
+        return 0;
+    }
+    if (!node->rxe || node->str || node->is_backref)
+        node->rxe = demote_node(node,flags);
+    if (star) {
+        // The full permutation: the size is the base's own cardinality, which
+        // has to be a number small enough to name a run of that many members.
+        if (!mpz_fits_slong_p(node->rxe->nitems) ||
+            mpz_cmp_ui(node->rxe->nitems,1000000000UL) > 0) {
+            *status = RXE_BAD_CHOOSE;
+            return 0;
+        }
+        lo = hi = (int)mpz_get_ui(node->rxe->nitems);
+    }
+    rxe_comb_make(node,lo,hi,perm);
+    return 1;
 }
 
 // A [:name:] dictionary reference, 'str' pointing at the ':' just inside the

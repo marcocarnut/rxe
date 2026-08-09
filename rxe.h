@@ -82,7 +82,9 @@
     X(RXE_BACKREF_INTO_VARIABLE_REPEAT,                                        \
       "backreference into a variably repeated group")                          \
     X(RXE_UNTERMINATED_DICT,            "unterminated dictionary")             \
-    X(RXE_UNKNOWN_DICT,                 "unknown dictionary")
+    X(RXE_UNKNOWN_DICT,                 "unknown dictionary")                  \
+    X(RXE_BAD_CHOOSE,                   "bad combinatorial parameters")        \
+    X(RXE_CHOOSE_INFINITE,              "combinatorial choice over an infinite set")
 
 enum rxe_parse_status {
 #define RXE_STATUS_ENUM_ENTRY(name,msg) name,
@@ -170,6 +172,9 @@ struct rxe_node {
     int   iterator;               // Current item being iterated
     int   is_backref;             // True if this node is a backreference
     int   is_repeat;              // True if this node is a repetition
+    int   is_comb;                // True if this is a combination/permutation
+    int   comb_perm;              // When is_comb: 1 ordered (perm), 0 unordered
+    mpz_t comb_index;             // When is_comb: current linear index, for iterate
     int   is_dict;                // True if this node draws from a dictionary
     int   nwords;                 // Number of words, when is_dict
     char **words;                 // The words, borrowed from the registry

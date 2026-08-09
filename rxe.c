@@ -23,6 +23,7 @@
 #include "rxe_node.h"
 #include "bkreftbl.h"
 #include "repeat.h"
+#include "comb.h"
 #include "pair.h"
 #include "lens.h"
 #include "parse.h"
@@ -109,6 +110,10 @@ static int tree_has_backref(struct rxe *rxe)
             // elsewhere in the tree, and following it would go round in
             // circles.
             if (node->is_backref) return 1;
+            // A combination or permutation is a finite choice with an order of
+            // its own, not a length-countable concatenation, so it keeps the
+            // diagonal order too rather than being enumerated shortest first.
+            if (node->is_comb) return 1;
             if (node->rxe && tree_has_backref(node->rxe)) return 1;
         }
     return 0;
@@ -142,7 +147,7 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
     struct rxe_node *node;
     if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
-        if (node->is_repeat) {
+        if (node->is_repeat || node->is_comb) {
             // One copy of the subexpression stands in for every position, so
             // it has to be seeked to each position's index in turn. Rendering
             // in string order also means the subexpression is left holding the
@@ -215,6 +220,8 @@ int rxe_iterate(struct rxe *rxe)
         while (carry) {
             if (node->is_repeat) {
                 carry = rxe_repeat_iterate(node,l2r);
+            } else if (node->is_comb) {
+                carry = rxe_comb_iterate(node);
             } else if (node->rxe && !node->is_backref) {
                 carry = rxe_iterate(node->rxe);
             }
@@ -289,10 +296,11 @@ static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
             i++;
             continue;
         }
-        // A repetition is the one kind of node whose cardinality is not its
-        // subexpression's: it is the geometric sum over it.
-        mpz_set(n, node->rxe && !node->is_repeat ? node->rxe->nitems
-                                                 : node->nitems);
+        // A repetition or a combination is a node whose cardinality is not its
+        // subexpression's: the geometric sum for one, the binomial sum for the
+        // other. Both carry their own count in node->nitems.
+        mpz_set(n, node->rxe && !node->is_repeat && !node->is_comb
+                       ? node->rxe->nitems : node->nitems);
         // An impossible node cannot be indexed into. Alternations holding one
         // are skipped by the caller, so reaching this means the caller seeked
         // into a set that has no such element; report failure rather than
@@ -302,6 +310,8 @@ static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
         mpz_set(p,q);
         if (node->is_repeat) {
             if (rxe_repeat_seek(node,r,l2r)) { rc = 1; break; }
+        } else if (node->is_comb) {
+            if (rxe_comb_seek(node,r)) { rc = 1; break; }
         } else if (node->rxe) {
             rxe_seek(node->rxe,r);
         } else {
@@ -435,6 +445,11 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
         // copy above is redundant here but harmless, and the clone starts at
         // the first item rather than wherever the original happens to sit.
         rxe_repeat_make(dst_node,src_node->rep_min,src_node->rep_max);
+    } else if (src_node->is_comb) {
+        // Likewise a combination is rebuilt from its subexpression and size
+        // range, starting at its first choice.
+        rxe_comb_make(dst_node,src_node->rep_min,src_node->rep_max,
+                      src_node->comb_perm);
     }
 }
 

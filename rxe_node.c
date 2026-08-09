@@ -27,6 +27,9 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->len = node->iterator = 0;
     node->is_backref = 0;
     node->is_repeat = 0;
+    node->is_comb = 0;
+    node->comb_perm = 0;
+    mpz_init(node->comb_index);
     node->is_inf = 0;
     node->is_dict = 0;
     node->nwords = 0;
@@ -65,6 +68,8 @@ void rxe_free_node_data(struct rxe_node *node)
     // A repetition owns one index per position it can occupy.
     rxe_repeat_free(node);
     node->is_repeat = 0;
+    node->is_comb = 0;
+    node->comb_perm = 0;
     node->is_inf = 0;
     node->rep_min = node->rep_max = node->rep_count = 0;
     // Keyed off the pointer, not the length: an empty character class still
@@ -80,6 +85,7 @@ void rxe_free_node(struct rxe_node *node)
 {
     rxe_free_node_data(node);
     mpz_clear(node->nitems);
+    mpz_clear(node->comb_index);
     rxe_lens_free(&node->lens);
     rxe_lens_free(&node->rest);
     rxe_mem_free(node);

@@ -182,6 +182,48 @@ def check_infinite(pat, maxlen, prefix):
     return bad
 
 
+# The {{...}} combinatorial quantifier has no counterpart in Python's re, so it
+# is checked against itertools instead: the whole set for a small base, plus
+# that random access lands where iteration does. Each base is a group of
+# distinct alternatives.
+CHOOSE = [("(a|b|c|d)", list("abcd")),
+          ("(cat|dog|fish)", ["cat", "dog", "fish"]),
+          ("[a-e]", list("abcde"))]
+
+
+def check_choose(bexpr, base):
+    """Failure messages for every {{...}} shape over one base."""
+    n = len(base)
+    cases = []
+    for x in range(n + 1):
+        cases.append((f"{bexpr}{{{{{x}}}}}",
+                      {"".join(c) for c in itertools.combinations(base, x)}))
+        cases.append((f"{bexpr}{{{{{x}!}}}}",
+                      {"".join(c) for c in itertools.permutations(base, x)}))
+    cases.append((f"{bexpr}{{{{1,{n}}}}}",
+                  {"".join(c) for x in range(1, n + 1)
+                   for c in itertools.combinations(base, x)}))
+    cases.append((f"{bexpr}{{{{*}}}}",
+                  {"".join(c) for c in itertools.permutations(base, n)}))
+    bad = []
+    for pat, want in cases:
+        gen, err = enumerate_pattern(pat)
+        if err:
+            bad.append(f"FAIL  {pat}: {err}")
+            continue
+        # exactly the itertools set, with no repeats (a bijection)
+        if set(gen) != want or len(gen) != len(want):
+            bad.append(f"FAIL  {pat}: set/count off "
+                       f"(got {len(gen)}, want {len(want)})")
+            continue
+        # seek lands where iteration does
+        for i in (0, len(gen) // 2, len(gen) - 1):
+            if gen and run(["-z", "-f", str(i), pat])[1].rstrip("\n") != gen[i]:
+                bad.append(f"FAIL  {pat}: seek {i} disagrees with iteration")
+                break
+    return bad
+
+
 def main():
     failures = 0
     for pat in PATTERNS:
@@ -248,10 +290,18 @@ def main():
         if bad:
             inf_failures += 1
 
-    total = len(PATTERNS) + len(INFINITE) + len(POSIX) * 2
-    clean = total - failures - inf_failures - posix_failures
+    choose_failures = 0
+    for bexpr, base in CHOOSE:
+        bad = check_choose(bexpr, base)
+        for line in bad:
+            print(line)
+        if bad:
+            choose_failures += 1
+
+    total = len(PATTERNS) + len(INFINITE) + len(POSIX) * 2 + len(CHOOSE)
+    clean = total - failures - inf_failures - posix_failures - choose_failures
     print(f"\noracle: {clean} of {total} patterns clean")
-    return 1 if failures or inf_failures or posix_failures else 0
+    return 1 if failures or inf_failures or posix_failures or choose_failures else 0
 
 
 if __name__ == "__main__":

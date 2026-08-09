@@ -626,6 +626,40 @@ check "[\\n] is the newline byte, matching [\\x0a]" \
 t_enum  '[\.]'    './'
 t_enum  '[\]]'    ']/'
 
+echo "== combinations and permutations, the {{...}} quantifier =="
+# '(re){{x}}' is every way of choosing x of the subexpression's members,
+# unordered; '{{x!}}' is ordered; a range sums the sizes; '{{*}}' is the full
+# permutation. All finite, all seekable. Cross-checked against Python's
+# itertools in the oracle; these pin the counts, the order and the edges.
+t_count '(a|b|c){{2}}'      '3'
+t_enum  '(a|b|c){{2}}'      'ab/ac/bc/'
+t_count '(a|b|c){{2!}}'     '6'
+t_enum  '(a|b|c){{2!}}'     'ab/ac/ba/bc/ca/cb/'
+t_count '(a|b|c){{*}}'      '6'
+t_enum  '(a|b|c){{*}}'      'abc/acb/bac/bca/cab/cba/'
+t_enum  '(a|b|c){{1,2}}'    'a/b/c/ab/ac/bc/'
+t_count '(a|b|c){{1,2!}}'   '9'
+t_count '[a-z]{{3}}'        '2,600'
+t_count '(l|i|s|t|e|n){{*}}' '720'
+t_count '(a|b|c|d|e|f){{3}}' '20'
+# The choice composes with the rest of the syntax and with itself.
+t_enum  'x(a|b){{2}}y'      'xaby/'
+t_enum  '(cat|dog|fish){{2}}' 'catdog/catfish/dogfish/'
+t_count '((a|b|c){{2}}){2}' '9'
+# Random access lands where sequential enumeration would.
+t_opts  'cab/'   -z -f 4 '(a|b|c){{*}}'
+t_opts  'dogfish/' -z -f 2 '(cat|dog|fish){{2}}'
+# Edges fall out of the arithmetic: choosing none is the empty string, choosing
+# more than there are is the empty set.
+t_count '[a-c]{{0}}'        '1'
+t_enum  '[a-c]{{0}}'        '/'
+t_count 'a{{2}}'            '0'
+# A choice needs a finite set and something to choose from.
+t_error '(a*){{2}}'  'combinatorial choice over an infinite set'
+t_error '{{2}}'      'nothing before quantifier'
+t_error '(a|b){{2,}}'  'bad combinatorial parameters'
+t_error '(a|b){{2,1}}' 'bad combinatorial parameters'
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"
