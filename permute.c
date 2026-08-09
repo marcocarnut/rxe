@@ -182,3 +182,78 @@ void rxe_permutation_map(
         feistel(result,perm,result);
     } while (mpz_cmp(result,perm->domain) >= 0);
 }
+
+/* ----------------------- Per-subexpression shuffle ---------------------- */
+
+// A duplicate of a permutation, for cloning a group that carries one. The key
+// and the shape are all it needs; nothing is derived from a string again.
+
+struct rxe_permutation *rxe_permutation_clone(const struct rxe_permutation *perm)
+{
+    if (!perm) return NULL;
+    struct rxe_permutation *copy = NEW(1,struct rxe_permutation);
+    mpz_init_set(copy->domain,perm->domain);
+    copy->half_bits = perm->half_bits;
+    copy->key       = perm->key;
+    copy->rounds    = perm->rounds;
+    return copy;
+}
+
+// Turn a subexpression node into one whose members come out permuted by a key.
+// The permutation is over the group's own cardinality, so it reorders those
+// members among themselves and nothing else. An empty group has nothing to
+// permute and gets no permutation, which rxe_permutation_map reads as the
+// identity.
+
+void rxe_shuffle_make(struct rxe_node *node, const char *key, int keylen)
+{
+    char *k = NEW(keylen+1,char);
+    if (keylen) memcpy(k,key,keylen);
+    k[keylen] = 0;
+    node->is_shuffle = 1;
+    node->shuffle    = rxe_permutation_new(node->rxe->nitems,k);
+    rxe_mem_free(k);
+    mpz_set(node->nitems,node->rxe->nitems);
+    mpz_set_ui(node->comb_index,0);
+    if (mpz_sgn(node->nitems) > 0) {
+        mpz_t z;
+        mpz_init_set_ui(z,0);
+        rxe_shuffle_seek(node,z);
+        mpz_clear(z);
+    }
+}
+
+// Position the group at index 'pos' in its permuted order: map the index
+// through the key, then seek the subexpression to the result.
+
+int rxe_shuffle_seek(struct rxe_node *node, const mpz_t pos)
+{
+    mpz_t mapped;
+    mpz_init(mapped);
+    rxe_permutation_map(mapped,node->shuffle,pos);
+    int rc = rxe_seek(node->rxe,mapped);
+    mpz_set(node->comb_index,pos);
+    mpz_clear(mapped);
+    return rc;
+}
+
+// Step to the next member in permuted order, wrapping with a carry-out of 1.
+
+int rxe_shuffle_iterate(struct rxe_node *node)
+{
+    mpz_t next;
+    int carry = 0;
+    mpz_init(next);
+    mpz_add_ui(next,node->comb_index,1);
+    if (mpz_cmp(next,node->nitems) >= 0) { mpz_set_ui(next,0); carry = 1; }
+    rxe_shuffle_seek(node,next);
+    mpz_clear(next);
+    return carry;
+}
+
+void rxe_shuffle_free(struct rxe_node *node)
+{
+    if (node->shuffle) rxe_permutation_free(node->shuffle);
+    node->shuffle    = NULL;
+    node->is_shuffle = 0;
+}

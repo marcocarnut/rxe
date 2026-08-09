@@ -403,6 +403,18 @@ recover the key. The key is folded to 64 bits however long it is.
 
 The order produced by a given key is fixed and is treated as part of the
 interface, since reproducibility is the whole point of using a key.
+.PP
+The same permutation can be applied to a single subexpression rather than the
+whole set, written
+.BR (?~ key : re ).
+The group's own members are passed through the key before it is seeked into,
+so they come out reordered while every other position is untouched:
+"\\d{4}-(?~secret:\\d{4})" leaves the first field in order and scrambles the
+second, a reproducible shuffle of just that field. The group is non-capturing,
+must describe a finite set, and composes with quantifiers and with the
+whole-set
+.B -k
+like any other. The key runs to the first colon.
 
 .SH DICTIONARIES
 A construct written "[:name:]" draws its members from a named dictionary

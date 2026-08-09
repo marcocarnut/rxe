@@ -30,6 +30,8 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->is_comb = 0;
     node->comb_perm = 0;
     mpz_init(node->comb_index);
+    node->is_shuffle = 0;
+    node->shuffle = NULL;
     node->is_inf = 0;
     node->is_dict = 0;
     node->nwords = 0;
@@ -70,6 +72,7 @@ void rxe_free_node_data(struct rxe_node *node)
     node->is_repeat = 0;
     node->is_comb = 0;
     node->comb_perm = 0;
+    rxe_shuffle_free(node);
     node->is_inf = 0;
     node->rep_min = node->rep_max = node->rep_count = 0;
     // Keyed off the pointer, not the length: an empty character class still
