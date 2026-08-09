@@ -96,18 +96,32 @@ int rxe_repeat_is_infinite(struct rxe_node *node)
 // doing so: 'a{1,1000000}' would otherwise reserve a million integers to
 // enumerate a set whose first element is one character long.
 
-void rxe_repeat_reserve(struct rxe_node *node, int want)
+// Returns non-zero, without allocating anything, when 'want' positions would
+// blow past rxe_max_member. Each position costs an mpz_t index of its own, so
+// the position count is capped directly at the byte limit -- a member cannot
+// have more positions than bytes anyway, since every position renders at least
+// nothing and most render more. The caller treats a refusal as "this member is
+// too large" and stops; the latch records it for the front-end.
+
+int rxe_repeat_reserve(struct rxe_node *node, int want)
 {
-    if (want <= node->rep_alloc) return;
-    int i, n = node->rep_alloc ? node->rep_alloc : 8;
-    while (n < want) n *= 2;
+    if (want <= node->rep_alloc) return 0;
+    if (rxe_max_member && (size_t)want > rxe_max_member) {
+        rxe_member_overflow = 1;
+        return 1;
+    }
+    int i;
+    size_t n = node->rep_alloc ? (size_t)node->rep_alloc : 8;
+    while (n < (size_t)want) n *= 2;
+    // The doubling can overshoot 'want'; keep the array itself within the cap.
+    if (rxe_max_member && n > rxe_max_member) n = rxe_max_member;
     mpz_t *fresh = NEW(n,mpz_t);
     for (i=0;i<node->rep_alloc;i++) {
         // mpz_t is an array type, so this hands the limbs over rather than
         // copying them; the old entries must not be cleared afterwards.
         fresh[i][0] = node->rep_digit[i][0];
     }
-    for (i=node->rep_alloc;i<n;i++) mpz_init(fresh[i]);
+    for (i=node->rep_alloc;i<(int)n;i++) mpz_init(fresh[i]);
     if (node->rep_digit) rxe_mem_free(node->rep_digit);
     node->rep_digit = fresh;
     // The parallel array of lengths, used only when the expression is
@@ -116,10 +130,11 @@ void rxe_repeat_reserve(struct rxe_node *node, int want)
     // one index into the body's whole ordering.
     int *lens = NEW(n,int);
     for (i=0;i<node->rep_alloc;i++) lens[i] = node->rep_len[i];
-    for (i=node->rep_alloc;i<n;i++) lens[i] = 0;
+    for (i=node->rep_alloc;i<(int)n;i++) lens[i] = 0;
     if (node->rep_len) rxe_mem_free(node->rep_len);
     node->rep_len = lens;
-    node->rep_alloc = n;
+    node->rep_alloc = (int)n;
+    return 0;
 }
 
 // Turn an ordinary subexpression node into a repetition of it. The caller has
@@ -193,7 +208,7 @@ int rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r)
         // an index that does not fit in a machine word never will be.
         if (!mpz_fits_slong_p(p)) goto done;
         node->rep_count = node->rep_min + (int)mpz_get_ui(p);
-        rxe_repeat_reserve(node,node->rep_count);
+        if (rxe_repeat_reserve(node,node->rep_count)) goto done;
         for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
         rc = 0;
         goto done;
@@ -211,7 +226,7 @@ int rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r)
     }
     if (!unbounded && n > node->rep_max) goto done;
     node->rep_count = n;
-    rxe_repeat_reserve(node,n);
+    if (rxe_repeat_reserve(node,n)) goto done;
     // p is now an n-digit numeral in base sub->nitems. Peel the digits off
     // least significant first and store each at the position it drives.
     for (i=0;i<n;i++) {
@@ -237,6 +252,9 @@ int rxe_repeat_iterate(struct rxe_node *node, int l2r)
     // step carries. Without this the count would walk up into repeat counts
     // whose blocks hold no strings at all.
     if (!mpz_sgn(sub->nitems)) return 1;
+    // A run wider than what was allocated can only mean a prior seek was
+    // refused for exceeding the cap; do not walk off the end of the array.
+    if (n > node->rep_alloc) { rxe_member_overflow = 1; return 1; }
     // Ripple through the digits, least significant first.
     for (i=0;i<n;i++) {
         mpz_t *d = &node->rep_digit[digit_at(n,i,l2r)];
@@ -257,7 +275,7 @@ int rxe_repeat_iterate(struct rxe_node *node, int l2r)
     }
     // The indices are allocated on demand, so a longer run than any reached
     // so far has to make room for itself before it can be cleared.
-    rxe_repeat_reserve(node,node->rep_count);
+    if (rxe_repeat_reserve(node,node->rep_count)) return 1;
     for (i=0;i<node->rep_count;i++) mpz_set_ui(node->rep_digit[i],0);
     return carry;
 }

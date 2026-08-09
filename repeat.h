@@ -20,7 +20,7 @@
 void rxe_repeat_nitems(mpz_t out, const mpz_t base, int r0, int r1);
 void rxe_repeat_make(struct rxe_node *node, int r0, int r1);
 int  rxe_repeat_is_infinite(struct rxe_node *node);
-void rxe_repeat_reserve(struct rxe_node *node, int want);
+int rxe_repeat_reserve(struct rxe_node *node, int want);
 void rxe_repeat_free(struct rxe_node *node);
 int  rxe_repeat_seek(struct rxe_node *node, const mpz_t pos, int l2r);
 int  rxe_repeat_iterate(struct rxe_node *node, int l2r);

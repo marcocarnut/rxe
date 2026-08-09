@@ -107,7 +107,7 @@ static int dict_resolver(const char *name)
 int main(int argc, char **argv)
 {
     if (argc<2) {
-        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] <regex>\n");
+        die(0,"Usage: rxenum [-isLnezr] [-k key] [-c count] [-f from] [-t to] [-M bytes] <regex>\n");
     }
     int flags = 0;
     int do_enumerate = 0;
@@ -129,7 +129,7 @@ int main(int argc, char **argv)
     // it under a leak checker.
     atexit(rxe_free_dicts);
     for (;;) {
-        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:QD:");
+        int o = getopt(argc,argv,"isLenzf:t:c:r.,_~k:QD:M:");
         if (o < 0) break;
         switch(o) {
             case 'i': flags |= RXE_CASELESS;
@@ -165,6 +165,8 @@ int main(int argc, char **argv)
                       break;
             case 'k': key = optarg;
                       do_enumerate = 1;
+                      break;
+            case 'M': rxe_set_max_member(strtoul(optarg,NULL,10));
                       break;
             case ',':
             case '_':
@@ -371,7 +373,16 @@ void enumerate(struct rxe *rxe, int flags, int offset, mpz_t from, mpz_t cnt,
     mpz_init(target);
     if (perm && mpz_cmp(idx,rxe->nitems)>=0) die(100,"seek past end");
     rxe_permutation_map(target,perm,idx);
-    if (rxe_seek(rxe,target)) die(100,"seek past end");
+    // A seek can fail two ways: the index is past the end of a finite set, or
+    // the member it lands on is too large to build. The latch tells them apart.
+    rxe_check_overflow();
+    if (rxe_seek(rxe,target)) {
+        if (rxe_member_overflow) {
+            rxe->status = RXE_TOO_BIG;
+            die(1,"%s\n",rxe_error_message(rxe));
+        }
+        die(100,"seek past end");
+    }
     for (;;) {
          char str[MAXSTRLEN+1];
          rxe_current(str,MAXSTRLEN,rxe);

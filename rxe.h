@@ -44,6 +44,22 @@
 
 #define RXE_REP_UNBOUNDED            (-1)
 
+// Materializing one member of a set costs memory in proportion to its length:
+// the string itself, and -- for a repetition -- one index per position. A set
+// can be indexed and counted without ever paying that, but rendering a single
+// member that runs to gigabytes will exhaust the host. rxe_max_member caps the
+// bytes a rendered member may occupy; a member that would exceed it is refused
+// with RXE_TOO_BIG rather than allocated. Zero lifts the cap entirely. This is
+// a limit on a single line of output, never on how many members the set has:
+// the cardinality stays unbounded, and seeking still reaches every index.
+#define RXE_DEFAULT_MAX_MEMBER       (1u<<20)   // one mebibyte
+
+// A hard ceiling on a fixed repetition count, well above any real use, that
+// keeps '{n}' from overflowing the int it is parsed into (and from demanding a
+// cardinality integer the size of a disk). Distinct from the soft byte cap
+// above: this one bounds the count, not the rendered size.
+#define RXE_MAX_REPEAT               (100*1000*1000)
+
 #define RXE_FLAG_CLOSED_BRACKET      0x0100
 #define RXE_FLAG_HAS_BKRTABLE        0x0200
 #define RXE_FLAG_VARIABLE_REPEAT     0x0400
@@ -86,7 +102,8 @@
     X(RXE_BAD_CHOOSE,                   "bad combinatorial parameters")        \
     X(RXE_CHOOSE_INFINITE,              "combinatorial choice over an infinite set") \
     X(RXE_BAD_SHUFFLE,                  "unterminated shuffle key")            \
-    X(RXE_SHUFFLE_INFINITE,             "shuffle key over an infinite set")
+    X(RXE_SHUFFLE_INFINITE,             "shuffle key over an infinite set")    \
+    X(RXE_TOO_BIG,                      "member too large to materialize")
 
 enum rxe_parse_status {
 #define RXE_STATUS_ENUM_ENTRY(name,msg) name,
@@ -225,6 +242,18 @@ struct rxe {
 
 extern void *(*rxe_mem_alloc)(size_t);
 extern void (*rxe_mem_free)(void *);
+
+// The cap on a rendered member's length in bytes; see RXE_DEFAULT_MAX_MEMBER.
+// A front-end sets it to suit where its output goes -- a page's DOM tolerates
+// far less than a file does. Zero means no cap.
+extern size_t rxe_max_member;
+void rxe_set_max_member(size_t bytes);
+
+// Raised whenever a render is refused or truncated for exceeding rxe_max_member.
+// A front-end resets it before rendering and reads it after to tell a genuine
+// member from a stub. rxe_check_overflow reads and clears it in one step.
+extern int rxe_member_overflow;
+int rxe_check_overflow(void);
 
 
 /* -------------------------- Function Prototypes ------------------------- */

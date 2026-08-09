@@ -698,11 +698,15 @@ static const char *parse_repeat_params(const char *str, int *r0, int *r1,
         *status = RXE_BAD_REPETITION;
         return NULL;
     }
-    // atoi stops at the closing brace on its own. The comma search must be
-    // bounded explicitly, though: this used to be done by writing a NUL over
-    // the '}', which made rxe_parse scribble on the caller's string and crash
-    // outright on a string literal.
-    *r0 = *r1 = atoi(str);
+    // strtol stops at the closing brace on its own, and unlike atoi it does
+    // not overflow silently into a negative count that later drives a wild
+    // allocation: a repetition beyond RXE_MAX_REPEAT is refused here. The comma
+    // search must be bounded explicitly, though: this used to be done by
+    // writing a NUL over the '}', which made rxe_parse scribble on the caller's
+    // string and crash outright on a string literal.
+    long v = strtol(str,NULL,10);
+    if (v > RXE_MAX_REPEAT) { *status = RXE_TOO_BIG; return NULL; }
+    *r0 = *r1 = (int)v;
     const char *c = memchr(str,',',end-str);
     if (c) {
         if (c+1 == end) {
@@ -715,7 +719,9 @@ static const char *parse_repeat_params(const char *str, int *r0, int *r1,
             *status = RXE_BAD_REPETITION;
             return NULL;
         }
-        *r1 = atoi(c+1);
+        v = strtol(c+1,NULL,10);
+        if (v > RXE_MAX_REPEAT) { *status = RXE_TOO_BIG; return NULL; }
+        *r1 = (int)v;
     }
     if (*r0 > *r1) {
         *status = RXE_BAD_REPETITION;
