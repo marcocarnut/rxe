@@ -52,9 +52,15 @@ struct rxe_gnode_ev {
     enum rxe_gkind   kind;
     const char      *line1;
     const char      *card;
+    const char      *card_exact; // exact decimal cardinality, or "" when it is
+                                 // infinite or too long to show in full. The
+                                 // browser groups this; DOT keeps 'card'.
     int              is_inf;    // the set at this node has no largest member
     const char      *place;     // place value "x N", or NULL
+    const char      *place_exact; // exact decimal place value, or "" / NULL
     const char      *choices;   // rolled-up repeat's chosen pieces, or NULL
+    const char      *text;      // on a lit path, the member text this node
+                                // contributes (may be ""); NULL off the path
     int              on_path;    // lit by a -f/rank path
     int              ref_to;     // referenced node id (subroutine/backref), or -1
     int              rep_min, rep_max;  // for REPEAT/COMB; else 0
@@ -63,7 +69,10 @@ struct rxe_gnode_ev {
 
 // One subsection of an alternation: where its branch begins in the numbering
 // and how many members it holds. start + card of one is the start of the next.
-struct rxe_gsub { const char *start; const char *card; int is_inf; };
+struct rxe_gsub {
+    const char *start; const char *card; int is_inf;
+    const char *start_exact; const char *card_exact;   // exact decimals, or ""
+};
 
 // An alternation node, emitted before its branches. The subsections describe
 // the record's cells; the branch edges follow as ordinary edge events whose
@@ -105,7 +114,10 @@ struct rxe_graph_visitor {
 // into 'c' 'a' 't' -- each letter carrying its own source, which is why the
 // library does the splitting rather than the client (an escape like '\.' is one
 // letter, not two). Nothing emits them unless asked; rxedot leaves this off.
-struct rxe_graph_opts { int collapse, unroll, fold, on_path, letters; };
+// alt_reverse lays an alternation's branches out in reverse index order (branch
+// zero last, so it sits rightmost once drawn) -- the browser sets it so a lit
+// path reads in written order; rxedot leaves it off and draws them in order.
+struct rxe_graph_opts { int collapse, unroll, fold, on_path, letters, alt_reverse; };
 
 // Walk 'rxe' (a root expression) and drive the visitor's callbacks. Node ids
 // are assigned from zero in traversal order; the root is node zero.

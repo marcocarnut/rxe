@@ -18,6 +18,7 @@
 #include <gmp.h>
 #include "rxe.h"
 #include "rxe_graph.h"
+#include "lens.h"    // rxe_seek_at_length, for rendering a lit repeat's text
 
 // The walk's running state: the visitor to drive, the next node id (sequential,
 // so ids match rxedot's old counter), the caller's options and the root source
@@ -27,6 +28,7 @@ struct walk {
     const struct rxe_graph_visitor *v;
     void       *ctx;
     const struct rxe_graph_opts    *opts;
+    struct rxe *root;
     const char *source;
     int         idc;
     struct { struct rxe *rxe; int id; } gmap[8192];
@@ -53,6 +55,43 @@ static void gnum(char *b, size_t n, const mpz_t v, int inf) {
     if (len <= 15) snprintf(b, n, "%s", s);
     else snprintf(b, n, "~%c.%c%c%ce%zu", s[0], s[1], s[2], s[3], len - 1);
     free(s);
+}
+
+// The exact cardinality as a decimal, when it is short enough to show in full
+// (up to 60 digits, which fits a 64-byte buffer); otherwise "", and the client
+// falls back to the abbreviated form. An infinite node yields "" too. This is
+// what lets the browser group a number with thousand separators rather than
+// show the order-of-magnitude sketch gnum draws for a cramped DOT box.
+static void gexact(char *b, size_t n, const mpz_t v, int inf) {
+    if (inf || mpz_sizeinbase(v, 10) > 60 || n < 64) { b[0] = 0; return; }
+    mpz_get_str(b, 10, v);
+}
+
+// The text a node contributes to the current member -- what rxe_current would
+// print for it -- capped, for showing a lit node's own output. The tree is
+// already seeked, so this reads the state a prior rxe_seek left. Empty stays
+// empty; the caller shows a placeholder for it.
+static void node_text(char *b, size_t n, struct walk *w, struct rxe_node *node) {
+    int shortlex = w->root && (w->root->flags & RXE_FLAG_SHORTLEX);
+    char *end = b;      // rxe_current writes up to (maxlen) chars then a null, so
+    b[0] = 0;           // it is always handed (bytes left) - 1.
+    if (node->is_repeat || node->is_comb) {
+        for (int i = 0; i < node->rep_count && i < node->rep_alloc; i++) {
+            size_t left = n - (size_t)(end - b);
+            if (left <= 1) break;
+            if (shortlex ? rxe_seek_at_length(node->rxe, node->rep_len[i], node->rep_digit[i])
+                         : rxe_seek(node->rxe, node->rep_digit[i])) break;
+            end = rxe_current(end, (int)left - 1, node->rxe);
+        }
+    } else if (node->rxe) {
+        end = rxe_current(end, (int)n - 1, node->rxe);
+    } else if (node->is_dict) {
+        const char *word = node->words[node->iterator];
+        while (*word && (size_t)(end - b) + 1 < n) *end++ = *word++;
+    } else if (node->len) {
+        if (n > 1) *end++ = node->str[node->iterator];
+    }
+    *end = 0;
 }
 
 // A node's exact input text, read from its source span.
@@ -116,7 +155,7 @@ static int draw_literal_run(struct walk *w, struct rxe_node *first,
     src[len] = 0;
     struct rxe_gnode_ev ev = { 0 };
     ev.id = id; ev.kind = RXE_G_LITERAL; ev.line1 = src; ev.card = "1";
-    ev.on_path = onpath; ev.ref_to = -1;
+    ev.card_exact = "1"; ev.on_path = onpath; ev.ref_to = -1;
     w->v->node(w->ctx, &ev);
     // Optionally hand over the word's own letters as child leaves, each with
     // its own source span, so a drawing can unfold the word into them. rxedot
@@ -129,7 +168,7 @@ static int draw_literal_run(struct walk *w, struct rxe_node *first,
             int cid = w->idc++;
             struct rxe_gnode_ev cev = { 0 };
             cev.id = cid; cev.kind = RXE_G_LEAF; cev.line1 = csrc; cev.card = "1";
-            cev.on_path = onpath; cev.ref_to = -1;
+            cev.card_exact = "1"; cev.on_path = onpath; cev.ref_to = -1;
             w->v->node(w->ctx, &cev);
             struct rxe_gedge_ev ce = { 0 };
             ce.from = id; ce.from_port = -1; ce.to = cid; ce.on_path = onpath;
@@ -144,10 +183,10 @@ static int draw_literal_run(struct walk *w, struct rxe_node *first,
 // their exact source text; structural nodes carry their kind and their children
 // the rest. 'weight' is the place value string, or NULL.
 static int draw_node(struct walk *w, struct rxe_node *node, const char *weight,
-                     int onpath) {
+                     const char *weight_exact, int onpath) {
     int id = w->idc++;
-    char line1[256], card[64], src[220], choices[200];
-    choices[0] = 0;
+    char line1[256], card[64], cardx[64], src[220], choices[200], text[128];
+    choices[0] = 0; text[0] = 0;
     node_source(src, sizeof src, w, node);
     int have_src = src[0] != 0;
     int inf = node->is_inf, recurse = 0, ref_to = -1, unroll = 0;
@@ -196,10 +235,15 @@ static int draw_node(struct walk *w, struct rxe_node *node, const char *weight,
     else { snprintf(line1, sizeof line1, "%s", have_src ? src : "?"); kind = RXE_G_LEAF; }
 
     gnum(card, sizeof card, node->nitems, inf);
+    gexact(cardx, sizeof cardx, node->nitems, inf);
+    if (onpath) node_text(text, sizeof text, w, node);
 
     struct rxe_gnode_ev ev = { 0 };
     ev.id = id; ev.kind = kind; ev.line1 = line1; ev.card = card;
-    ev.is_inf = inf; ev.place = weight; ev.choices = choices[0] ? choices : NULL;
+    ev.card_exact = cardx;
+    ev.is_inf = inf; ev.place = weight; ev.place_exact = weight_exact;
+    ev.choices = choices[0] ? choices : NULL;
+    ev.text = onpath ? text : NULL;
     ev.on_path = onpath; ev.ref_to = ref_to;
     ev.rep_min = node->rep_min; ev.rep_max = node->rep_max;
     ev.comb_perm = node->comb_perm;
@@ -237,8 +281,8 @@ static void draw_seq(struct walk *w, int from, int from_port, struct rxe_alt *a,
             nid = draw_literal_run(w, nd, last, onpath);
             nd = last->next;
         } else {
-            char wbuf[48];
-            const char *wp = NULL;
+            char wbuf[48], wexact[64];
+            const char *wp = NULL, *wpx = NULL;
             if (mpz_cmp_ui(nd->nitems, 1) > 0) {
                 concat_weight(a, nd, wt);
                 if (mpz_cmp_ui(wt, 1) > 0) {
@@ -246,9 +290,11 @@ static void draw_seq(struct walk *w, int from, int from_port, struct rxe_alt *a,
                     gnum(ws, sizeof ws, wt, 0);
                     snprintf(wbuf, sizeof wbuf, "×%s", ws);
                     wp = wbuf;
+                    gexact(wexact, sizeof wexact, wt, 0);
+                    wpx = wexact[0] ? wexact : NULL;
                 }
             }
-            nid = draw_node(w, nd, wp, onpath);
+            nid = draw_node(w, nd, wp, wpx, onpath);
             nd = nd->next;
         }
         struct rxe_gedge_ev e = { 0 };
@@ -274,11 +320,16 @@ static void draw_contents(struct walk *w, int parent, struct rxe *rxe, int onpat
     struct rxe_gsub *subs = malloc(nsub * sizeof *subs);
     char (*sbuf)[64] = malloc(nsub * sizeof *sbuf);
     char (*cbuf)[64] = malloc(nsub * sizeof *cbuf);
+    char (*sxbuf)[64] = malloc(nsub * sizeof *sxbuf);
+    char (*cxbuf)[64] = malloc(nsub * sizeof *cxbuf);
     int k = 0;
     for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
         gnum(sbuf[k], sizeof sbuf[k], a->start, 0);
         gnum(cbuf[k], sizeof cbuf[k], a->nitems, a->ninf > 0);
+        gexact(sxbuf[k], sizeof sxbuf[k], a->start, 0);
+        gexact(cxbuf[k], sizeof cxbuf[k], a->nitems, a->ninf > 0);
         subs[k].start = sbuf[k]; subs[k].card = cbuf[k]; subs[k].is_inf = a->ninf > 0;
+        subs[k].start_exact = sxbuf[k]; subs[k].card_exact = cxbuf[k];
     }
     struct rxe_galt_ev aev = { 0 };
     aev.id = aid; aev.on_path = onpath; aev.nsub = nsub; aev.subs = subs;
@@ -288,27 +339,37 @@ static void draw_contents(struct walk *w, int parent, struct rxe *rxe, int onpat
     pe.from = parent; pe.from_port = -1; pe.to = aid; pe.on_path = onpath;
     w->v->edge(w->ctx, &pe);
 
-    k = 0;
-    for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
+    // Branch zero is drawn last under alt_reverse, so dagre (which keeps the
+    // insertion order of a crossing-free fan) leaves it rightmost -- the browser
+    // wants a lit path to read in written order. Either way each branch keeps
+    // its own index k, so its port and its "start / +size" label stay right.
+    int rev = w->opts->alt_reverse;
+    struct rxe_alt *a = rev ? rxe->tail : rxe->head;
+    for (k = rev ? nsub - 1 : 0; a; a = rev ? a->prev : a->next, k += rev ? -1 : 1) {
         int branch = onpath && a == rxe->curr;
         char blabel[140];
         snprintf(blabel, sizeof blabel, "%s\n+%s", subs[k].start, subs[k].card);
         draw_seq(w, aid, k, a, branch, blabel);
     }
-    free(subs); free(sbuf); free(cbuf);
+    free(subs); free(sbuf); free(cbuf); free(sxbuf); free(cxbuf);
 }
 
 void rxe_graph_walk(struct rxe *rxe, const struct rxe_graph_opts *opts,
                     const struct rxe_graph_visitor *v, void *ctx) {
     struct walk w = { 0 };
-    w.v = v; w.ctx = ctx; w.opts = opts; w.source = rxe->source; w.idc = 0;
+    w.v = v; w.ctx = ctx; w.opts = opts; w.root = rxe; w.source = rxe->source;
+    w.idc = 0;
     int root = w.idc++;
-    char card[64];
+    char card[64], cardx[64], text[128];
+    text[0] = 0;
     int inf = rxe_is_infinite(rxe);
     gnum(card, sizeof card, rxe->nitems, inf);
+    gexact(cardx, sizeof cardx, rxe->nitems, inf);
+    if (opts->on_path) rxe_current(text, sizeof text, rxe);
     struct rxe_gnode_ev ev = { 0 };
     ev.id = root; ev.kind = RXE_G_ROOT; ev.line1 = "set"; ev.card = card;
-    ev.is_inf = inf; ev.on_path = opts->on_path; ev.ref_to = -1;
+    ev.card_exact = cardx; ev.is_inf = inf; ev.on_path = opts->on_path;
+    ev.text = opts->on_path ? text : NULL; ev.ref_to = -1;
     v->node(ctx, &ev);
     draw_contents(&w, root, rxe, opts->on_path);
 }

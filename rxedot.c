@@ -214,7 +214,10 @@ int main(int argc, char **argv) {
         fprintf(f, ">;\n");
     }
 
-    struct rxe_graph_opts opts = { do_collapse, unroll, fold, onpath };
+    // letters and alt_reverse stay off: they shape the browser's drawing, not
+    // the DOT, and turning either on would move this output.
+    struct rxe_graph_opts opts = { .collapse = do_collapse, .unroll = unroll,
+                                   .fold = fold, .on_path = onpath };
     struct rxe_graph_visitor vis = { dot_node, dot_alt, dot_edge };
     rxe_graph_walk(rxe, &opts, &vis, f);
 
