@@ -420,8 +420,15 @@ struct rxe *rxe_parse(const char *str, int flags)
     struct rxe *rxe = rxe_new();
     rxe->brt = rxe_backref_table_new(10);
     rxe->flags |= RXE_FLAG_HAS_BKRTABLE;
-    if (*str=='^') str++;
-    parse(rxe,rxe->nitems,str,flags,0);
+    // Keep a private copy of the input, so node spans can point into it and
+    // outlive the caller's string. The parse runs over this copy, so every
+    // offset it records is relative to source itself.
+    size_t slen = strlen(str);
+    rxe->source = NEW(slen + 1, char);
+    memcpy(rxe->source, str, slen + 1);
+    const char *base = rxe->source, *p = rxe->source;
+    if (*p == '^') p++;
+    parse(rxe,rxe->nitems,p,flags,0,base);
     // Only an infinite expression is enumerated by length; a finite one is a
     // numeral and keeps the order it has always had, which the radix
     // conversion in the manual page depends on.
@@ -440,6 +447,7 @@ struct rxe *rxe_new(void)
     rxe->status = RXE_OK;
     rxe->brt = NULL;
     rxe->flags = 0;
+    rxe->source = NULL;
     mpz_init(rxe->nitems);
     mpz_init(rxe->index);
     rxe_lens_init(&rxe->lens);
@@ -468,6 +476,11 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
     }
     dst_node->is_backref = src_node->is_backref;
     dst_node->is_inf     = src_node->is_inf;
+    // Spans point into the one shared source, and a subroutine's referent is a
+    // group that outlives the copy, so both carry over unchanged.
+    dst_node->src_start  = src_node->src_start;
+    dst_node->src_end    = src_node->src_end;
+    dst_node->refers_to  = src_node->refers_to;
     // A dictionary node borrows its words, so the copy borrows the same ones.
     dst_node->is_dict    = src_node->is_dict;
     dst_node->nwords     = src_node->nwords;
@@ -531,6 +544,7 @@ void rxe_free(struct rxe *rxe)
     mpz_clear(rxe->nitems);
     mpz_clear(rxe->index);
     rxe_lens_free(&rxe->lens);
+    if (rxe->source) rxe_mem_free(rxe->source);   // root only; NULL elsewhere
     rxe_mem_free(rxe);
 }
 

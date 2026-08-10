@@ -21,6 +21,7 @@
 // point; this declares the recursive worker it calls, which was previously
 // reached through an implicit declaration.
 
-const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
+                  int depth, const char *base);
 
 #endif // __RXE_PARSE_H__

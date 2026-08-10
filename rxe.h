@@ -209,6 +209,10 @@ struct rxe_node {
     struct rxe_lens lens;         // Members of this node by length
     struct rxe_lens rest;         // ...of every node less significant than it
     struct rxe *rxe;              // Pointer to a subexpression or backref
+    struct rxe *refers_to;        // For a (?N) subroutine: the group it copies,
+                                  // so a drawing can collapse the copy to a link
+    int   src_start;              // This node's span in the root's source text,
+    int   src_end;                // as byte offsets [start,end); 0,0 if unknown
     struct rxe_node *prev;        // Pointer to the next node
     struct rxe_node *next;        // Pointer to the previous node
     struct rxe_alt  *owner;       // The alternation this belongs to
@@ -238,6 +242,8 @@ struct rxe {
     struct rxe_lens lens;          // Members by length, over all its alternations
     struct rxe_backref_table *brt; // backreferences table (only on root node)
     int flags;                     // miscellaneous flags
+    char *source;                  // a private copy of the input text, on the
+                                  // root only, that node spans point into
 };
 
 extern void *(*rxe_mem_alloc)(size_t);

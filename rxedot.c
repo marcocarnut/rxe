@@ -66,41 +66,47 @@ static void numshort(char *b, size_t n, const mpz_t v, int inf) {
     free(s);
 }
 
-// The option set of a one-position character class, previewed: a lone
-// character bare, a small set in full, a large one as first..last.
-static void class_preview(char *b, size_t n, struct rxe_node *node) {
-    size_t p = 0;
-    #define PUTC(ch) do { unsigned char _c = (unsigned char)(ch); \
-        p += (_c >= 32 && _c < 127) ? snprintf(b + p, p < n ? n - p : 0, "%c", _c) \
-                                    : snprintf(b + p, p < n ? n - p : 0, "<%02x>", _c); \
-        } while (0)
-    if (node->len <= 0) { snprintf(b, n, "ε"); return; }   // epsilon: empty
-    if (node->len == 1) { PUTC(node->str[0]); return; }
-    p += snprintf(b + p, p < n ? n - p : 0, "[");
-    if (node->len <= 8) for (int i = 0; i < node->len; i++) PUTC(node->str[i]);
-    else { PUTC(node->str[0]); p += snprintf(b + p, p < n ? n - p : 0, "…");
-           PUTC(node->str[node->len - 1]); }
-    p += snprintf(b + p, p < n ? n - p : 0, "]");
-    #undef PUTC
+// The root's source text, so a node's exact input can be read from its span.
+static const char *g_source;
+static void node_source(char *b, size_t n, struct rxe_node *node) {
+    int a = node->src_start, e = node->src_end;
+    if (!g_source || e <= a || a < 0) { b[0] = 0; return; }
+    size_t len = (size_t)(e - a);
+    if (len >= n) len = n - 1;
+    memcpy(b, g_source + a, len);
+    b[len] = 0;
 }
 
 static void draw_contents(FILE *f, int parent, struct rxe *rxe);
 
-// Draw one node of a concatenation and return its id.
+// Draw one node of a concatenation and return its id. Leaves are labelled with
+// their exact source text -- '[a-z]', '\d', '[:name:]', '\1', '(?2)' -- read
+// from the span; structural nodes carry their kind and their children the rest.
 static int draw_node(FILE *f, struct rxe_node *node) {
     int id = idc++;
-    char kind[128], card[64], label[220];
+    char kind[256], card[64], label[340], src[220];
     const char *fill = "#ffffff";
-    int inf = node->is_inf;
+    int inf = node->is_inf, recurse = 0, refedge = -1;
+    node_source(src, sizeof src, node);
+    int have_src = src[0] != 0;
 
-    if (node->is_backref) { snprintf(kind, sizeof kind, "\\ backref"); fill = "#ffe0b0"; }
+    if (node->refers_to) {                        // a (?N) subroutine call
+        snprintf(kind, sizeof kind, "%s", have_src ? src : "(?…)");
+        fill = "#ffe0b0";
+        refedge = map_get(node->refers_to);       // a link to the group it copies
+    }
+    else if (node->is_backref) {                  // a \N backreference
+        snprintf(kind, sizeof kind, "%s", have_src ? src : "\\ref");
+        fill = "#ffe0b0";
+        refedge = node->rxe ? map_get(node->rxe) : -1;
+    }
     else if (node->is_repeat) {
         if (node->rep_max == RXE_REP_UNBOUNDED)
             snprintf(kind, sizeof kind, "repeat {%d,}", node->rep_min);
         else if (node->rep_min == node->rep_max)
             snprintf(kind, sizeof kind, "repeat {%d}", node->rep_min);
         else snprintf(kind, sizeof kind, "repeat {%d,%d}", node->rep_min, node->rep_max);
-        fill = "#d4e4ff";
+        fill = "#d4e4ff"; recurse = 1;
     }
     else if (node->is_comb) {
         const char *verb = node->comb_perm ? "permute" : "choose";
@@ -109,13 +115,12 @@ static int draw_node(FILE *f, struct rxe_node *node) {
             snprintf(kind, sizeof kind, "%s {{%d%s}}", verb, node->rep_min, bang);
         else snprintf(kind, sizeof kind, "%s {{%d,%d%s}}", verb,
                       node->rep_min, node->rep_max, bang);
-        fill = "#ffd4e6";
+        fill = "#ffd4e6"; recurse = 1;
     }
-    else if (node->is_shuffle) { snprintf(kind, sizeof kind, "shuffle (?~…)"); fill = "#e6d4ff"; }
-    else if (node->is_dict)    { snprintf(kind, sizeof kind, "dict · %d words", node->nwords); fill = "#d4f4d4"; }
-    else if (node->rxe)        { snprintf(kind, sizeof kind, "group ( )"); fill = "#eeeeee"; }
-    else { char cp[80]; class_preview(cp, sizeof cp, node);
-           snprintf(kind, sizeof kind, "%s", cp); fill = "#ffffff"; }
+    else if (node->is_shuffle) { snprintf(kind, sizeof kind, "shuffle (?~…)"); fill = "#e6d4ff"; recurse = 1; }
+    else if (node->is_dict)    { snprintf(kind, sizeof kind, "%s", have_src ? src : "dict"); fill = "#d4f4d4"; }
+    else if (node->rxe)        { snprintf(kind, sizeof kind, "( )"); fill = "#eeeeee"; recurse = 1; }
+    else { snprintf(kind, sizeof kind, "%s", have_src ? src : "?"); fill = "#ffffff"; }
 
     numshort(card, sizeof card, node->nitems, inf);
     snprintf(label, sizeof label, "%s\n%s", kind, card);
@@ -124,14 +129,10 @@ static int draw_node(FILE *f, struct rxe_node *node) {
     fprintf(f, "\", fillcolor=\"%s\"%s];\n", fill,
             inf ? ", color=\"#2f60c0\", penwidth=2" : "");
 
-    if (node->is_backref) {
-        int g = node->rxe ? map_get(node->rxe) : -1;
-        if (g >= 0)
-            fprintf(f, "  n%d -> n%d [style=dashed, constraint=false, "
-                       "color=\"#c07000\", arrowsize=0.6];\n", id, g);
-    } else if (node->rxe) {
-        draw_contents(f, id, node->rxe);
-    }
+    if (recurse && node->rxe) draw_contents(f, id, node->rxe);
+    if (refedge >= 0)
+        fprintf(f, "  n%d -> n%d [style=dashed, constraint=false, "
+                   "color=\"#c07000\", arrowsize=0.6];\n", id, refedge);
     return id;
 }
 
@@ -175,6 +176,8 @@ int main(int argc, char **argv) {
         rxe_free(rxe);
         return 1;
     }
+
+    g_source = rxe->source;
 
     FILE *f = stdout;
     fprintf(f, "digraph rxe {\n");

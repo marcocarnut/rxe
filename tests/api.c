@@ -356,6 +356,42 @@ int main(void)
         rxe_free_dicts();
     }
 
+    {
+        // Source spans: each node remembers the exact text it came from, so a
+        // consumer can show the regex as typed rather than reconstruct it.
+        struct rxe *rxe = rxe_parse("\\d[a-z]{2}", 0);
+        char s[64];
+        int n;
+        check_int("a spanned pattern parses", RXE_OK, rxe_error(rxe));
+        struct rxe_node *first = rxe->head->head;      // \d
+        n = first->src_end - first->src_start;
+        memcpy(s, rxe->source + first->src_start, n); s[n] = 0;
+        check("the first node's span is the shorthand verbatim", "\\d", s);
+        // A repeat wraps a body whose span is just the atom, not the quantifier.
+        struct rxe_node *body = first->next->rxe->head->head;   // [a-z] inside {2}
+        n = body->src_end - body->src_start;
+        memcpy(s, rxe->source + body->src_start, n); s[n] = 0;
+        check("the repeated body's span is the class alone", "[a-z]", s);
+        rxe_free(rxe);
+    }
+    {
+        // A subroutine points back at the group it copies, for drawings that
+        // want to collapse the copy to a reference.
+        struct rxe *rxe = rxe_parse("(a)(?1)", 0);
+        char s[64];
+        int n;
+        check_int("a subroutine parses", RXE_OK, rxe_error(rxe));
+        struct rxe_node *grp = rxe->head->head;        // (a)
+        struct rxe_node *sub = grp->next;              // (?1)
+        check_int("the subroutine refers to a group", 1, sub->refers_to != NULL);
+        check_int("and it is exactly the group it names", 1,
+                  sub->refers_to == grp->rxe);
+        n = sub->src_end - sub->src_start;
+        memcpy(s, rxe->source + sub->src_start, n); s[n] = 0;
+        check("its span is the call text", "(?1)", s);
+        rxe_free(rxe);
+    }
+
     printf("api: %s\n", failures ? "FAILURES ABOVE" : "all checks passed");
     return failures ? 1 : 0;
 }

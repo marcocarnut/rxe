@@ -118,7 +118,8 @@ const char *backslash_letters[] = {
 
 /* -------------------------- Function Prototypes ------------------------- */
 
-const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth);
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
+                  int depth, const char *base);
 const char *handle_repeats(struct rxe_alt *alt, const char *str,
                            int flags, enum rxe_parse_status *status);
 int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
@@ -173,7 +174,8 @@ static const char *parse_done(mpz_t x, mpz_t n, mpz_t p, const char *str)
     return str;
 }
 
-const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int depth)
+const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
+                  int depth, const char *base)
 {
     mpz_t x,n,p;
     mpz_init_set_ui(x,1);  // Multiplicative accumulator
@@ -193,6 +195,11 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
     const char *str2;
     char prev=0;
     for (;;) {
+        // Where this token begins in the source, and the tail before it, so the
+        // node it produces can be given its span once, uniformly, below.
+        const char *tok = str;
+        struct rxe_node *tail0 = alt->tail;
+        int quant_here = 0;
         switch (c = *str++) {
             // ---------------- Termination conditions ---------------
             // End of subexpression
@@ -314,7 +321,7 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       // reads as "abb", and '(?:a)(b)\2' was accepted at all.
                       if (!is_flag_group)
                           rxe_backref_table_add(rxe->brt,sub_rxe);
-                      str = parse(sub_rxe,n,str,newflags,depth+1);
+                      str = parse(sub_rxe,n,str,newflags,depth+1,base);
                       node->rxe = sub_rxe;
                       mpz_set(node->rxe->nitems,n);
                       mpz_set(node->nitems,n);
@@ -415,7 +422,8 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
                       // All three quantifiers land here. An endless one has no
                       // cardinality to fold into the product: it is a
                       // dimension of the alternation instead, counted in ninf.
-            quantified: if (alt->tail->is_inf) {
+            quantified: quant_here = 1;   // the tail's span grows to cover this
+                        if (alt->tail->is_inf) {
                           mpz_set_ui(n,1);
                       } else {
                           mpz_set(n,alt->tail->nitems);
@@ -515,6 +523,17 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags, int de
         mpz_mul(x,x,p);
         mpz_set(p,n);
         prev = c;
+        // Record the span of whatever this iteration produced: a fresh atom
+        // runs from its first character to here; a quantifier stretches the
+        // tail it modified in place to take itself in.
+        if (alt->tail) {
+            if (alt->tail != tail0) {
+                alt->tail->src_start = (int)(tok - base);
+                alt->tail->src_end   = (int)(str - base);
+            } else if (quant_here) {
+                alt->tail->src_end   = (int)(str - base);
+            }
+        }
     }
 }
 
@@ -634,6 +653,9 @@ const char *handle_recursion(const char *str, mpz_t n, struct rxe_alt *alt, stru
     }
     struct rxe *new_rxe = rxe_deep_clone(base_rxe);
     node->rxe = new_rxe;
+    // Remember the group this is a copy of, so a drawing can show (?N) as a
+    // single reference back to it rather than redrawing the whole clone.
+    node->refers_to = base_rxe;
     node->is_inf = rxe_is_infinite(new_rxe);
     if (node->is_inf) mpz_set_ui(n,1);
     else mpz_set(n,new_rxe->nitems);
@@ -749,6 +771,13 @@ static struct rxe *demote_node(struct rxe_node *node, int flags)
     inner->nwords     = node->nwords;
     inner->words      = node->words;
     inner->is_inf     = node->is_inf;
+    // The body keeps the atom's span and any subroutine referent; the node,
+    // becoming the repetition wrapper, has its span stretched over the
+    // quantifier by the parse loop and no longer refers on its own.
+    inner->src_start  = node->src_start;
+    inner->src_end    = node->src_end;
+    inner->refers_to  = node->refers_to;
+    node->refers_to   = NULL;
     inner->is_repeat  = node->is_repeat;
     inner->rep_min    = node->rep_min;
     inner->rep_max    = node->rep_max;
