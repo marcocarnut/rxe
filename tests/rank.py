@@ -47,6 +47,11 @@ FINITE = [
     # repeats whose body can itself be empty, so one string is reached by many
     # repeat counts -- the count must follow the paths, not the characters
     r"(a?){0,4}", r"(a?){3}", r"(a|){2}", r"(ab?){0,2}",
+    # keyed shuffles: the key reorders which member sits at which index, so the
+    # rank must undo the permutation. The last two shuffle a set that itself
+    # holds duplicates, so the remap and the duplication compose.
+    r"(?~key:[0-9])", r"(?~secret:[a-c]{2})", r"(?~:M{0,3})",
+    r"(?~x:(a|a))", r"(?~k:(a|ab)(b|))",
     # roman numerals, finite
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]
@@ -56,7 +61,6 @@ FINITE = [
 REFUSE = [
     (r"a*", "infinite"), (r"\d+", "infinite"), (r"a{2,}", "infinite"),
     (r"(a|b|c){{2}}", "combinatorial"), (r"(cat|dog){{1,2}}", "combinatorial"),
-    (r"(?~key:[0-9])", "shuffle"), (r"(?~:[a-z])", "shuffle"),
     (r"(a)\1", "backreference"), (r"([ab])\1", "backreference"),
 ]
 

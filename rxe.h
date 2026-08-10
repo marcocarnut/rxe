@@ -355,6 +355,10 @@ void rxe_shuffle_free(struct rxe_node *node);
 
 void rxe_permutation_map(mpz_t result, struct rxe_permutation *perm,
                          const mpz_t index);
+// The inverse of rxe_permutation_map, used to rank a shuffled group: given the
+// underlying index a member was found at, recover the index the key shows it at.
+void rxe_permutation_unmap(mpz_t result, struct rxe_permutation *perm,
+                           const mpz_t image);
 
 /* ------------------------ Macro-Defined Functions ----------------------- */
 

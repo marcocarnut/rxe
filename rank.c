@@ -62,7 +62,6 @@ static int scan(struct rxe *rxe)
         for (struct rxe_node *node = alt->head; node; node = node->next) {
             if (node->is_backref) { g_reason = "backreference"; return 1; }
             if (node->is_comb)    { g_reason = "combinatorial {{k}}"; return 1; }
-            if (node->is_shuffle) { g_reason = "(?~key:) shuffle"; return 1; }
             if (node->is_inf)     { g_reason = "infinite subexpression"; return 1; }
             if (node->is_repeat && node->rep_max == RXE_REP_UNBOUNDED) {
                 g_reason = "unbounded repetition"; return 1;
@@ -268,6 +267,22 @@ static int sub_sink(void *v, mpz_srcptr d)
     return b->emit(b->ectx, d, b->q);
 }
 
+// --- a shuffled group. The key reorders which member sits at which index, so
+// the member found in the underlying set at index u is presented at unmap(u).
+// The count is untouched -- a permutation is a bijection, so a string is
+// reached by exactly as many indices either way -- only the index is remapped.
+struct shuf_bridge { emit_fn emit; void *ectx; int q; struct rxe_permutation *p; };
+static int shuf_sink(void *v, mpz_srcptr u)
+{
+    struct shuf_bridge *b = v;
+    mpz_t pos;
+    mpz_init(pos);
+    rxe_permutation_unmap(pos, b->p, u);
+    int stop = b->emit(b->ectx, pos, b->q);
+    mpz_clear(pos);
+    return stop;
+}
+
 // --- repetition. Walk the body 0..k times, building the block-and-digit index
 // seek decodes. value accumulates the body digits most significant first
 // (value = value*base + d), placing the last body least significant, as the
@@ -345,6 +360,13 @@ static int enum_node(struct rxe_node *node, const char *s, int off, int len,
         int stop = rep_go(&w, off, 0, z);
         mpz_clear(z);
         return stop;
+    }
+    if (node->is_shuffle) {                   // a keyed group: remap the index
+        for (int q = off; q <= len; q++) {
+            struct shuf_bridge b = { emit, ectx, q, node->shuffle };
+            if (enum_rxe(node->rxe, s + off, q - off, shuf_sink, &b)) return 1;
+        }
+        return 0;
     }
     if (node->rxe) {                          // a plain subexpression
         for (int q = off; q <= len; q++) {

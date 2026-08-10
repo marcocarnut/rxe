@@ -122,6 +122,32 @@ static void feistel(mpz_t out, struct rxe_permutation *perm, const mpz_t in)
     mpz_clear(l); mpz_clear(r); mpz_clear(f); mpz_clear(t);
 }
 
+// One pass of the Feistel network run backwards, undoing feistel(). A forward
+// round takes (l,r) to (r, l ^ F(r,i)); inverting it recovers r as the new low
+// half and l as the new high half ^ F, with the rounds visited last to first.
+// The same bijection on [0, 2^(2*half_bits)) as feistel(), only its inverse.
+
+static void feistel_inverse(mpz_t out, struct rxe_permutation *perm,
+                            const mpz_t in)
+{
+    mpz_t l,r,f,t;
+    mpz_init(l); mpz_init(r); mpz_init(f); mpz_init(t);
+    mpz_fdiv_q_2exp(l,in,perm->half_bits);   // high half
+    mpz_fdiv_r_2exp(r,in,perm->half_bits);   // low half
+    int i;
+    for (i=perm->rounds-1;i>=0;i--) {
+        // Forward round i produced (l,r) = (r_prev, l_prev ^ F(r_prev,i)), and
+        // r_prev is the current l, so F is taken over l here.
+        round_function(f,perm->key,i,l,perm->half_bits);
+        mpz_xor(t,r,f);                       // l_prev
+        mpz_set(r,l);                         // r_prev = current l
+        mpz_set(l,t);
+    }
+    mpz_mul_2exp(out,l,perm->half_bits);
+    mpz_add(out,out,r);
+    mpz_clear(l); mpz_clear(r); mpz_clear(f); mpz_clear(t);
+}
+
 /* ------------------------------------------------------------------------ */
 
 // Folds a key string down to the 64 bits the round function uses. The key
@@ -180,6 +206,27 @@ void rxe_permutation_map(
     mpz_set(result,index);
     do {
         feistel(result,perm,result);
+    } while (mpz_cmp(result,perm->domain) >= 0);
+}
+
+// The inverse of rxe_permutation_map: given the value an index maps to, recover
+// the index. The forward map cycle-walks feistel() until it lands in range; the
+// inverse cycle-walks feistel_inverse() the same way, which lands back on the
+// one index whose image the caller passed. So unmap(map(i)) == i over the whole
+// range, which is what lets a member found by its string be reported at the
+// index the key placed it at.
+
+void rxe_permutation_unmap(
+    mpz_t result,
+    struct rxe_permutation *perm,
+    const mpz_t image
+) {
+    if (!perm) { mpz_set(result,image); return; }
+    if (mpz_cmp_ui(perm->domain,1) <= 0) { mpz_set_ui(result,0); return; }
+    if (mpz_cmp(image,perm->domain) >= 0) { mpz_set(result,image); return; }
+    mpz_set(result,image);
+    do {
+        feistel_inverse(result,perm,result);
     } while (mpz_cmp(result,perm->domain) >= 0);
 }
 
