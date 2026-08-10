@@ -56,6 +56,13 @@ FINITE = [
     # rank must weight the concatenation and the repeat from the other end.
     r"(?L)[a-c][0-9]", r"(?L)(a|b)(c|d)(e|f)", r"(?L)[ab]{3}",
     r"(?L)(ab|cd){2}", r"(?L)(a|a)(b|b)",
+    # combinatorial choices: {{k}} unordered (combinadic), {{k!}} ordered
+    # (factorial), ranges, and {{*}}. The last two put the choice inside a
+    # concatenation and give the body duplicate members, so one string is a
+    # valid choice by more than one set of indices -- a duplicate again.
+    r"(a|b|c|d){{2}}", r"(a|b|c){{2!}}", r"[a-e]{{3}}",
+    r"(a|b|c|d){{1,3}}", r"(a|b|c){{*}}", r"(cat|dog|fish){{2!}}",
+    r"x(a|b|c){{2}}y", r"(a|a|b){{2}}",
     # roman numerals, finite
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]
@@ -64,7 +71,6 @@ FINITE = [
 # guess. Each entry is a pattern and the substring its reason should contain.
 REFUSE = [
     (r"a*", "infinite"), (r"\d+", "infinite"), (r"a{2,}", "infinite"),
-    (r"(a|b|c){{2}}", "combinatorial"), (r"(cat|dog){{1,2}}", "combinatorial"),
     (r"(a)\1", "backreference"), (r"([ab])\1", "backreference"),
 ]
 

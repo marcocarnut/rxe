@@ -82,22 +82,24 @@ With no strings on the command line, rxerank reads them from standard input,
 one per line, and answers each in turn \(en so a file of candidates can be
 ranked in one pass.
 .SH WHAT RANK CAN AND CANNOT DO
-rxerank answers the finite, place-value sets: literals, classes, alternation,
-concatenation, subexpressions and fixed or bounded repetition
-.RB ( {m,n} ).
+rxerank answers the finite sets: literals, classes, alternation, concatenation,
+subexpressions, fixed or bounded repetition
+.RB ( {m,n} ),
+the combinatorial choice
+.RB ( {{k}} " and " {{k!}} ),
+the keyed shuffle
+.RB ( (?~key:re) )
+and left-to-right ordering
+.RB ( (?L) ).
 A set it cannot yet rank it refuses by name rather than answer wrongly, with a
 line to standard error and exit status 2. Those are the infinite sets (anything
 with
 .BR * ", " +
 or an open-ended
-.BR {n,} ),
-the combinatorial choice
-.BR {{k}} ,
-the keyed shuffle
-.BR (?~key:re) ,
-a backreference, and left-to-right ordering
-.RB ( (?L) ).
-The plain, much the commonest, cases are all in.
+.BR {n,} )
+and backreferences. So a lottery ticket can be ranked into its draw \(en
+.B rxerank '( 0[1-9]| [1-5][0-9]| 60){{6}}' ' 04 08 15 16 23 42'
+finds where one Mega-Sena game falls among the fifty million.
 .SH VERIFYING AGAINST RXENUM
 rank and seek are inverses, which is easy to check by hand:
 .PP

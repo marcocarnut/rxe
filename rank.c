@@ -57,7 +57,6 @@ static int scan(struct rxe *rxe)
         if (alt->ninf) { g_reason = "infinite set"; return 1; }
         for (struct rxe_node *node = alt->head; node; node = node->next) {
             if (node->is_backref) { g_reason = "backreference"; return 1; }
-            if (node->is_comb)    { g_reason = "combinatorial {{k}}"; return 1; }
             if (node->is_inf)     { g_reason = "infinite subexpression"; return 1; }
             if (node->is_repeat && node->rep_max == RXE_REP_UNBOUNDED) {
                 g_reason = "unbounded repetition"; return 1;
@@ -119,6 +118,12 @@ static void place_before(mpz_t out, struct rxe_node *node)
 
 static void count_rxe(mpz_t out, struct rxe *rxe, const char *s, int len);
 
+// How many combinatorial members equal exactly s[off..q). Defined with the rest
+// of the {{k}} machinery below, since it enumerates the valid choices -- their
+// indices must be increasing or distinct, a constraint no plain count can see.
+static void comb_count(mpz_t out, struct rxe_node *node,
+                       const char *s, int off, int q);
+
 // How many members of one node equal exactly s[off..q).
 static void count_node(mpz_t out, struct rxe_node *node,
                        const char *s, int off, int q)
@@ -126,6 +131,7 @@ static void count_node(mpz_t out, struct rxe_node *node,
     int seglen = q - off;
     mpz_set_ui(out, 0);
 
+    if (node->is_comb) { comb_count(out, node, s, off, q); return; }
     if (node->is_repeat) {
         // A run of k copies of the body, k in [rep_min, rep_max]. R[j][pos] is
         // the number of ways the tail from position off+pos is matched by
@@ -242,6 +248,20 @@ static int enum_rxe(struct rxe *rxe, const char *s, int len,
 // d being the node's own index for that match. It threads the string only,
 // never the whole assembled index.
 typedef int (*emit_fn)(void *ectx, mpz_srcptr d, int q);
+
+// A combinatorial choice reports each of its members through this, the local
+// index and the position the member ends at. Defined with the {{k}} code below.
+typedef int (*comb_cb)(void *ctx, mpz_srcptr local, int endpos);
+static int comb_walk(struct rxe_node *node, const char *s, int off, int len,
+                     comb_cb cb, void *ctx);
+
+// Feeding a {{k}} member straight on to the enclosing concatenation's emit.
+struct comb_emit_ctx { emit_fn emit; void *ectx; };
+static int comb_emit_cb(void *v, mpz_srcptr local, int endpos)
+{
+    struct comb_emit_ctx *c = v;
+    return c->emit(c->ectx, local, endpos);
+}
 
 // --- continuing a concatenation: fold this node's match into the running
 // index and go on to the next node.
@@ -391,6 +411,10 @@ static int enum_node(struct rxe_node *node, const char *s, int off, int len,
         mpz_clear(one);
         return stop;
     }
+    if (node->is_comb) {                      // a {{k}} choice
+        struct comb_emit_ctx c = { emit, ectx };
+        return comb_walk(node, s, off, len, comb_emit_cb, &c);
+    }
     if (node->is_shuffle) {                   // a keyed group: remap the index
         for (int q = off; q <= len; q++) {
             struct shuf_bridge b = { emit, ectx, q, node->shuffle };
@@ -467,6 +491,179 @@ static int enum_rxe(struct rxe *rxe, const char *s, int len,
         if (stop) return 1;
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Combinatorial choice, {{k}} and {{k!}}. seek decodes an index into a choice
+ * of body members through the combinatorial or factorial number system; rank
+ * encodes a choice back. The wrinkle is that the members come as a string, not
+ * as indices, so the choice has to be recovered first: split the string into
+ * body members, and keep only the splits whose indices form a valid choice --
+ * strictly increasing for an unordered {{k}}, all distinct for an ordered
+ * {{k!}}. Each valid choice is one index; several may spell one string, and
+ * those are its duplicates.
+ * ------------------------------------------------------------------------- */
+
+// Members of one size: C(n,k) unordered, or P(n,k)=C(n,k)k! ordered.
+static void rk_size_count(mpz_t out, mpz_srcptr n, int size, int perm)
+{
+    mpz_bin_ui(out, n, (unsigned long)size);
+    if (perm && size > 1) {
+        mpz_t f;
+        mpz_init(f);
+        mpz_fac_ui(f, (unsigned long)size);
+        mpz_mul(out, out, f);
+        mpz_clear(f);
+    }
+}
+
+// The index a run of this size starts at: every shorter size laid before it.
+static void comb_block_offset(mpz_t out, mpz_srcptr n, int lo, int size, int perm)
+{
+    mpz_t c;
+    mpz_init(c);
+    mpz_set_ui(out, 0);
+    for (int s = lo; s < size; s++) {
+        rk_size_count(c, n, s, perm);
+        mpz_add(out, out, c);
+    }
+    mpz_clear(c);
+}
+
+// The inverse of decode_comb: the combinadic j = sum C(chosen[i], i+1), the
+// chosen indices ascending. (comb.c's decode reads this same sum backwards.)
+static void encode_comb(mpz_t out, mpz_t *chosen, int size)
+{
+    mpz_t c;
+    mpz_init(c);
+    mpz_set_ui(out, 0);
+    for (int i = 0; i < size; i++) {
+        mpz_bin_ui(c, chosen[i], (unsigned long)(i + 1));
+        mpz_add(out, out, c);
+    }
+    mpz_clear(c);
+}
+
+// The inverse of decode_perm: the factorial-base numeral whose digit at each
+// position is that member's rank among the ones not yet used, times the falling
+// factorial of the positions still to fill -- the Lehmer code.
+static void encode_perm(mpz_t out, mpz_t *chosen, int size, mpz_srcptr n)
+{
+    mpz_t block, rank, term, rest;
+    mpz_init(block);
+    mpz_init(rank);
+    mpz_init(term);
+    mpz_init(rest);
+    mpz_set_ui(out, 0);
+    for (int p = 0; p < size; p++) {
+        mpz_sub_ui(rest, n, (unsigned long)(p + 1));     // n-1-p
+        mpz_set_ui(block, 1);
+        for (int t = 0; t < size - 1 - p; t++) {
+            mpz_sub_ui(term, rest, (unsigned long)t);
+            mpz_mul(block, block, term);
+        }
+        mpz_set(rank, chosen[p]);                        // rank among the unused
+        for (int i = 0; i < p; i++)
+            if (mpz_cmp(chosen[i], chosen[p]) < 0) mpz_sub_ui(rank, rank, 1);
+        mpz_mul(term, rank, block);
+        mpz_add(out, out, term);
+    }
+    mpz_clear(block);
+    mpz_clear(rank);
+    mpz_clear(term);
+    mpz_clear(rest);
+}
+
+// Walking the choices. chosen[] holds the body indices picked so far; at each
+// depth in [lo,hi] the run is a valid member and its index is reported.
+struct comb_state {
+    struct rxe_node *node;
+    const char *s;
+    int len, lo, hi, perm;
+    mpz_srcptr n;                 // body cardinality
+    mpz_t *chosen;
+    comb_cb cb;
+    void *ctx;
+};
+
+static int comb_rec(struct comb_state *st, int pos, int depth);
+
+// One more body match, at index d over some prefix: admit it only if it keeps
+// the choice valid, then descend.
+struct comb_body { struct comb_state *st; int q; int depth; };
+static int comb_body_sink(void *v, mpz_srcptr d)
+{
+    struct comb_body *b = v;
+    struct comb_state *st = b->st;
+    int depth = b->depth;
+    if (st->perm) {                           // ordered: all distinct
+        for (int i = 0; i < depth; i++)
+            if (!mpz_cmp(st->chosen[i], d)) return 0;
+    } else {                                  // unordered: strictly increasing
+        if (depth > 0 && mpz_cmp(d, st->chosen[depth - 1]) <= 0) return 0;
+    }
+    mpz_set(st->chosen[depth], d);
+    return comb_rec(st, b->q, depth + 1);
+}
+
+static int comb_rec(struct comb_state *st, int pos, int depth)
+{
+    if (depth >= st->lo && depth <= st->hi) {
+        mpz_t local, off, enc;
+        mpz_init(local);
+        mpz_init(off);
+        mpz_init(enc);
+        comb_block_offset(off, st->n, st->lo, depth, st->perm);
+        if (st->perm) encode_perm(enc, st->chosen, depth, st->n);
+        else          encode_comb(enc, st->chosen, depth);
+        mpz_add(local, off, enc);
+        int stop = st->cb(st->ctx, local, pos);
+        mpz_clear(local);
+        mpz_clear(off);
+        mpz_clear(enc);
+        if (stop) return 1;
+    }
+    if (depth >= st->hi) return 0;
+    for (int q = pos; q <= st->len; q++) {
+        struct comb_body b = { st, q, depth };
+        if (enum_rxe(st->node->rxe, st->s + pos, q - pos, comb_body_sink, &b))
+            return 1;
+    }
+    return 0;
+}
+
+static int comb_walk(struct rxe_node *node, const char *s, int off, int len,
+                     comb_cb cb, void *ctx)
+{
+    int hi = node->rep_max, n = hi > 0 ? hi : 1;
+    struct comb_state st = {
+        node, s, len, node->rep_min, hi, node->comb_perm,
+        node->rxe->nitems, NEW(n, mpz_t), cb, ctx
+    };
+    for (int i = 0; i < n; i++) mpz_init(st.chosen[i]);
+    int stop = comb_rec(&st, off, 0);
+    for (int i = 0; i < n; i++) mpz_clear(st.chosen[i]);
+    rxe_mem_free(st.chosen);
+    return stop;
+}
+
+// Count is the choices that consume exactly s[off..q); a choice ending short of
+// q fills a smaller segment and belongs to another split, so it is not counted
+// here. Each valid choice is one index, so counting them is counting indices.
+struct comb_count_ctx { int q; mpz_ptr out; };
+static int comb_count_cb(void *v, mpz_srcptr local, int endpos)
+{
+    struct comb_count_ctx *c = v;
+    if (endpos == c->q) mpz_add_ui(c->out, c->out, 1);
+    return 0;
+}
+
+static void comb_count(mpz_t out, struct rxe_node *node,
+                       const char *s, int off, int q)
+{
+    mpz_set_ui(out, 0);
+    struct comb_count_ctx c = { q, out };
+    comb_walk(node, s, off, q, comb_count_cb, &c);
 }
 
 /* ------------------------------------------------------------------------- *
