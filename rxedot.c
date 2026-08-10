@@ -77,14 +77,19 @@ static void node_source(char *b, size_t n, struct rxe_node *node) {
     b[len] = 0;
 }
 
-static void draw_contents(FILE *f, int parent, struct rxe *rxe);
+// The colour of the -f path: the route from the root to one member, lit along
+// its edges and node borders so the reader can check the finger-slide.
+#define HL "#d1442a"
+
+static void draw_contents(FILE *f, int parent, struct rxe *rxe, int onpath);
 
 // Draw one node of a concatenation and return its id. Leaves are labelled with
 // their exact source text -- '[a-z]', '\d', '[:name:]', '\1', '(?2)' -- read
 // from the span; structural nodes carry their kind and their children the rest.
-static int draw_node(FILE *f, struct rxe_node *node) {
+static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
+                     int onpath) {
     int id = idc++;
-    char kind[256], card[64], label[340], src[220];
+    char kind[256], card[64], label[400], src[220];
     const char *fill = "#ffffff";
     int inf = node->is_inf, recurse = 0, refedge = -1;
     node_source(src, sizeof src, node);
@@ -123,13 +128,18 @@ static int draw_node(FILE *f, struct rxe_node *node) {
     else { snprintf(kind, sizeof kind, "%s", have_src ? src : "?"); fill = "#ffffff"; }
 
     numshort(card, sizeof card, node->nitems, inf);
-    snprintf(label, sizeof label, "%s\n%s", kind, card);
+    // The weight is this digit's place value in its concatenation: how far the
+    // index moves when it ticks over. Shown only when it carries (> 1).
+    if (weight) snprintf(label, sizeof label, "%s\n%s\n%s", kind, card, weight);
+    else        snprintf(label, sizeof label, "%s\n%s", kind, card);
     fprintf(f, "  n%d [label=\"", id);
     dot_escape(f, label);
+    // On the path, a red border wins over the blue-ringed infinite mark.
     fprintf(f, "\", fillcolor=\"%s\"%s];\n", fill,
-            inf ? ", color=\"#2f60c0\", penwidth=2" : "");
+            onpath ? ", color=\"" HL "\", penwidth=2.4" :
+            inf    ? ", color=\"#2f60c0\", penwidth=2" : "");
 
-    if (recurse && node->rxe) draw_contents(f, id, node->rxe);
+    if (recurse && node->rxe) draw_contents(f, id, node->rxe, onpath);
     if (refedge >= 0)
         fprintf(f, "  n%d -> n%d [style=dashed, constraint=false, "
                    "color=\"#c07000\", arrowsize=0.6];\n", id, refedge);
@@ -147,7 +157,7 @@ static int is_lit(struct rxe_node *n) {
 // One node for a run of literals from 'first' to 'last', labelled with the
 // stretch of source they span -- 'cat' rather than three boxes 'c' 'a' 't'.
 static int draw_literal_run(FILE *f, struct rxe_node *first,
-                            struct rxe_node *last) {
+                            struct rxe_node *last, int onpath) {
     int id = idc++;
     char src[256], label[300];
     int a = first->src_start, e = last->src_end, len = e - a;
@@ -158,26 +168,58 @@ static int draw_literal_run(FILE *f, struct rxe_node *first,
     snprintf(label, sizeof label, "%s\n1", src);
     fprintf(f, "  n%d [label=\"", id);
     dot_escape(f, label);
-    fprintf(f, "\", fillcolor=\"#ffffff\"];\n");
+    fprintf(f, "\", fillcolor=\"#ffffff\"%s];\n",
+            onpath ? ", color=\"" HL "\", penwidth=2.4" : "");
     return id;
 }
 
+// A concatenation node's place value: the product of the sizes of its less
+// significant siblings -- those after it, or before it under (?L). Left at 1
+// (and so not shown) for the least significant, or for any endless
+// concatenation, where the order is by length rather than place value.
+static void concat_weight(struct rxe_alt *a, struct rxe_node *nd, mpz_t w) {
+    mpz_set_ui(w, 1);
+    int l2r = a->owner && (a->owner->flags & RXE_FLAG_LEFT_TO_RIGHT);
+    for (struct rxe_node *m = a->head; m; m = m->next) if (m->is_inf) return;
+    for (struct rxe_node *m = l2r ? nd->prev : nd->next; m;
+         m = l2r ? m->prev : m->next)
+        mpz_mul(w, w, m->nitems);
+}
+
 // Draw one alternative's concatenation, hanging from `from` (a node id, or a
-// node:port when it comes off an alternation subsection), folding literal runs.
-static void draw_seq(FILE *f, const char *from, struct rxe_alt *a) {
+// node:port when it comes off an alternation subsection), folding literal runs
+// and tagging each carrying digit with its place value.
+static void draw_seq(FILE *f, const char *from, struct rxe_alt *a, int onpath) {
+    // Every node of a concatenation is present in a member, so the whole run is
+    // on the path if its alternative is.
+    const char *edge = onpath ? " [color=\"" HL "\", penwidth=2.2]" : "";
+    mpz_t w;
+    mpz_init(w);
     for (struct rxe_node *nd = a->head; nd; ) {
         int nid;
         if (is_lit(nd) && is_lit(nd->next)) {
             struct rxe_node *last = nd;
             while (is_lit(last->next)) last = last->next;
-            nid = draw_literal_run(f, nd, last);
+            nid = draw_literal_run(f, nd, last, onpath);
             nd = last->next;
         } else {
-            nid = draw_node(f, nd);
+            char wbuf[48];
+            const char *wp = NULL;
+            if (mpz_cmp_ui(nd->nitems, 1) > 0) {
+                concat_weight(a, nd, w);
+                if (mpz_cmp_ui(w, 1) > 0) {   // 1 is the fastest digit; no need
+                    char ws[40];
+                    numshort(ws, sizeof ws, w, 0);
+                    snprintf(wbuf, sizeof wbuf, "×%s", ws);
+                    wp = wbuf;
+                }
+            }
+            nid = draw_node(f, nd, wp, onpath);
             nd = nd->next;
         }
-        fprintf(f, "  %s -> n%d;\n", from, nid);
+        fprintf(f, "  %s -> n%d%s;\n", from, nid, edge);
     }
+    mpz_clear(w);
 }
 
 // Hang the alternations of `rxe` under `parent`. One alternative is a plain
@@ -187,44 +229,72 @@ static void draw_seq(FILE *f, const char *from, struct rxe_alt *a) {
 // end, so a subsection's start plus its size is exactly the next one's start:
 // that is how you pick a branch when seeking to an index. Each subsection is a
 // port the branch hangs from.
-static void draw_contents(FILE *f, int parent, struct rxe *rxe) {
+static void draw_contents(FILE *f, int parent, struct rxe *rxe, int onpath) {
     map_put(rxe, parent);
     if (rxe->nalts <= 1) {
         char from[24];
         snprintf(from, sizeof from, "n%d", parent);
-        if (rxe->head) draw_seq(f, from, rxe->head);
+        if (rxe->head) draw_seq(f, from, rxe->head, onpath);
         return;
     }
     int aid = idc++, k = 0;
-    fprintf(f, "  n%d [shape=Mrecord, fillcolor=\"#fff0c0\", label=\"", aid);
+    fprintf(f, "  n%d [shape=Mrecord, fillcolor=\"#fff0c0\"%s, label=\"", aid,
+            onpath ? ", color=\"" HL "\", penwidth=2.4" : "");
     for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
         char start[64], card[64];
         numshort(start, sizeof start, a->start, 0);
         numshort(card, sizeof card, a->nitems, a->ninf > 0);
         fprintf(f, "%s<p%d>%s\\n+%s", k ? "|" : "", k, start, card);
     }
-    fprintf(f, "\"];\n  n%d -> n%d;\n", parent, aid);
+    fprintf(f, "\"];\n  n%d -> n%d%s;\n", parent, aid,
+            onpath ? " [color=\"" HL "\", penwidth=2.2]" : "");
     k = 0;
     for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
         char from[32];
+        // Only the branch the seek chose (rxe->curr) stays on the path.
+        int branch = onpath && a == rxe->curr;
         snprintf(from, sizeof from, "n%d:p%d", aid, k);
-        draw_seq(f, from, a);
+        draw_seq(f, from, a, branch);
     }
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <regex>\n"
+    const char *pattern = NULL, *findex = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-f") && i + 1 < argc) findex = argv[++i];
+        else pattern = argv[i];
+    }
+    if (!pattern) {
+        fprintf(stderr, "usage: %s [-f index] <regex>\n"
                         "  prints Graphviz DOT of the parse tree on stdout.\n"
+                        "  -f lights the path taken to reach one member.\n"
                         "  e.g. %s '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png\n",
                 argv[0], argv[0]);
         return 1;
     }
-    struct rxe *rxe = rxe_parse(argv[1], 0);
+    struct rxe *rxe = rxe_parse(pattern, 0);
     if (rxe_error(rxe)) {
         fprintf(stderr, "%s: %s\n", argv[0], rxe_error_message(rxe));
         rxe_free(rxe);
         return 1;
+    }
+
+    // -f seeks to a member; afterwards the tree's curr pointers spell the path,
+    // and rxe_current spells the member itself, which the caption shows.
+    int onpath = 0;
+    char member[1024];
+    member[0] = 0;
+    if (findex) {
+        mpz_t idx;
+        mpz_init(idx);
+        if (mpz_set_str(idx, findex, 10) == 0 && mpz_sgn(idx) >= 0
+                && rxe_seek(rxe, idx) == 0) {
+            onpath = 1;
+            rxe_current(member, sizeof member - 1, rxe);
+        } else {
+            fprintf(stderr, "%s: no member at index %s\n", argv[0], findex);
+        }
+        mpz_clear(idx);
     }
 
     g_source = rxe->source;
@@ -236,6 +306,13 @@ int main(int argc, char **argv) {
     fprintf(f, "  node [shape=box, style=\"filled,rounded\", fontname=\"Helvetica\", "
                "fontsize=11, margin=\"0.10,0.05\"];\n");
     fprintf(f, "  edge [arrowsize=0.7, color=\"#888888\"];\n");
+    if (onpath) {
+        fprintf(f, "  labelloc=\"t\"; fontsize=13; fontcolor=\"" HL "\"; label=\"");
+        char cap[1100];
+        snprintf(cap, sizeof cap, "index %s  =  %s", findex, member);
+        dot_escape(f, cap);
+        fprintf(f, "\";\n");
+    }
 
     int root = idc++;
     int inf = rxe_is_infinite(rxe);
@@ -243,10 +320,11 @@ int main(int argc, char **argv) {
     numshort(card, sizeof card, rxe->nitems, inf);
     snprintf(label, sizeof label, "set\n%s", card);
     fprintf(f, "  n%d [shape=box, fillcolor=\"#333a44\", fontcolor=\"white\", "
-               "style=\"filled,rounded\", label=\"", root);
+               "style=\"filled,rounded\"%s, label=\"", root,
+            onpath ? ", color=\"" HL "\", penwidth=2.4" : "");
     dot_escape(f, label);
     fprintf(f, "\"];\n");
-    draw_contents(f, root, rxe);
+    draw_contents(f, root, rxe, onpath);
 
     fprintf(f, "}\n");
     rxe_free(rxe);
