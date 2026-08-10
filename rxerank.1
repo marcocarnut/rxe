@@ -91,15 +91,25 @@ the keyed shuffle
 .RB ( (?~key:re) ),
 left-to-right ordering
 .RB ( (?L) )
-and backreferences. A set it cannot rank it refuses by name rather than answer
-wrongly, with a line to standard error and exit status 2 \(en which now means
-only the infinite sets, anything with
-.BR * ", " +
-or an open-ended
-.BR {n,} .
-So a lottery ticket can be ranked into its draw \(en
+and backreferences. So a lottery ticket can be ranked into its draw \(en
 .B rxerank '( 0[1-9]| [1-5][0-9]| 60){{6}}' ' 04 08 15 16 23 42'
 finds where one Mega-Sena game falls among the fifty million.
+.PP
+An infinite set \(en anything with
+.BR * ", " +
+or an open-ended
+.BR {n,} \(en
+is answered too when it comes out shortest first and the repeated part is a
+fixed length, which covers the common shapes:
+.BR a* ", " \ed+ ", " [a-z]+ ", " a*b* ", " (abc)* .
+The index is then the shortlex one: the member's place when the set is walked
+shortest first. A set it cannot rank it refuses by name rather than answer
+wrongly, with a line to standard error and exit status 2. Those are the
+infinite sets whose repeated part varies in length
+.RB ( (\ed+,)* ),
+those a backreference forces into the diagonal order
+.RB ( ([ab]+)\e1 ),
+and left-to-right ordering of an infinite set.
 .SH VERIFYING AGAINST RXENUM
 rank and seek are inverses, which is easy to check by hand:
 .PP
@@ -135,6 +145,9 @@ The indices at which the empty string is reached.
 .TP
 .B rxerank '(\ed{3})-\e1' 507-507
 Where a repeated-field code falls; the backreference must echo the group.
+.TP
+.B rxerank -z '\ed+' 42
+Prints 52: past the ten one-digit numbers, 42nd among the two-digit ones.
 .TP
 .B cut -f2 accounts.txt | rxerank -q '[a-z]{3,8}' ; echo $?
 Test a column of names for membership, silently, and read the verdict from the

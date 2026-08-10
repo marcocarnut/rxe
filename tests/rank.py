@@ -76,9 +76,22 @@ FINITE = [
 
 # Sets rank is not meant to answer yet: it must refuse them by name, never
 # guess. Each entry is a pattern and the substring its reason should contain.
+# Infinite sets rank now handles: shortlex order, fixed-length repeat body. The
+# check is a round-trip over a prefix of the enumeration -- every index must be
+# among those its string ranks to.
+INFINITE = [
+    r"a*", r"a+", r"[ab]*", r"[ab]+", r"\d+", r"a{3,}", r"[ab]{2,}",
+    r"xa*y", r"x[ab]*y", r"[ab]*c", r"c[ab]*", r"(ab)*", r"(abc)+",
+    r"a*b*", r"a*b*c*", r"[ab]*[cd]*", r"(a|b)+", r"a|b*", r"b*|a",
+    r"\d{2,}", r"(a|b)*", r"x\d+y", r"(ab,)*",
+]
+
+# Sets rank still refuses: a variable-length repeat body, a backreference that
+# keeps an infinite set in diagonal order, or left-to-right ordering.
 REFUSE = [
-    (r"a*", "infinite"), (r"\d+", "infinite"), (r"a{2,}", "infinite"),
-    (r"[ab]*[cd]*", "infinite"), (r"(ab,)*", "infinite"),
+    (r"(\d+,)*", "variable-length"), (r"(a|bb)*", "variable-length"),
+    (r"(?L)a*", "variable-length"),
+    (r"([ab]+)\1", "diagonal"), (r"([0-9]+)-\1", "diagonal"),
 ]
 
 # A handful of strings that are not members, to confirm a clean miss.
@@ -145,6 +158,25 @@ def check_finite(pat):
     return bad
 
 
+def check_infinite(pat, n=48):
+    """Round-trip a prefix of an infinite set: seek i, rank it, i must be there."""
+    rc, out, _ = run(RXENUM, ["-z", "-e", "-c", str(n), pat])
+    if rc != 0:
+        return [f"FAIL  {pat}: rxenum -e failed"]
+    gen = out.split("\n")[:-1]
+    bad = []
+    for i, s in enumerate(gen):
+        rc, out, _ = run(RXERANK, ["-z", "-a", pat, s])
+        if rc not in (0, 1):
+            bad.append(f"FAIL  {pat}: rank -a {s!r} exit {rc}")
+            break
+        ranks = [int(x) for x in out.split("\n") if x != ""]
+        if i not in ranks:
+            bad.append(f"FAIL  {pat}: seek {i} = {s!r}, but rank gives {ranks}")
+            break
+    return bad
+
+
 def check_refuse(pat, want):
     rc, out, err = run(RXERANK, [pat, "x"])
     if rc != 2:
@@ -174,6 +206,11 @@ def main():
         for line in bad:
             print(line)
         failures += bool(bad)
+    for pat in INFINITE:
+        bad = check_infinite(pat)
+        for line in bad:
+            print(line)
+        failures += bool(bad)
     for pat, want in REFUSE:
         bad = check_refuse(pat, want)
         for line in bad:
@@ -185,7 +222,7 @@ def main():
             print(line)
         failures += bool(bad)
 
-    total = len(FINITE) + len(REFUSE) + len(NONMEMBERS)
+    total = len(FINITE) + len(INFINITE) + len(REFUSE) + len(NONMEMBERS)
     print(f"\nrank: {total - failures} of {total} patterns clean")
     return 1 if failures else 0
 

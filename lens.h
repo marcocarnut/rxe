@@ -29,6 +29,16 @@ int rxe_seek_shortlex(struct rxe *rxe, const mpz_t pos);
 int rxe_repeat_seek_at_length(struct rxe_node *node, int L, const mpz_t idx,
                               int l2r);
 
+// The inverse of rxe_seek_shortlex: report every shortlex index at which the
+// string s of length len sits, each handed to the visitor. A member may sit at
+// more than one index when the set has duplicates. Returns 0 on success, or -1
+// if the set is outside what shortlex rank handles yet -- a variable-length
+// repetition body or left-to-right ordering -- in which case nothing is
+// visited. The visitor returns non-zero to stop early.
+typedef int (*rxe_rank_visit)(void *ctx, const mpz_t index);
+int rxe_rank_shortlex(struct rxe *rxe, const char *s, int len,
+                      rxe_rank_visit visit, void *ctx);
+
 // Non-zero if this expression can match the empty string. An unbounded
 // repetition of one derives the empty string infinitely many ways, so its
 // count at length zero does not converge and the parser refuses it.

@@ -668,3 +668,297 @@ int rxe_seek_shortlex(struct rxe *rxe, const mpz_t pos)
     mpz_clear(c);
     return 1;
 }
+
+/* ----------------------------- Ranking ---------------------------------- */
+
+// The inverse of the shortlex seek. Given a string, find the shortlex index it
+// sits at, by the same length-split arithmetic run backwards: count and skip
+// the members shorter than it, then within its own length undo the split of
+// the length among the positions. Each function mirrors the seek of the same
+// name. Only fixed-length repeat bodies and the default direction are handled;
+// the rest is refused up front so nothing partial is ever visited.
+
+static int rank_at_length(struct rxe *rxe, const char *s, int off, int L,
+                          rxe_rank_visit visit, void *ctx);
+static int rank_from(struct rxe_node *node, const char *s, int off, int L,
+                     rxe_rank_visit visit, void *ctx);
+
+// The body's single member length, if it has one, independent of any query
+// length: probe the body's lengths until the shortest non-empty one turns up,
+// then it is fixed iff that length holds the body's whole cardinality. Unlike
+// body_fixed_length, which is told a length, this finds its own, so it answers
+// even for the empty string, where the query length says nothing.
+static int repeat_body_fixed(struct rxe_node *node, int *m)
+{
+    struct rxe *body = node->rxe;
+    int L = 1;
+    for (;;) {
+        rxe_lens_rxe(body, L);
+        int hi = L < body->lens.max ? L : body->lens.max;
+        for (int i = 1; i <= hi; i++)
+            if (mpz_sgn(body->lens.count[i])) {      // shortest non-empty length
+                *m = i;
+                return !mpz_cmp(body->lens.count[i], body->nitems);
+            }
+        if (!mpz_cmp(body->lens.count[0], body->nitems)) return 0;  // empty only
+        if (L >= LENS_MAX_LENGTH) return 0;
+        L *= 2;
+    }
+}
+
+// Only fixed-length repeat bodies and the default direction are rankable so
+// far. Checked over the whole tree before any index is built, so a set outside
+// that is refused whole rather than answered in part.
+static int shortlex_rankable(struct rxe *rxe, int len)
+{
+    if (rxe->flags & RXE_FLAG_LEFT_TO_RIGHT) return 0;
+    for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next)
+        for (struct rxe_node *node = alt->head; node; node = node->next) {
+            int m;
+            if (node->is_repeat && !repeat_body_fixed(node, &m)) return 0;
+            if (node->rxe && !node->is_backref
+                    && !shortlex_rankable(node->rxe, len))
+                return 0;
+        }
+    return 1;
+}
+
+// A repetition of a fixed-length body: the length names the count outright and
+// every position takes the same share m, so the string splits into n chunks of
+// m with no search, and the index is a numeral over the chunks' own
+// within-length ranks -- the last chunk least significant, as the odometer runs.
+struct rep_len_ctx {
+    struct rxe *body;
+    const char *s;
+    int off, m, n;
+    mpz_srcptr base;                       // members of the body at length m
+    rxe_rank_visit visit;
+    void *ctx;
+};
+static int rep_len_rec(struct rep_len_ctx *c, int p, mpz_srcptr value);
+
+struct rep_len_chunk { struct rep_len_ctx *c; int p; mpz_srcptr value; };
+static int rep_len_chunk_visit(void *v, const mpz_t qd)
+{
+    struct rep_len_chunk *k = v;
+    mpz_t nv;
+    mpz_init(nv);
+    mpz_mul(nv, k->value, k->c->base);     // value = value*base + qd
+    mpz_add(nv, nv, qd);
+    int stop = rep_len_rec(k->c, k->p + 1, nv);
+    mpz_clear(nv);
+    return stop;
+}
+static int rep_len_rec(struct rep_len_ctx *c, int p, mpz_srcptr value)
+{
+    if (p == c->n) return c->visit(c->ctx, value);
+    struct rep_len_chunk k = { c, p, value };
+    return rank_at_length(c->body, c->s, c->off + p * c->m, c->m,
+                          rep_len_chunk_visit, &k);
+}
+static int rank_repeat_len(struct rxe_node *node, const char *s, int off, int L,
+                           rxe_rank_visit visit, void *ctx)
+{
+    struct rxe *body = node->rxe;
+    int m;
+    if (!repeat_body_fixed(node, &m)) return 0;      // refused already; guard
+    rxe_lens_rxe(body, L);
+    int n = L / m;
+    if (L % m || n < node->rep_min) return 0;
+    if (node->rep_max != RXE_REP_UNBOUNDED && n > node->rep_max) return 0;
+    mpz_t base, zero;
+    mpz_init(base);
+    lens_at(base, &body->lens, m);
+    mpz_init_set_ui(zero, 0);
+    struct rep_len_ctx c = { body, s, off, m, n, base, visit, ctx };
+    int stop = rep_len_rec(&c, 0, zero);
+    mpz_clear(base);
+    mpz_clear(zero);
+    return stop;
+}
+
+// One position's members of exactly length L, each reported by its within-length
+// rank. Mirrors seek_node.
+static int rank_node_len(struct rxe_node *node, const char *s, int off, int L,
+                         rxe_rank_visit visit, void *ctx)
+{
+    if (node->is_repeat) return rank_repeat_len(node, s, off, L, visit, ctx);
+    if (node->rxe)       return rank_at_length(node->rxe, s, off, L, visit, ctx);
+    if (node->is_dict) {
+        int r = 0, stop = 0;
+        for (int k = 0; k < node->nwords && !stop; k++) {
+            if ((int)strlen(node->words[k]) != L) continue;
+            if (!memcmp(node->words[k], s + off, L)) {
+                mpz_t z;
+                mpz_init_set_ui(z, r);
+                stop = visit(ctx, z);
+                mpz_clear(z);
+            }
+            r++;                           // rank counts length-L words passed
+        }
+        return stop;
+    }
+    if (node->len) {
+        if (L != 1) return 0;
+        for (int i = 0; i < node->len; i++)
+            if ((unsigned char)node->str[i] == (unsigned char)s[off]) {
+                mpz_t z;
+                mpz_init_set_ui(z, i);
+                int stop = visit(ctx, z);
+                mpz_clear(z);
+                if (stop) return 1;
+            }
+        return 0;
+    }
+    if (L == 0) {                          // an empty node matches only ""
+        mpz_t z;
+        mpz_init_set_ui(z, 0);
+        int stop = visit(ctx, z);
+        mpz_clear(z);
+        return stop;
+    }
+    return 0;
+}
+
+// Fold this position's within-length rank qd and the rest's rank r into the
+// index: idx = offset(longer splits) + qd*count(rest,L-l) + r. Mirrors the body
+// of seek_from.
+struct rf_rest {
+    rxe_rank_visit visit; void *ctx; mpz_srcptr offset; mpz_srcptr b; mpz_srcptr qd;
+};
+static int rf_rest_visit(void *v, const mpz_t r)
+{
+    struct rf_rest *rr = v;
+    mpz_t idx;
+    mpz_init(idx);
+    mpz_mul(idx, rr->qd, rr->b);
+    mpz_add(idx, idx, rr->offset);
+    mpz_add(idx, idx, r);
+    int stop = rr->visit(rr->ctx, idx);
+    mpz_clear(idx);
+    return stop;
+}
+struct rf_node {
+    struct rxe_node *nxt; const char *s; int roff; int rL;
+    rxe_rank_visit visit; void *ctx; mpz_srcptr offset; mpz_srcptr b;
+};
+static int rf_node_visit(void *v, const mpz_t qd)
+{
+    struct rf_node *o = v;
+    struct rf_rest rr = { o->visit, o->ctx, o->offset, o->b, qd };
+    return rank_from(o->nxt, o->s, o->roff, o->rL, rf_rest_visit, &rr);
+}
+
+static int rank_from(struct rxe_node *node, const char *s, int off, int L,
+                     rxe_rank_visit visit, void *ctx)
+{
+    if (!node) {
+        if (L != 0) return 0;              // length left over: no match
+        mpz_t z;
+        mpz_init_set_ui(z, 0);
+        int stop = visit(ctx, z);
+        mpz_clear(z);
+        return stop;
+    }
+    lens_node(node, L);
+    lens_rest(node, L);
+    mpz_t offset, a, b;
+    mpz_init(offset);
+    mpz_init(a);
+    mpz_init(b);
+    // node takes length l, the rest L-l. Longer l are the earlier members, so
+    // their blocks are the offset before this split.
+    for (int l = 0; l <= L; l++) {
+        mpz_set_ui(offset, 0);
+        for (int lp = l + 1; lp <= L; lp++) {
+            lens_at(a, &node->lens, lp);
+            if (!mpz_sgn(a)) continue;
+            lens_at(b, &node->rest, L - lp);
+            if (!mpz_sgn(b)) continue;
+            mpz_addmul(offset, a, b);
+        }
+        lens_at(b, &node->rest, L - l);    // place value for this position
+        struct rf_node o = { node->next, s, off + l, L - l,
+                             visit, ctx, offset, b };
+        if (rank_node_len(node, s, off, l, rf_node_visit, &o)) {
+            mpz_clear(offset);
+            mpz_clear(a);
+            mpz_clear(b);
+            return 1;
+        }
+    }
+    mpz_clear(offset);
+    mpz_clear(a);
+    mpz_clear(b);
+    return 0;
+}
+
+// An alternation's members are laid out in order, so an index is that branch's
+// start plus the rank within it. Mirrors rxe_seek_at_length.
+struct at_ctx { rxe_rank_visit visit; void *ctx; mpz_srcptr base; };
+static int at_visit(void *v, const mpz_t j)
+{
+    struct at_ctx *a = v;
+    mpz_t idx;
+    mpz_init(idx);
+    mpz_add(idx, a->base, j);
+    int stop = a->visit(a->ctx, idx);
+    mpz_clear(idx);
+    return stop;
+}
+static int rank_at_length(struct rxe *rxe, const char *s, int off, int L,
+                          rxe_rank_visit visit, void *ctx)
+{
+    mpz_t base, c;
+    mpz_init_set_ui(base, 0);
+    mpz_init(c);
+    rxe_lens_rxe(rxe, L);
+    for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next) {
+        rxe_lens_alt(alt, L);
+        lens_at(c, &alt->lens, L);
+        if (mpz_sgn(c)) {
+            struct at_ctx a = { visit, ctx, base };
+            if (rank_from(alt->head, s, off, L, at_visit, &a)) {
+                mpz_clear(base);
+                mpz_clear(c);
+                return 1;
+            }
+        }
+        mpz_add(base, base, c);
+    }
+    mpz_clear(base);
+    mpz_clear(c);
+    return 0;
+}
+
+// The members shorter than L come first, so their total is the base the
+// within-length rank is added to. Mirrors rxe_seek_shortlex.
+struct sl_ctx { rxe_rank_visit visit; void *ctx; mpz_srcptr base; };
+static int sl_visit(void *v, const mpz_t j)
+{
+    struct sl_ctx *sl = v;
+    mpz_t idx;
+    mpz_init(idx);
+    mpz_add(idx, sl->base, j);
+    int stop = sl->visit(sl->ctx, idx);
+    mpz_clear(idx);
+    return stop;
+}
+int rxe_rank_shortlex(struct rxe *rxe, const char *s, int len,
+                      rxe_rank_visit visit, void *ctx)
+{
+    if (!rxe || len < 0 || len > LENS_MAX_LENGTH) return -1;
+    if (!shortlex_rankable(rxe, len)) return -1;
+    mpz_t base, c;
+    mpz_init_set_ui(base, 0);
+    mpz_init(c);
+    for (int l = 0; l < len; l++) {
+        rxe_count_at_length(c, rxe, l);
+        mpz_add(base, base, c);
+    }
+    struct sl_ctx sl = { visit, ctx, base };
+    rank_at_length(rxe, s, 0, len, sl_visit, &sl);
+    mpz_clear(base);
+    mpz_clear(c);
+    return 0;
+}

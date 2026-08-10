@@ -302,9 +302,11 @@ int rxe_seek(struct rxe *rxe, mpz_t pos);
 // and rxe_rank_all visits each in turn. The string must equal a member whole.
 //
 // rxe_rank returns 0 and sets out when the string is a member, 1 when it is
-// not, and -1 when the set is one rank cannot handle -- which now means only an
-// infinite set -- in which case rxe_rank_reason() names why. Every finite set
-// is answered, backreferences and {{k}} choices included. rxe_rank_count returns 0 on
+// not, and -1 when the set is one rank cannot handle, in which case
+// rxe_rank_reason() names why. Every finite set is answered, and an infinite
+// one too when it is shortlex with a fixed-length repeat body (a*, \d+, a*b*);
+// what is refused is a variable-length body, a backreference's diagonal order,
+// or (?L) over an infinite set. rxe_rank_count returns 0 on
 // success or -1 on refusal. rxe_rank_all returns how many indices it emitted,
 // or -1 on refusal; its callback returns non-zero to stop early, which is how
 // a caller caps a listing that count told it would be huge.

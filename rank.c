@@ -34,40 +34,17 @@
  *
  * This handles every finite set: alternation, concatenation, repetition, the
  * combinatorial {{k}} and {{k!}} choices, the (?~key:) shuffle, left-to-right
- * ordering and backreferences. Only an infinite set is refused up front by a
- * scan, with a reason a front-end can print, rather than answered wrongly. See
- * rxe_rank_reason().
+ * ordering and backreferences. An infinite set is dispatched to the shortlex
+ * ranker in lens.c; only what neither can do is refused, with a reason a
+ * front-end can print. See rxe_rank_reason().
  */
 
 #include <stdio.h>
 #include <string.h>
 #include "rxe.h"
-
-/* ------------------------------------------------------------------------- *
- * Feature scan. rank inverts a subset of the tree the enumerator can build;
- * anything outside it is refused before a single character is matched, so a
- * partial walk can never return a wrong count or a missing index.
- * ------------------------------------------------------------------------- */
+#include "lens.h"
 
 static const char *g_reason;
-
-static int scan(struct rxe *rxe)
-{
-    if (!rxe) { g_reason = "null expression"; return 1; }
-    for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next) {
-        if (alt->ninf) { g_reason = "infinite set"; return 1; }
-        for (struct rxe_node *node = alt->head; node; node = node->next) {
-            if (node->is_inf)     { g_reason = "infinite subexpression"; return 1; }
-            if (node->is_repeat && node->rep_max == RXE_REP_UNBOUNDED) {
-                g_reason = "unbounded repetition"; return 1;
-            }
-            // A backreference borrows another group's tree; do not descend into
-            // it. Every other subexpression is the node's own to walk.
-            if (node->rxe && !node->is_backref && scan(node->rxe)) return 1;
-        }
-    }
-    return 0;
-}
 
 // The cardinality seek divides by at this node: a plain subexpression carries
 // its own, a repeat or comb the geometric or binomial sum in nitems.
@@ -733,6 +710,31 @@ static void comb_count(mpz_t out, struct rxe_node *node,
  * Public entry points.
  * ------------------------------------------------------------------------- */
 
+// Walk the set for the string, handing each index it sits at to the sink.
+// Returns 0 on success, -1 when the set is one rank cannot handle (g_reason
+// says why). A finite set goes to the place-value enumerator; a shortlex
+// infinite set to the length-indexed ranker in lens.c; a non-shortlex infinite
+// set -- a backreference that keeps an infinite set in diagonal order -- is
+// refused, as is a shortlex set the ranker does not cover yet.
+static int rank_walk(struct rxe *rxe, const char *s, rank_sink sink, void *ctx)
+{
+    if (!rxe) { g_reason = "null expression"; return -1; }
+    if (rxe_is_infinite(rxe)) {
+        if (!rxe_is_shortlex(rxe)) {
+            g_reason = "infinite set kept in diagonal order by a backreference";
+            return -1;
+        }
+        if (rxe_rank_shortlex(rxe, s, (int)strlen(s),
+                              (rxe_rank_visit)sink, ctx) < 0) {
+            g_reason = "infinite set with a variable-length body or (?L)";
+            return -1;
+        }
+        return 0;
+    }
+    enum_rxe(rxe, s, (int)strlen(s), sink, ctx);
+    return 0;
+}
+
 // First (smallest) index, tracked without stopping so the result is the least
 // of the several a duplicate may sit at, not merely the first walked to.
 struct min_ctx { int found; mpz_t min; };
@@ -749,22 +751,21 @@ static int min_sink(void *v, mpz_srcptr idx)
 int rxe_rank(struct rxe *rxe, const char *s, mpz_t out)
 {
     g_reason = NULL;
-    if (scan(rxe)) return -1;
     struct min_ctx mc;
     mc.found = 0;
     mpz_init(mc.min);
-    enum_rxe(rxe, s, (int)strlen(s), min_sink, &mc);
+    if (rank_walk(rxe, s, min_sink, &mc) < 0) { mpz_clear(mc.min); return -1; }
     int rc = mc.found ? 0 : 1;
     if (mc.found) mpz_set(out, mc.min);
     mpz_clear(mc.min);
     return rc;
 }
 
-// Counting a set with a backreference by tallying the enumeration: the DP that
-// makes an ordinary count cheap assumes the nodes are independent, which a
-// backref breaks. A backref set is finite and usually spelt one way, so walking
-// it is affordable; it just is not the cap-free count the DP gives.
-static int tally_sink(const mpz_t idx, void *v)
+// Counting a set the enumerator has to walk -- a backreference breaks the DP's
+// independence, and an infinite set has no DP at all -- by tallying what the
+// walk visits. Both are finite for a given string and usually spelt few ways,
+// so this is affordable; it just is not the cap-free count the DP gives.
+static int tally_sink(void *v, mpz_srcptr idx)
 {
     (void)idx;
     mpz_add_ui((mpz_ptr)v, (mpz_ptr)v, 1);
@@ -774,14 +775,12 @@ static int tally_sink(const mpz_t idx, void *v)
 int rxe_rank_count(struct rxe *rxe, const char *s, mpz_t out)
 {
     g_reason = NULL;
-    if (scan(rxe)) return -1;
-    if (has_backref(rxe)) {
-        mpz_set_ui(out, 0);
-        rxe_rank_all(rxe, s, tally_sink, out);
+    if (rxe && !rxe_is_infinite(rxe) && !has_backref(rxe)) {
+        count_rxe(out, rxe, s, (int)strlen(s));   // the cheap, cap-free DP
         return 0;
     }
-    count_rxe(out, rxe, s, (int)strlen(s));
-    return 0;
+    mpz_set_ui(out, 0);
+    return rank_walk(rxe, s, tally_sink, out);     // -1 refused, 0 ok
 }
 
 struct all_ctx { rxe_rank_cb cb; void *ctx; long n; };
@@ -795,9 +794,8 @@ static int all_sink(void *v, mpz_srcptr idx)
 long rxe_rank_all(struct rxe *rxe, const char *s, rxe_rank_cb cb, void *ctx)
 {
     g_reason = NULL;
-    if (scan(rxe)) return -1;
     struct all_ctx a = { cb, ctx, 0 };
-    enum_rxe(rxe, s, (int)strlen(s), all_sink, &a);
+    if (rank_walk(rxe, s, all_sink, &a) < 0) return -1;
     return a.n;
 }
 
