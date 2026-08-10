@@ -209,6 +209,10 @@ struct rxe_node {
     struct rxe_lens lens;         // Members of this node by length
     struct rxe_lens rest;         // ...of every node less significant than it
     struct rxe *rxe;              // Pointer to a subexpression or backref
+    struct rxe *refers_to;        // For a (?N) subroutine: the group it copies,
+                                  // so a drawing can collapse the copy to a link
+    int   src_start;              // This node's span in the root's source text,
+    int   src_end;                // as byte offsets [start,end); 0,0 if unknown
     struct rxe_node *prev;        // Pointer to the next node
     struct rxe_node *next;        // Pointer to the previous node
     struct rxe_alt  *owner;       // The alternation this belongs to
@@ -230,6 +234,8 @@ struct rxe {
     int nalts;                     // number of alternations in the linked list
     int ninf;                      // how many of them have no largest member
     enum rxe_parse_status status;  // error code returned during parsing
+    int error_pos;                 // offset into source of a parse error, only
+                                  // meaningful when status is not RXE_OK
     struct rxe_alt *head;          // start of the linked list of alternations
     struct rxe_alt *tail;          // end of the linked list of alternations
     struct rxe_alt *curr;          // current item being iterated
@@ -238,6 +244,8 @@ struct rxe {
     struct rxe_lens lens;          // Members by length, over all its alternations
     struct rxe_backref_table *brt; // backreferences table (only on root node)
     int flags;                     // miscellaneous flags
+    char *source;                  // a private copy of the input text, on the
+                                  // root only, that node spans point into
 };
 
 extern void *(*rxe_mem_alloc)(size_t);
@@ -261,6 +269,10 @@ int rxe_check_overflow(void);
 struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
 const char *rxe_error_message(struct rxe *rxe);
+
+// Where in the input a parse error was found, as a byte offset. Only meaningful
+// when rxe_error() is not RXE_OK; a front-end can point a caret at it.
+int rxe_error_pos(struct rxe *rxe);
 
 // Non-zero when the expression describes an infinite set. rxe->nitems then
 // counts only the part of it that is finite, and is not the size of the set;

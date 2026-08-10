@@ -42,6 +42,8 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->rep_len = NULL;
     node->str = NULL;
     node->rxe = NULL;
+    node->refers_to = NULL;
+    node->src_start = node->src_end = 0;
     node->owner = alt;
     rxe_lens_init(&node->lens);
     rxe_lens_init(&node->rest);

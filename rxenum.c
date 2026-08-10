@@ -200,7 +200,13 @@ int main(int argc, char **argv)
             argv[optind+1]);
     rxe = rxe_parse(argv[optind],flags);
     if (rxe_error(rxe)) {
-        fprintf(stderr,"%s\n",rxe_error_message(rxe));
+        const char *pat = argv[optind];
+        int pos = rxe_error_pos(rxe), len = (int)strlen(pat);
+        if (pos < 0) pos = 0;
+        if (pos > len) pos = len;
+        fprintf(stderr,"%s\n",rxe_error_message(rxe));   // line 1 unchanged
+        fprintf(stderr,"    %s\n",pat);
+        fprintf(stderr,"    %*s^\n",pos,"");
         exit(1);
     }
 

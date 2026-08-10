@@ -710,6 +710,13 @@ check "-w truncates to its width" '5' \
 check "raising -w prints the full member" '3000' \
       "$("$RXENUM" -w 4000 -c 1 '\d{3000}' | head -1 | tr -d '\n' | wc -c | tr -d ' ')"
 
+echo "== parse-error carets =="
+# The error report's third line is a caret under the offending token.
+check "caret marks the brace of a{2,1}" '     ^' \
+      "$("$RXENUM" 'a{2,1}' 2>&1 | sed -n 3p)"
+check "caret reaches inside a group" '         ^' \
+      "$("$RXENUM" 'ab(cd[ef)' 2>&1 | sed -n 3p)"
+
 echo "== known divergences, still open =="
 
 printf '\n%d passed, %d failed' "$pass" "$fail"
