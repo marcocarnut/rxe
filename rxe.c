@@ -445,6 +445,7 @@ struct rxe *rxe_new(void)
     rxe->nalts = 0;
     rxe->ninf = 0;
     rxe->status = RXE_OK;
+    rxe->error_pos = 0;
     rxe->brt = NULL;
     rxe->flags = 0;
     rxe->source = NULL;

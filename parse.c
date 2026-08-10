@@ -152,6 +152,11 @@ const char *rxe_error_message(struct rxe *rxe)
     return rxe_status_msgs[rxe->status];
 }
 
+int rxe_error_pos(struct rxe *rxe)
+{
+    return rxe ? rxe->error_pos : 0;
+}
+
 // This is the main parser routine. It calls itself recursively to handle
 // subexpressions. 'rxe' is a previously created struct rxe store the parse 
 // tree, 'ret' is a arbitrary precision integer with the number of items in
@@ -200,6 +205,9 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
         const char *tok = str;
         struct rxe_node *tail0 = alt->tail;
         int quant_here = 0;
+        // Track where we are, so a failure this iteration lands the error on
+        // the token that caused it. Overwritten each turn; read only on error.
+        rxe->error_pos = (int)(tok - base);
         switch (c = *str++) {
             // ---------------- Termination conditions ---------------
             // End of subexpression
@@ -337,6 +345,9 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
                       sub_rxe->flags |= RXE_FLAG_CLOSED_BRACKET;
                       if (sub_rxe->status) {
                           rxe->status = sub_rxe->status;
+                          // The sub-parse ran over the same source, so its error
+                          // offset is already in this expression's terms.
+                          rxe->error_pos = sub_rxe->error_pos;
                           return parse_done(x,n,p,str);
                       }
                       // Attach the shuffle now that the group's cardinality is

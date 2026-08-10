@@ -234,6 +234,8 @@ struct rxe {
     int nalts;                     // number of alternations in the linked list
     int ninf;                      // how many of them have no largest member
     enum rxe_parse_status status;  // error code returned during parsing
+    int error_pos;                 // offset into source of a parse error, only
+                                  // meaningful when status is not RXE_OK
     struct rxe_alt *head;          // start of the linked list of alternations
     struct rxe_alt *tail;          // end of the linked list of alternations
     struct rxe_alt *curr;          // current item being iterated
@@ -267,6 +269,10 @@ int rxe_check_overflow(void);
 struct rxe *rxe_parse(const char *str, int flags);
 enum rxe_parse_status rxe_error(struct rxe *rxe);
 const char *rxe_error_message(struct rxe *rxe);
+
+// Where in the input a parse error was found, as a byte offset. Only meaningful
+// when rxe_error() is not RXE_OK; a front-end can point a caret at it.
+int rxe_error_pos(struct rxe *rxe);
 
 // Non-zero when the expression describes an infinite set. rxe->nitems then
 // counts only the part of it that is finite, and is not the size of the set;

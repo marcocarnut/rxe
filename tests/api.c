@@ -392,6 +392,20 @@ int main(void)
         rxe_free(rxe);
     }
 
+    {
+        // A parse error carries the offset it was found at, for a caret.
+        struct rxe *rxe = rxe_parse("a{2,1}", 0);
+        check_int("a bad repetition is refused", RXE_BAD_REPETITION, rxe_error(rxe));
+        check_int("and the error sits on the brace", 1, rxe_error_pos(rxe));
+        rxe_free(rxe);
+        // An error inside a group reports where it really is, not the group.
+        rxe = rxe_parse("ab(cd[ef)", 0);
+        check_int("a nested error is refused", RXE_UNTERMINATED_CLASS,
+                  rxe_error(rxe));
+        check_int("and points inside the group", 5, rxe_error_pos(rxe));
+        rxe_free(rxe);
+    }
+
     printf("api: %s\n", failures ? "FAILURES ABOVE" : "all checks passed");
     return failures ? 1 : 0;
 }
