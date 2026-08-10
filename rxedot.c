@@ -68,6 +68,10 @@ static void numshort(char *b, size_t n, const mpz_t v, int inf) {
 
 // The root's source text, so a node's exact input can be read from its span.
 static const char *g_source;
+
+// Draw a (?N) subroutine as a reference back to its group (compact), or in
+// full (clearer when following a path, since each call goes its own way).
+static int g_collapse = 1;
 static void node_source(char *b, size_t n, struct rxe_node *node) {
     int a = node->src_start, e = node->src_end;
     if (!g_source || e <= a || a < 0) { b[0] = 0; return; }
@@ -98,7 +102,8 @@ static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
     if (node->refers_to) {                        // a (?N) subroutine call
         snprintf(kind, sizeof kind, "%s", have_src ? src : "(?…)");
         fill = "#ffe0b0";
-        refedge = map_get(node->refers_to);       // a link to the group it copies
+        if (g_collapse) refedge = map_get(node->refers_to);  // link to its group
+        else recurse = 1;                          // or draw the copied body in full
     }
     else if (node->is_backref) {                  // a \N backreference
         snprintf(kind, sizeof kind, "%s", have_src ? src : "\\ref");
@@ -260,18 +265,26 @@ static void draw_contents(FILE *f, int parent, struct rxe *rxe, int onpath) {
 
 int main(int argc, char **argv) {
     const char *pattern = NULL, *findex = NULL;
+    int collapse = -1;                             // -1: decide from -f below
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") && i + 1 < argc) findex = argv[++i];
+        else if (!strcmp(argv[i], "-c")) collapse = 1;   // force compact
+        else if (!strcmp(argv[i], "-e")) collapse = 0;   // force expanded
         else pattern = argv[i];
     }
     if (!pattern) {
-        fprintf(stderr, "usage: %s [-f index] <regex>\n"
+        fprintf(stderr, "usage: %s [-f index] [-c|-e] <regex>\n"
                         "  prints Graphviz DOT of the parse tree on stdout.\n"
                         "  -f lights the path taken to reach one member.\n"
+                        "  -c/-e collapse a (?N) subroutine to a reference, or draw\n"
+                        "        it in full; default is collapsed, but expanded with -f.\n"
                         "  e.g. %s '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png\n",
                 argv[0], argv[0]);
         return 1;
     }
+    // A path is clearer with each subroutine drawn out, since its calls diverge;
+    // a plain structure view is smaller with them collapsed.
+    g_collapse = (collapse >= 0) ? collapse : (findex ? 0 : 1);
     struct rxe *rxe = rxe_parse(pattern, 0);
     if (rxe_error(rxe)) {
         fprintf(stderr, "%s: %s\n", argv[0], rxe_error_message(rxe));
