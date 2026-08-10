@@ -78,6 +78,23 @@ static int g_collapse = 1;
 // what each iteration chose, under -f, so nothing is lost -- just compact.
 static int g_unroll = 0;
 
+// Show the input regex as a title above the tree; on by default, off with -t.
+static int g_title = 1;
+
+// Text safe inside a Graphviz HTML-like label: the few markup characters
+// become entities, and a control byte a numeric reference rather than a break.
+static void html_escape(FILE *f, const char *s) {
+    for (; *s; s++) {
+        unsigned char c = *s;
+        if      (c == '&') fputs("&amp;", f);
+        else if (c == '<') fputs("&lt;", f);
+        else if (c == '>') fputs("&gt;", f);
+        else if (c == '"') fputs("&quot;", f);
+        else if (c < 32 || c == 127) fprintf(f, "&#%d;", c);
+        else fputc(c, f);
+    }
+}
+
 // The pieces a fixed repetition's iterations produced under -f, space-joined
 // and capped, read from the seeked tree by pointing the body at each stored
 // index in turn.
@@ -317,16 +334,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c")) collapse = 1;   // force compact
         else if (!strcmp(argv[i], "-e")) collapse = 0;   // force expanded
         else if (!strcmp(argv[i], "-u") && i + 1 < argc) g_unroll = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t")) g_title = 0;
         else pattern = argv[i];
     }
     if (!pattern) {
-        fprintf(stderr, "usage: %s [-f index] [-c|-e] [-u n] <regex>\n"
+        fprintf(stderr, "usage: %s [-f index] [-c|-e] [-u n] [-t] <regex>\n"
                         "  prints Graphviz DOT of the parse tree on stdout.\n"
                         "  -f lights the path taken to reach one member.\n"
                         "  -c/-e collapse a (?N) subroutine to a reference, or draw\n"
                         "        it in full; default is collapsed, but expanded with -f.\n"
                         "  -u  unroll a fixed {k} repetition into k bodies when k<=n\n"
                         "        (default 0, none); rolled-up ones list their choices under -f.\n"
+                        "  -t  omit the title (the regex, shown by default).\n"
                         "  e.g. %s '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png\n",
                 argv[0], argv[0]);
         return 1;
@@ -368,12 +387,24 @@ int main(int argc, char **argv) {
     fprintf(f, "  node [shape=box, style=\"filled,rounded\", fontname=\"Helvetica\", "
                "fontsize=11, margin=\"0.10,0.05\"];\n");
     fprintf(f, "  edge [arrowsize=0.7, color=\"#888888\"];\n");
-    if (onpath) {
-        fprintf(f, "  labelloc=\"t\"; fontsize=13; fontcolor=\"" HL "\"; label=\"");
-        char cap[1100];
-        snprintf(cap, sizeof cap, "index %s  =  %s", findex, member);
-        dot_escape(f, cap);
-        fprintf(f, "\";\n");
+    // A title above the tree: the regex in monospace, and -- under -f -- the
+    // index and the member it reaches, in the path's colour.
+    if (g_title || onpath) {
+        fprintf(f, "  labelloc=\"t\"; label=<");
+        if (g_title) {
+            fprintf(f, "<FONT FACE=\"Courier\" POINT-SIZE=\"15\">");
+            html_escape(f, pattern);
+            fprintf(f, "</FONT>");
+        }
+        if (onpath) {
+            if (g_title) fprintf(f, "<BR/>");
+            fprintf(f, "<FONT COLOR=\"" HL "\" POINT-SIZE=\"13\">index ");
+            html_escape(f, findex);
+            fprintf(f, " = ");
+            html_escape(f, member);
+            fprintf(f, "</FONT>");
+        }
+        fprintf(f, ">;\n");
     }
 
     int root = idc++;

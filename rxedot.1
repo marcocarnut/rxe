@@ -1,0 +1,164 @@
+.TH RXEDOT 1 "Aug 2026" Linux "User Manuals"
+.SH NAME
+rxedot \- draw the parse tree of a regular expression as Graphviz DOT
+.SH SYNOPSIS
+.B rxedot
+[\fIoptions\fR]
+.I regex
+.SH DESCRIPTION
+.B rxedot
+parses
+.I regex
+with the same library
+.BR rxenum (1)
+uses, then walks the finished tree and writes a Graphviz graph of it on
+standard output. Pipe it into
+.BR dot (1):
+.PP
+.RS
+.B rxedot '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png
+.RE
+.PP
+The library itself knows nothing of DOT;
+.B rxedot
+is a sibling that reads the same public structure. Because a repetition is
+counted rather than written out, the tree stays small even for astronomically
+large sets: a fixed run is one node, not one per position.
+.PP
+Every box carries its cardinality, so the arithmetic of the set is on show: a
+concatenation multiplies its children, an alternation sums them, a
+combinatorial
+.B {{k}}
+is C(n,k) or P(n,k). With the numbers in place the tree becomes a device you
+can run by hand \(en see FOLLOWING A PATH below \(en and
+.B \-f
+runs it for you.
+.SH OPTIONS
+.TP
+.B \-f index
+Light the path taken to reach one member. The tree is sought to
+.BR index ,
+a decimal from zero, and the chosen branch at each alternation, together with
+every node on the way, is drawn in a heavier coloured outline. A title names
+the index and the member it reaches.
+.TP
+.B \-c
+Force a
+.B (?N)
+subroutine to be drawn collapsed \(en as a single node with a dashed edge back
+to the group it copies. Compact, but a path through it is ambiguous, since the
+several calls share the one drawn group.
+.TP
+.B \-e
+Force a subroutine to be drawn in full, each call its own copy. Clearer under
+.BR \-f ,
+where the calls go their own ways. Without either flag the default is
+collapsed, but expanded when
+.B \-f
+is given.
+.TP
+.B \-u n
+Unroll a fixed
+.B {k}
+repetition into
+.B k
+copies of its body when
+.B k
+is at most
+.BR n ;
+the default is 0, which never unrolls. A repetition left rolled up is still
+one node, but under
+.B \-f
+it lists what each iteration chose beside it (capped and ellipsised, so a large
+count costs nothing). Only fixed, finite repetitions unroll or list; variable,
+open-ended, and infinite ones are left alone.
+.TP
+.B \-t
+Omit the title. The input regex is shown above the tree by default; with
+.B \-f
+the index and member are shown too. This hides the regex line; the
+.B \-f
+line, when present, remains.
+.SH READING THE TREE
+.TP
+.B Cardinality
+Every node's second line is the number of members of the set it stands for,
+abbreviated past fifteen digits. A node with no largest member \(en an infinite
+one \(en shows the infinity sign and is ringed.
+.TP
+.B Character classes and literals
+A leaf shows the exact text it was parsed from:
+.BR [a-z] ,
+.BR \ed ,
+a literal character, a
+.B [:name:]
+dictionary. A run of two or more fixed single characters is folded into one
+word node, so
+.B cat
+reads whole rather than as three boxes.
+.TP
+.B Alternation
+Several alternatives become one rounded record, a subsection per branch.
+Each shows where that branch starts in the numbering and, after a
+.BR + ,
+how many it holds. The branches lie end to end, so a subsection's start plus
+its size is the next one's start \(en which is how a seek picks a branch.
+.TP
+.B Concatenation
+Nodes in sequence multiply. A node that carries \(en whose members are not all
+the same \(en shows its place value as
+.BR "\(mu weight" :
+how far the index moves when that digit ticks over. It is the divide-step for
+peeling the digit off an index.
+.TP
+.B Repetition
+A
+.B {m,n}
+repetition is one node over a single copy of its body. See
+.B \-u
+for drawing the iterations out.
+.TP
+.B Subroutine and backreference
+A
+.B (?N)
+subroutine and a
+.B \eN
+backreference both draw a dashed edge to the group they point at. See
+.B \-c
+and
+.BR \-e .
+.SH FOLLOWING A PATH
+The numbers turn the tree into a working odometer. To find the member at an
+index by hand, start at the set and descend:
+.IP \(bu 3
+at an alternation, choose the subsection whose start is the greatest not
+exceeding the index, and subtract that start from it;
+.IP \(bu 3
+at a concatenation, at each node that shows
+.BR "\(mu weight" ,
+divide the index by the weight and take the remainder as the smaller digits go
+on \(en the quotient selects this node's member;
+.IP \(bu 3
+a leaf is reached with a single value; read it off.
+.PP
+.B \-f
+does exactly this and lights the route, so the two can be checked against each
+other. For a finite, place-value set the numbers and the path are exact; an
+infinite set is ordered by length instead of place value and is left unlit.
+.SH EXAMPLES
+.TP
+.B rxedot '\ed{4}-\ed{2}-\ed{2}' | dot -Tsvg -o date.svg
+The tree of a date, each field a repetition with its place value.
+.TP
+.B rxedot -f 20240315 '\ed{4}-\ed{2}-\ed{2}' | dot -Tpng | display
+The path to
+.BR 2024-03-15 ,
+with each field listing the digits it chose.
+.TP
+.B rxedot -e -u 3 -f 5 '(a|b){3}' | dot -Tpng -o unrolled.png
+The three iterations drawn out, each lighting the branch it took.
+.SH SEE ALSO
+.BR rxenum (1),
+.BR dot (1)
+.SH LICENSE
+Free software under the GNU General Public License, version 2 or later.
