@@ -136,6 +136,32 @@ static int draw_node(FILE *f, struct rxe_node *node) {
     return id;
 }
 
+// A fixed single character: a plain leaf of exactly one member, with a span to
+// read it from. A run of these is a literal word, and reads better whole.
+static int is_lit(struct rxe_node *n) {
+    return n && !n->rxe && !n->is_backref && !n->is_repeat && !n->is_comb
+        && !n->is_shuffle && !n->is_dict && !n->refers_to
+        && n->src_end > n->src_start && mpz_cmp_ui(n->nitems, 1) == 0;
+}
+
+// One node for a run of literals from 'first' to 'last', labelled with the
+// stretch of source they span -- 'cat' rather than three boxes 'c' 'a' 't'.
+static int draw_literal_run(FILE *f, struct rxe_node *first,
+                            struct rxe_node *last) {
+    int id = idc++;
+    char src[256], label[300];
+    int a = first->src_start, e = last->src_end, len = e - a;
+    if (len < 0) len = 0;
+    if ((size_t)len >= sizeof src) len = sizeof src - 1;
+    memcpy(src, g_source + a, len);
+    src[len] = 0;
+    snprintf(label, sizeof label, "%s\n1", src);
+    fprintf(f, "  n%d [label=\"", id);
+    dot_escape(f, label);
+    fprintf(f, "\", fillcolor=\"#ffffff\"];\n");
+    return id;
+}
+
 // Hang the alternations of `rxe` under the box `parent`. A single alternation
 // is just a concatenation, drawn straight under it; several become a fan of
 // diamonds, each showing where in the numbering it starts.
@@ -155,8 +181,19 @@ static void draw_contents(FILE *f, int parent, struct rxe *rxe) {
             fprintf(f, "\"];\n  n%d -> n%d;\n", parent, aid);
             p = aid;
         }
-        for (struct rxe_node *nd = a->head; nd; nd = nd->next) {
-            int nid = draw_node(f, nd);
+        for (struct rxe_node *nd = a->head; nd; ) {
+            int nid;
+            // Fold a run of two or more adjacent literals into one word node;
+            // draw anything else, and a lone literal, on its own.
+            if (is_lit(nd) && is_lit(nd->next)) {
+                struct rxe_node *last = nd;
+                while (is_lit(last->next)) last = last->next;
+                nid = draw_literal_run(f, nd, last);
+                nd = last->next;
+            } else {
+                nid = draw_node(f, nd);
+                nd = nd->next;
+            }
             fprintf(f, "  n%d -> n%d;\n", p, nid);
         }
     }
