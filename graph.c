@@ -118,6 +118,25 @@ static int draw_literal_run(struct walk *w, struct rxe_node *first,
     ev.id = id; ev.kind = RXE_G_LITERAL; ev.line1 = src; ev.card = "1";
     ev.on_path = onpath; ev.ref_to = -1;
     w->v->node(w->ctx, &ev);
+    // Optionally hand over the word's own letters as child leaves, each with
+    // its own source span, so a drawing can unfold the word into them. rxedot
+    // never asks, so its output is untouched (and the ids these consume are
+    // never assigned for it either).
+    if (w->opts->letters) {
+        for (struct rxe_node *n = first; ; n = n->next) {
+            char csrc[64];
+            node_source(csrc, sizeof csrc, w, n);
+            int cid = w->idc++;
+            struct rxe_gnode_ev cev = { 0 };
+            cev.id = cid; cev.kind = RXE_G_LEAF; cev.line1 = csrc; cev.card = "1";
+            cev.on_path = onpath; cev.ref_to = -1;
+            w->v->node(w->ctx, &cev);
+            struct rxe_gedge_ev ce = { 0 };
+            ce.from = id; ce.from_port = -1; ce.to = cid; ce.on_path = onpath;
+            w->v->edge(w->ctx, &ce);
+            if (n == last) break;
+        }
+    }
     return id;
 }
 

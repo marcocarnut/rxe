@@ -100,8 +100,12 @@ struct rxe_graph_visitor {
 // full copy; unroll expands a fixed {k} into k bodies when k <= unroll; fold
 // runs a stretch of fixed characters into one literal word; on_path marks the
 // whole walk as lighting a path (the tree's curr pointers, set by a prior seek,
-// pick which branches stay lit).
-struct rxe_graph_opts { int collapse, unroll, fold, on_path; };
+// pick which branches stay lit). letters, on top of fold, also hands over each
+// folded word's own characters as child leaves, so a drawing can unfold 'cat'
+// into 'c' 'a' 't' -- each letter carrying its own source, which is why the
+// library does the splitting rather than the client (an escape like '\.' is one
+// letter, not two). Nothing emits them unless asked; rxedot leaves this off.
+struct rxe_graph_opts { int collapse, unroll, fold, on_path, letters; };
 
 // Walk 'rxe' (a root expression) and drive the visitor's callbacks. Node ids
 // are assigned from zero in traversal order; the root is node zero.
