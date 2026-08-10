@@ -79,6 +79,10 @@ Omit the title. The input regex is shown above the tree by default; with
 the index and member are shown too. This hides the regex line; the
 .B \-f
 line, when present, remains.
+.TP
+.B \-w
+Draw each fixed single character as its own leaf, rather than folding a run of
+them into one word node. Explicit, at the cost of width.
 .SH READING THE TREE
 .TP
 .B Cardinality
@@ -95,7 +99,9 @@ a literal character, a
 dictionary. A run of two or more fixed single characters is folded into one
 word node, so
 .B cat
-reads whole rather than as three boxes.
+reads whole rather than as three boxes; see
+.B \-w
+to draw them apart.
 .TP
 .B Alternation
 Several alternatives become one rounded record, a subsection per branch.
@@ -145,6 +151,18 @@ a leaf is reached with a single value; read it off.
 does exactly this and lights the route, so the two can be checked against each
 other. For a finite, place-value set the numbers and the path are exact; an
 infinite set is ordered by length instead of place value and is left unlit.
+.PP
+The numbers describe the natural place-value order only. A Feistel keyed
+permutation reorders members by an arithmetic they do not express:
+.BR rxenum (1)'s
+.B \-k
+has no counterpart here, so
+.BR rxedot 's
+index is always the unpermuted one, and a
+.B (?~key:re)
+shuffle within the tree is not followable by hand \(en though
+.BR \-f ,
+which performs the real seek, still reaches the right member across one.
 .SH EXAMPLES
 .TP
 .B rxedot '\ed{4}-\ed{2}-\ed{2}' | dot -Tsvg -o date.svg

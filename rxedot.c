@@ -81,6 +81,10 @@ static int g_unroll = 0;
 // Show the input regex as a title above the tree; on by default, off with -t.
 static int g_title = 1;
 
+// Fold a run of fixed single characters into one word node; on by default,
+// off with -w so each character is drawn as its own leaf.
+static int g_fold = 1;
+
 // Text safe inside a Graphviz HTML-like label: the few markup characters
 // become entities, and a control byte a numeric reference rather than a break.
 static void html_escape(FILE *f, const char *s) {
@@ -265,7 +269,7 @@ static void draw_seq(FILE *f, const char *from, struct rxe_alt *a, int onpath) {
     mpz_init(w);
     for (struct rxe_node *nd = a->head; nd; ) {
         int nid;
-        if (is_lit(nd) && is_lit(nd->next)) {
+        if (g_fold && is_lit(nd) && is_lit(nd->next)) {
             struct rxe_node *last = nd;
             while (is_lit(last->next)) last = last->next;
             nid = draw_literal_run(f, nd, last, onpath);
@@ -335,6 +339,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-e")) collapse = 0;   // force expanded
         else if (!strcmp(argv[i], "-u") && i + 1 < argc) g_unroll = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t")) g_title = 0;
+        else if (!strcmp(argv[i], "-w")) g_fold = 0;
         else pattern = argv[i];
     }
     if (!pattern) {
@@ -346,6 +351,8 @@ int main(int argc, char **argv) {
                         "  -u  unroll a fixed {k} repetition into k bodies when k<=n\n"
                         "        (default 0, none); rolled-up ones list their choices under -f.\n"
                         "  -t  omit the title (the regex, shown by default).\n"
+                        "  -w  draw each literal character as its own node, not\n"
+                        "        folded into a word.\n"
                         "  e.g. %s '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png\n",
                 argv[0], argv[0]);
         return 1;
