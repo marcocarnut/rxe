@@ -82,22 +82,22 @@ With no strings on the command line, rxerank reads them from standard input,
 one per line, and answers each in turn \(en so a file of candidates can be
 ranked in one pass.
 .SH WHAT RANK CAN AND CANNOT DO
-rxerank answers the finite sets: literals, classes, alternation, concatenation,
+rxerank answers every finite set: literals, classes, alternation, concatenation,
 subexpressions, fixed or bounded repetition
 .RB ( {m,n} ),
 the combinatorial choice
 .RB ( {{k}} " and " {{k!}} ),
 the keyed shuffle
-.RB ( (?~key:re) )
-and left-to-right ordering
-.RB ( (?L) ).
-A set it cannot yet rank it refuses by name rather than answer wrongly, with a
-line to standard error and exit status 2. Those are the infinite sets (anything
-with
+.RB ( (?~key:re) ),
+left-to-right ordering
+.RB ( (?L) )
+and backreferences. A set it cannot rank it refuses by name rather than answer
+wrongly, with a line to standard error and exit status 2 \(en which now means
+only the infinite sets, anything with
 .BR * ", " +
 or an open-ended
-.BR {n,} )
-and backreferences. So a lottery ticket can be ranked into its draw \(en
+.BR {n,} .
+So a lottery ticket can be ranked into its draw \(en
 .B rxerank '( 0[1-9]| [1-5][0-9]| 60){{6}}' ' 04 08 15 16 23 42'
 finds where one Mega-Sena game falls among the fifty million.
 .SH VERIFYING AGAINST RXENUM
@@ -132,6 +132,9 @@ Prints 4: the four ways the set spells the one string.
 .TP
 .B rxerank -a '(a|)(|a)' ''
 The indices at which the empty string is reached.
+.TP
+.B rxerank '(\ed{3})-\e1' 507-507
+Where a repeated-field code falls; the backreference must echo the group.
 .TP
 .B cut -f2 accounts.txt | rxerank -q '[a-z]{3,8}' ; echo $?
 Test a column of names for membership, silently, and read the verdict from the

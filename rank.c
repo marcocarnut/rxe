@@ -32,10 +32,11 @@
  * them without building any (so a count stays cheap and unbounded even when the
  * list would be astronomical).
  *
- * This is the finite, place-value case. An infinite set, a combinatorial
- * {{k}}, a (?~key:) shuffle, a backreference and left-to-right ordering are
- * refused up front by a scan, with a reason a front-end can print, rather than
- * answered wrongly. See rxe_rank_reason().
+ * This handles every finite set: alternation, concatenation, repetition, the
+ * combinatorial {{k}} and {{k!}} choices, the (?~key:) shuffle, left-to-right
+ * ordering and backreferences. Only an infinite set is refused up front by a
+ * scan, with a reason a front-end can print, rather than answered wrongly. See
+ * rxe_rank_reason().
  */
 
 #include <stdio.h>
@@ -56,7 +57,6 @@ static int scan(struct rxe *rxe)
     for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next) {
         if (alt->ninf) { g_reason = "infinite set"; return 1; }
         for (struct rxe_node *node = alt->head; node; node = node->next) {
-            if (node->is_backref) { g_reason = "backreference"; return 1; }
             if (node->is_inf)     { g_reason = "infinite subexpression"; return 1; }
             if (node->is_repeat && node->rep_max == RXE_REP_UNBOUNDED) {
                 g_reason = "unbounded repetition"; return 1;
@@ -108,6 +108,45 @@ static void place_before(mpz_t out, struct rxe_node *node)
         mpz_mul(out, out, c);
     }
     mpz_clear(c);
+}
+
+// Backref capture. A group records the substring it matched on the current path
+// so a later backreference can compare against it. That substring is the slice
+// of the input the group consumed -- the member it rendered is exactly the
+// bytes it produced -- so nothing is re-rendered and the group's own state is
+// left alone. Each match overwrites the last, so a repeated group's backref
+// binds to the final iteration, which is the one rxe's render leaves standing;
+// the previous value is saved and put back as the path unwinds. A backref adds
+// no index of its own, so none of this touches cardinality or place value.
+struct cap_save { const char *str; int len; int set; };
+static struct cap_save cap_push(struct rxe *g, const char *str, int len)
+{
+    struct cap_save old = { g->rank_cap, g->rank_cap_len, g->rank_cap_set };
+    g->rank_cap = str;
+    g->rank_cap_len = len;
+    g->rank_cap_set = 1;
+    return old;
+}
+static void cap_pop(struct rxe *g, struct cap_save old)
+{
+    g->rank_cap = old.str;
+    g->rank_cap_len = old.len;
+    g->rank_cap_set = old.set;
+}
+
+// Whether any backreference appears in the tree. A backref ties two positions
+// together, so the counting DP -- which assumes the nodes are independent --
+// cannot be used; such a set is counted by enumeration instead.
+static int has_backref(struct rxe *rxe)
+{
+    if (!rxe) return 0;
+    for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next)
+        for (struct rxe_node *node = alt->head; node; node = node->next) {
+            if (node->is_backref) return 1;
+            if (node->rxe && !node->is_backref && has_backref(node->rxe))
+                return 1;
+        }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -350,9 +389,10 @@ static void block_offset(mpz_t out, mpz_srcptr base, int mink, int k)
     mpz_clear(p);
 }
 
-// Continuation for one body match at a fixed end position q.
+// Continuation for one body match over [start, q).
 struct rep_ext {
-    struct rep_walk *w; int j; mpz_srcptr value; mpz_srcptr weight; int q;
+    struct rep_walk *w; int j; mpz_srcptr value; mpz_srcptr weight;
+    int start; int q;
 };
 static int rep_ext_sink(void *v, mpz_srcptr d)
 {
@@ -369,7 +409,12 @@ static int rep_ext_sink(void *v, mpz_srcptr d)
         mpz_add(nv, nv, d);
         mpz_set(nw, e->weight);               // weight unused, carried along
     }
+    // Bind a backref into this repeated group to the latest iteration's text,
+    // the one rxe's render leaves standing; each iteration overwrites the last.
+    struct cap_save sv = cap_push(e->w->node->rxe, e->w->s + e->start,
+                                  e->q - e->start);
     int stop = rep_go(e->w, e->q, e->j + 1, nv, nw);
+    cap_pop(e->w->node->rxe, sv);
     mpz_clear(nv);
     mpz_clear(nw);
     return stop;
@@ -392,7 +437,7 @@ static int rep_go(struct rep_walk *w, int p, int j,
     }
     if (j >= node->rep_max) return 0;
     for (int q = p; q <= w->len; q++) {
-        struct rep_ext e = { w, j, value, weight, q };
+        struct rep_ext e = { w, j, value, weight, p, q };
         if (enum_rxe(node->rxe, w->s + p, q - p, rep_ext_sink, &e)) return 1;
     }
     return 0;
@@ -401,6 +446,17 @@ static int rep_go(struct rep_walk *w, int p, int j,
 static int enum_node(struct rxe_node *node, const char *s, int off, int len,
                      int l2r, emit_fn emit, void *ectx)
 {
+    if (node->is_backref) {                   // must equal what its group matched
+        struct rxe *g = node->rxe;
+        int L = g->rank_cap_len;
+        if (!g->rank_cap_set) return 0;       // group not yet bound: no match
+        if (off + L > len || memcmp(g->rank_cap, s + off, L)) return 0;
+        mpz_t z;
+        mpz_init_set_ui(z, 0);                 // a backref carries no index
+        int stop = emit(ectx, z, off + L);
+        mpz_clear(z);
+        return stop;
+    }
     if (node->is_repeat) {
         struct rep_walk w = { node, s, len, l2r, node->rxe->nitems, emit, ectx };
         mpz_t z, one;
@@ -418,14 +474,21 @@ static int enum_node(struct rxe_node *node, const char *s, int off, int len,
     if (node->is_shuffle) {                   // a keyed group: remap the index
         for (int q = off; q <= len; q++) {
             struct shuf_bridge b = { emit, ectx, q, node->shuffle };
-            if (enum_rxe(node->rxe, s + off, q - off, shuf_sink, &b)) return 1;
+            struct cap_save sv = cap_push(node->rxe, s + off, q - off);
+            int stop = enum_rxe(node->rxe, s + off, q - off, shuf_sink, &b);
+            cap_pop(node->rxe, sv);
+            if (stop) return 1;
         }
         return 0;
     }
     if (node->rxe) {                          // a plain subexpression
         for (int q = off; q <= len; q++) {
             struct sub_bridge b = { emit, ectx, q };
-            if (enum_rxe(node->rxe, s + off, q - off, sub_sink, &b)) return 1;
+            // Record what this group matched over [off,q), for any backref to it.
+            struct cap_save sv = cap_push(node->rxe, s + off, q - off);
+            int stop = enum_rxe(node->rxe, s + off, q - off, sub_sink, &b);
+            cap_pop(node->rxe, sv);
+            if (stop) return 1;
         }
         return 0;
     }
@@ -697,10 +760,26 @@ int rxe_rank(struct rxe *rxe, const char *s, mpz_t out)
     return rc;
 }
 
+// Counting a set with a backreference by tallying the enumeration: the DP that
+// makes an ordinary count cheap assumes the nodes are independent, which a
+// backref breaks. A backref set is finite and usually spelt one way, so walking
+// it is affordable; it just is not the cap-free count the DP gives.
+static int tally_sink(const mpz_t idx, void *v)
+{
+    (void)idx;
+    mpz_add_ui((mpz_ptr)v, (mpz_ptr)v, 1);
+    return 0;
+}
+
 int rxe_rank_count(struct rxe *rxe, const char *s, mpz_t out)
 {
     g_reason = NULL;
     if (scan(rxe)) return -1;
+    if (has_backref(rxe)) {
+        mpz_set_ui(out, 0);
+        rxe_rank_all(rxe, s, tally_sink, out);
+        return 0;
+    }
     count_rxe(out, rxe, s, (int)strlen(s));
     return 0;
 }

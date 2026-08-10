@@ -63,6 +63,13 @@ FINITE = [
     r"(a|b|c|d){{2}}", r"(a|b|c){{2!}}", r"[a-e]{{3}}",
     r"(a|b|c|d){{1,3}}", r"(a|b|c){{*}}", r"(cat|dog|fish){{2!}}",
     r"x(a|b|c){{2}}y", r"(a|a|b){{2}}",
+    # backreferences: a \1 must equal what its group matched on the same path,
+    # which adds no index of its own. Includes a repeated group (bound to its
+    # last iteration), nested groups, a backref across an alternation, and a
+    # group with duplicate branches so one string is reached more than one way.
+    r"(a)\1", r"([ab])\1", r"([ab])([cd])\1\2", r"(a)(b)(c)\3\2\1",
+    r"(([ab])\2)\1", r"([ab]){2}\1", r"([ab]){3}\1", r"(x)([ab]){2}\1",
+    r"([ab])\1|([ab]){2}\2", r"(([ab])(c)){2}\2", r"(a|a)\1", r"(\d{2})-\1",
     # roman numerals, finite
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]
@@ -71,7 +78,7 @@ FINITE = [
 # guess. Each entry is a pattern and the substring its reason should contain.
 REFUSE = [
     (r"a*", "infinite"), (r"\d+", "infinite"), (r"a{2,}", "infinite"),
-    (r"(a)\1", "backreference"), (r"([ab])\1", "backreference"),
+    (r"[ab]*[cd]*", "infinite"), (r"(ab,)*", "infinite"),
 ]
 
 # A handful of strings that are not members, to confirm a clean miss.

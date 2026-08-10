@@ -449,6 +449,9 @@ struct rxe *rxe_new(void)
     rxe->brt = NULL;
     rxe->flags = 0;
     rxe->source = NULL;
+    rxe->rank_cap = NULL;
+    rxe->rank_cap_len = 0;
+    rxe->rank_cap_set = 0;
     mpz_init(rxe->nitems);
     mpz_init(rxe->index);
     rxe_lens_init(&rxe->lens);

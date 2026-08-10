@@ -246,6 +246,9 @@ struct rxe {
     int flags;                     // miscellaneous flags
     char *source;                  // a private copy of the input text, on the
                                   // root only, that node spans point into
+    const char *rank_cap;          // rank scratch: the substring this group
+    int   rank_cap_len;            // matched on the current path, for a later
+    int   rank_cap_set;            // backreference to compare against. See rank.c
 };
 
 extern void *(*rxe_mem_alloc)(size_t);
@@ -299,9 +302,9 @@ int rxe_seek(struct rxe *rxe, mpz_t pos);
 // and rxe_rank_all visits each in turn. The string must equal a member whole.
 //
 // rxe_rank returns 0 and sets out when the string is a member, 1 when it is
-// not, and -1 when the set is one rank cannot yet handle -- an infinite set, a
-// {{k}} choice, a (?~key:) shuffle, a backreference, or left-to-right order --
-// in which case rxe_rank_reason() names why. rxe_rank_count returns 0 on
+// not, and -1 when the set is one rank cannot handle -- which now means only an
+// infinite set -- in which case rxe_rank_reason() names why. Every finite set
+// is answered, backreferences and {{k}} choices included. rxe_rank_count returns 0 on
 // success or -1 on refusal. rxe_rank_all returns how many indices it emitted,
 // or -1 on refusal; its callback returns non-zero to stop early, which is how
 // a caller caps a listing that count told it would be huge.
