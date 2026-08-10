@@ -12,6 +12,13 @@ all: rxenum
 rxenum: rxenum.o librxe.a rxe.h
 	$(CC) rxenum.o -g -L. -lgmp -lm -lrxe -o rxenum
 
+# A sibling tool: draws the parse tree as Graphviz DOT. Not built by 'all'
+# since it is only useful with graphviz on hand; 'make rxedot' when wanted.
+rxedot: rxedot.o librxe.a rxe.h
+	$(CC) rxedot.o -g -L. -lgmp -lm -lrxe -o rxedot
+
+rxedot.o: rxedot.c rxe.h
+
 rxenum.o: rxenum.c rxe.h
 
 rxe.o: rxe.c rxe.h parse.h repeat.h pair.h lens.h
