@@ -162,40 +162,53 @@ static int draw_literal_run(FILE *f, struct rxe_node *first,
     return id;
 }
 
-// Hang the alternations of `rxe` under the box `parent`. A single alternation
-// is just a concatenation, drawn straight under it; several become a fan of
-// diamonds, each showing where in the numbering it starts.
+// Draw one alternative's concatenation, hanging from `from` (a node id, or a
+// node:port when it comes off an alternation subsection), folding literal runs.
+static void draw_seq(FILE *f, const char *from, struct rxe_alt *a) {
+    for (struct rxe_node *nd = a->head; nd; ) {
+        int nid;
+        if (is_lit(nd) && is_lit(nd->next)) {
+            struct rxe_node *last = nd;
+            while (is_lit(last->next)) last = last->next;
+            nid = draw_literal_run(f, nd, last);
+            nd = last->next;
+        } else {
+            nid = draw_node(f, nd);
+            nd = nd->next;
+        }
+        fprintf(f, "  %s -> n%d;\n", from, nid);
+    }
+}
+
+// Hang the alternations of `rxe` under `parent`. One alternative is a plain
+// concatenation drawn straight under it. Several become a single rounded record
+// -- one subsection per alternative, each labelled with where it starts in the
+// numbering and, after a '+', how many it holds. The alternatives lie end to
+// end, so a subsection's start plus its size is exactly the next one's start:
+// that is how you pick a branch when seeking to an index. Each subsection is a
+// port the branch hangs from.
 static void draw_contents(FILE *f, int parent, struct rxe *rxe) {
     map_put(rxe, parent);
-    int single = (rxe->nalts <= 1);
-    for (struct rxe_alt *a = rxe->head; a; a = a->next) {
-        int p = parent;
-        if (!single) {
-            int aid = idc++;
-            char card[64], start[64], label[160];
-            numshort(card, sizeof card, a->nitems, a->ninf > 0);
-            numshort(start, sizeof start, a->start, 0);
-            snprintf(label, sizeof label, "|\nstart %s\n%s", start, card);
-            fprintf(f, "  n%d [shape=diamond, fillcolor=\"#fff0c0\", label=\"", aid);
-            dot_escape(f, label);
-            fprintf(f, "\"];\n  n%d -> n%d;\n", parent, aid);
-            p = aid;
-        }
-        for (struct rxe_node *nd = a->head; nd; ) {
-            int nid;
-            // Fold a run of two or more adjacent literals into one word node;
-            // draw anything else, and a lone literal, on its own.
-            if (is_lit(nd) && is_lit(nd->next)) {
-                struct rxe_node *last = nd;
-                while (is_lit(last->next)) last = last->next;
-                nid = draw_literal_run(f, nd, last);
-                nd = last->next;
-            } else {
-                nid = draw_node(f, nd);
-                nd = nd->next;
-            }
-            fprintf(f, "  n%d -> n%d;\n", p, nid);
-        }
+    if (rxe->nalts <= 1) {
+        char from[24];
+        snprintf(from, sizeof from, "n%d", parent);
+        if (rxe->head) draw_seq(f, from, rxe->head);
+        return;
+    }
+    int aid = idc++, k = 0;
+    fprintf(f, "  n%d [shape=Mrecord, fillcolor=\"#fff0c0\", label=\"", aid);
+    for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
+        char start[64], card[64];
+        numshort(start, sizeof start, a->start, 0);
+        numshort(card, sizeof card, a->nitems, a->ninf > 0);
+        fprintf(f, "%s<p%d>%s\\n+%s", k ? "|" : "", k, start, card);
+    }
+    fprintf(f, "\"];\n  n%d -> n%d;\n", parent, aid);
+    k = 0;
+    for (struct rxe_alt *a = rxe->head; a; a = a->next, k++) {
+        char from[32];
+        snprintf(from, sizeof from, "n%d:p%d", aid, k);
+        draw_seq(f, from, a);
     }
 }
 
