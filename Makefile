@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c
-HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c graph.c
+HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h rxe_graph.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -17,7 +17,7 @@ rxenum: rxenum.o librxe.a rxe.h
 rxedot: rxedot.o librxe.a rxe.h
 	$(CC) rxedot.o -g -L. -lgmp -lm -lrxe -o rxedot
 
-rxedot.o: rxedot.c rxe.h
+rxedot.o: rxedot.c rxe.h rxe_graph.h
 
 # A sibling tool: rank, the inverse of rxenum -- given a string, print the
 # index (or indices) at which it sits in the set. Not built by 'all'.
@@ -51,8 +51,10 @@ dict.o: dict.c dict.h rxe.h
 
 rank.o: rank.c rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o
+graph.o: graph.c rxe.h rxe_graph.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
