@@ -72,6 +72,28 @@ static const char *g_source;
 // Draw a (?N) subroutine as a reference back to its group (compact), or in
 // full (clearer when following a path, since each call goes its own way).
 static int g_collapse = 1;
+
+// Unroll a fixed {n} repetition into n copies of its body when n is at most
+// this; 0 (the default) never unrolls. A repetition left rolled up still lists
+// what each iteration chose, under -f, so nothing is lost -- just compact.
+static int g_unroll = 0;
+
+// The pieces a fixed repetition's iterations produced under -f, space-joined
+// and capped, read from the seeked tree by pointing the body at each stored
+// index in turn.
+static void repeat_choices(struct rxe_node *node, char *b, size_t n) {
+    b[0] = 0;
+    size_t p = 0;
+    for (int i = 0; i < node->rep_count && i < 24; i++) {
+        char piece[128];
+        rxe_seek(node->rxe, node->rep_digit[i]);
+        rxe_current(piece, sizeof piece - 1, node->rxe);
+        p += snprintf(b + p, p < n ? n - p : 0, "%s%s", i ? " " : "→ ", piece);
+        if (p >= n - 12) break;
+    }
+    if (node->rep_count > 24 && p < n - 3)
+        snprintf(b + p, n - p, " …");
+}
 static void node_source(char *b, size_t n, struct rxe_node *node) {
     int a = node->src_start, e = node->src_end;
     if (!g_source || e <= a || a < 0) { b[0] = 0; return; }
@@ -93,9 +115,11 @@ static void draw_contents(FILE *f, int parent, struct rxe *rxe, int onpath);
 static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
                      int onpath) {
     int id = idc++;
-    char kind[256], card[64], label[400], src[220];
+    char kind[256], card[64], label[600], src[220];
     const char *fill = "#ffffff";
-    int inf = node->is_inf, recurse = 0, refedge = -1;
+    int inf = node->is_inf, recurse = 0, refedge = -1, unroll = 0;
+    char choices[200];
+    choices[0] = 0;
     node_source(src, sizeof src, node);
     int have_src = src[0] != 0;
 
@@ -116,7 +140,19 @@ static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
         else if (node->rep_min == node->rep_max)
             snprintf(kind, sizeof kind, "repeat {%d}", node->rep_min);
         else snprintf(kind, sizeof kind, "repeat {%d,%d}", node->rep_min, node->rep_max);
-        fill = "#d4e4ff"; recurse = 1;
+        fill = "#d4e4ff";
+        // A fixed run short enough is unrolled into a copy of the body per
+        // iteration; otherwise the body is drawn once, and -f still lists what
+        // each iteration chose beside it.
+        int fixed = !node->is_inf && node->rep_max != RXE_REP_UNBOUNDED
+                    && node->rep_min == node->rep_max;
+        if (fixed && node->rep_max >= 1 && node->rep_max <= g_unroll)
+            unroll = node->rep_max;
+        else {
+            recurse = 1;
+            if (onpath && fixed && node->rep_count >= 1)
+                repeat_choices(node, choices, sizeof choices);
+        }
     }
     else if (node->is_comb) {
         const char *verb = node->comb_perm ? "permute" : "choose";
@@ -133,10 +169,11 @@ static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
     else { snprintf(kind, sizeof kind, "%s", have_src ? src : "?"); fill = "#ffffff"; }
 
     numshort(card, sizeof card, node->nitems, inf);
-    // The weight is this digit's place value in its concatenation: how far the
-    // index moves when it ticks over. Shown only when it carries (> 1).
-    if (weight) snprintf(label, sizeof label, "%s\n%s\n%s", kind, card, weight);
-    else        snprintf(label, sizeof label, "%s\n%s", kind, card);
+    // type, then size, then the place value where it carries, then -- for a
+    // rolled-up repeat under -f -- what each iteration chose.
+    size_t lp = snprintf(label, sizeof label, "%s\n%s", kind, card);
+    if (weight)     lp += snprintf(label + lp, sizeof label - lp, "\n%s", weight);
+    if (choices[0]) lp += snprintf(label + lp, sizeof label - lp, "\n%s", choices);
     fprintf(f, "  n%d [label=\"", id);
     dot_escape(f, label);
     // On the path, a red border wins over the blue-ringed infinite mark.
@@ -144,7 +181,16 @@ static int draw_node(FILE *f, struct rxe_node *node, const char *weight,
             onpath ? ", color=\"" HL "\", penwidth=2.4" :
             inf    ? ", color=\"#2f60c0\", penwidth=2" : "");
 
-    if (recurse && node->rxe) draw_contents(f, id, node->rxe, onpath);
+    if (unroll) {
+        // One copy of the body per iteration; under -f each is pointed at the
+        // index that iteration took, so it lights its own values.
+        for (int i = 0; i < unroll; i++) {
+            if (onpath && i < node->rep_count) rxe_seek(node->rxe, node->rep_digit[i]);
+            draw_contents(f, id, node->rxe, onpath);
+        }
+    } else if (recurse && node->rxe) {
+        draw_contents(f, id, node->rxe, onpath);
+    }
     if (refedge >= 0)
         fprintf(f, "  n%d -> n%d [style=dashed, constraint=false, "
                    "color=\"#c07000\", arrowsize=0.6];\n", id, refedge);
@@ -270,14 +316,17 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-f") && i + 1 < argc) findex = argv[++i];
         else if (!strcmp(argv[i], "-c")) collapse = 1;   // force compact
         else if (!strcmp(argv[i], "-e")) collapse = 0;   // force expanded
+        else if (!strcmp(argv[i], "-u") && i + 1 < argc) g_unroll = atoi(argv[++i]);
         else pattern = argv[i];
     }
     if (!pattern) {
-        fprintf(stderr, "usage: %s [-f index] [-c|-e] <regex>\n"
+        fprintf(stderr, "usage: %s [-f index] [-c|-e] [-u n] <regex>\n"
                         "  prints Graphviz DOT of the parse tree on stdout.\n"
                         "  -f lights the path taken to reach one member.\n"
                         "  -c/-e collapse a (?N) subroutine to a reference, or draw\n"
                         "        it in full; default is collapsed, but expanded with -f.\n"
+                        "  -u  unroll a fixed {k} repetition into k bodies when k<=n\n"
+                        "        (default 0, none); rolled-up ones list their choices under -f.\n"
                         "  e.g. %s '([2-9TJQKA][SHDC]){{5}}' | dot -Tpng -o hand.png\n",
                 argv[0], argv[0]);
         return 1;
