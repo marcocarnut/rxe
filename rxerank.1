@@ -1,0 +1,141 @@
+.TH RXERANK 1 "Aug 2026" Linux "User Manuals"
+.SH NAME
+rxerank \- find where a string sits in the set a regular expression describes
+.SH SYNOPSIS
+.B rxerank
+[\fIoptions\fR]
+.I regex
+[\fIstring\fR ...]
+.SH DESCRIPTION
+.B rxerank
+is the inverse of
+.BR rxenum (1).
+Where rxenum turns an index into the member of the set that sits at it,
+rxerank turns a member back into the index it sits at \(en rank, the inverse
+of seek. Given the
+.I regex
+and one or more strings, it prints, for each, the number rxenum would need to
+reach it:
+.PP
+.RS
+.B rxerank '[0-9A-Za-z]{8}' passw0rd
+.RE
+.PP
+The match is anchored and whole: the string has to equal a member exactly, not
+merely begin one. A string that is no member of the set prints nothing and
+sets the exit status; see EXIT STATUS.
+.PP
+The index is numbered as
+.BR rxenum 's
+is: from one by default, from zero under
+.BR \-z .
+So the number rxerank prints for a string is the one
+.B rxenum \-f
+takes to print that string back.
+.SH DUPLICATES
+A set can hold the same member more than once. A class written
+.BR [aa] ,
+an alternation whose branches overlap such as
+.BR "(ab|a)(b|bc)" ,
+or two spellings that meet at the empty string as in
+.BR "(a|)(|a)" ,
+all reach one string by more than one path. rxerank is a bijection at the index
+level \(en every index is one member \(en but not at the string level, so it is
+many-valued, and the modes below choose what to do about that.
+.TP
+.B \-a
+List every index the string reaches, one per line, in place of just the first.
+When more than one string is given each line is tagged with its string, so the
+answers stay apart.
+.TP
+.B \-c
+Print how many indices the string reaches rather than the indices themselves.
+A count above one is a proof of duplication. The count is exact and costs
+nothing to be large: it is tallied without any index being built, so a string
+reached four billion ways is counted as fast as one reached once. Run it before
+.B \-a
+on a set you do not trust, to learn whether the list would be endless.
+.TP
+.B \-q
+Quiet. Print nothing; let the exit status alone report membership. Useful as a
+test in a script.
+.PP
+With no mode flag, rxerank prints one line per string: the least of the indices
+that string reaches, which for a member that appears once is simply its index.
+.SH OPTIONS
+.TP
+.B \-i
+Caseless. Parse the regex as
+.B rxenum \-i
+would, so the set is the same one being ranked into.
+.TP
+.B \-s
+Dot matches a newline too, as
+.BR rxenum \-s .
+.TP
+.B \-z
+Number from zero, matching
+.BR "rxenum \-z" .
+The default is from one.
+.PP
+With no strings on the command line, rxerank reads them from standard input,
+one per line, and answers each in turn \(en so a file of candidates can be
+ranked in one pass.
+.SH WHAT RANK CAN AND CANNOT DO
+rxerank answers the finite, place-value sets: literals, classes, alternation,
+concatenation, subexpressions and fixed or bounded repetition
+.RB ( {m,n} ).
+A set it cannot yet rank it refuses by name rather than answer wrongly, with a
+line to standard error and exit status 2. Those are the infinite sets (anything
+with
+.BR * ", " +
+or an open-ended
+.BR {n,} ),
+the combinatorial choice
+.BR {{k}} ,
+the keyed shuffle
+.BR (?~key:re) ,
+a backreference, and left-to-right ordering
+.RB ( (?L) ).
+The plain, much the commonest, cases are all in.
+.SH VERIFYING AGAINST RXENUM
+rank and seek are inverses, which is easy to check by hand:
+.PP
+.RS
+.B rxenum \-f 124 '[0-9]{3}'   \(->  123
+.br
+.B rxerank '[0-9]{3}' 123      \(->  124
+.RE
+.PP
+Over a whole finite set the indices rxerank returns, gathered across every
+member, are a permutation of the numbers rxenum would enumerate: each reached
+once, none missed, none invented.
+.SH EXIT STATUS
+.TP
+.B 0
+Every string given was a member.
+.TP
+.B 1
+At least one string was not a member of the set.
+.TP
+.B 2
+The set is one rank cannot handle; standard error names why.
+.SH EXAMPLES
+.TP
+.B rxerank '\ed{4}-\ed{2}-\ed{2}' 2024-03-15
+Where a given date falls in the space of all such dates.
+.TP
+.B rxerank -c '(a|a)(b|b)' ab
+Prints 4: the four ways the set spells the one string.
+.TP
+.B rxerank -a '(a|)(|a)' ''
+The indices at which the empty string is reached.
+.TP
+.B cut -f2 accounts.txt | rxerank -q '[a-z]{3,8}' ; echo $?
+Test a column of names for membership, silently, and read the verdict from the
+exit status.
+.SH SEE ALSO
+.BR rxenum (1),
+.BR rxedot (1)
+.SH LICENSE
+Free software under the GNU General Public License, version 2 or later.

@@ -292,6 +292,25 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);
 int rxe_seek(struct rxe *rxe, mpz_t pos);
 
+// rank -- the inverse of seek. Given a string, find where it sits in the set.
+// A member can appear at more than one index (a set may hold duplicates), so
+// rank is many-valued: rxe_rank returns the smallest index the string reaches,
+// rxe_rank_count how many it reaches (a count above one proves a duplicate),
+// and rxe_rank_all visits each in turn. The string must equal a member whole.
+//
+// rxe_rank returns 0 and sets out when the string is a member, 1 when it is
+// not, and -1 when the set is one rank cannot yet handle -- an infinite set, a
+// {{k}} choice, a (?~key:) shuffle, a backreference, or left-to-right order --
+// in which case rxe_rank_reason() names why. rxe_rank_count returns 0 on
+// success or -1 on refusal. rxe_rank_all returns how many indices it emitted,
+// or -1 on refusal; its callback returns non-zero to stop early, which is how
+// a caller caps a listing that count told it would be huge.
+typedef int (*rxe_rank_cb)(const mpz_t index, void *ctx);
+int  rxe_rank(struct rxe *rxe, const char *s, mpz_t out);
+int  rxe_rank_count(struct rxe *rxe, const char *s, mpz_t out);
+long rxe_rank_all(struct rxe *rxe, const char *s, rxe_rank_cb cb, void *ctx);
+const char *rxe_rank_reason(void);
+
 void rxe_init(void);
 struct rxe *rxe_new(void);
 void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node);

@@ -5,5 +5,7 @@ rxenum
 rxenum-asan
 rxedot
 rxedot-asan
+rxerank
+rxerank-asan
 tests/api
 tests/api-asan

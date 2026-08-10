@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c
 HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -18,6 +18,13 @@ rxedot: rxedot.o librxe.a rxe.h
 	$(CC) rxedot.o -g -L. -lgmp -lm -lrxe -o rxedot
 
 rxedot.o: rxedot.c rxe.h
+
+# A sibling tool: rank, the inverse of rxenum -- given a string, print the
+# index (or indices) at which it sits in the set. Not built by 'all'.
+rxerank: rxerank.o librxe.a rxe.h
+	$(CC) rxerank.o -g -L. -lgmp -lm -lrxe -o rxerank
+
+rxerank.o: rxerank.c rxe.h
 
 rxenum.o: rxenum.c rxe.h
 
@@ -42,17 +49,19 @@ lens.o: lens.c lens.h repeat.h rxe_alt.h rxe.h
 
 dict.o: dict.c dict.h rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o
+rank.o: rank.c rxe.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
 
-test: rxenum tests/api
+test: rxenum rxerank tests/api
 	sh tests/run.sh
 	./tests/api
 	@if command -v python3 >/dev/null 2>&1; then \
-	    python3 tests/oracle.py && python3 tests/shortlex.py; \
+	    python3 tests/oracle.py && python3 tests/shortlex.py && python3 tests/rank.py; \
 	else \
 	    echo "oracle: skipped, python3 not found"; \
 	fi
@@ -66,16 +75,22 @@ tests/api-asan: tests/api.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 	$(CC) $(WARNFLAGS) $(SANFLAGS) -I. tests/api.c \
 	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o tests/api-asan
 
-test-asan: rxenum-asan tests/api-asan
+rxerank-asan: rxerank.c $(filter-out rxenum.c,$(SRC)) $(HDR)
+	$(CC) $(WARNFLAGS) $(SANFLAGS) rxerank.c \
+	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxerank-asan
+
+test-asan: rxenum-asan rxerank-asan tests/api-asan
 	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
 	ASAN_OPTIONS=detect_leaks=1 ./tests/api-asan
 	@if command -v python3 >/dev/null 2>&1; then \
 	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/oracle.py && \
-	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/shortlex.py; \
+	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan python3 tests/shortlex.py && \
+	    ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan RXERANK=./rxerank-asan \
+	        python3 tests/rank.py; \
 	fi
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan tests/api tests/api-asan
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxerank rxerank-asan tests/api tests/api-asan
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
