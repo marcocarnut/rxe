@@ -53,10 +53,6 @@ static const char *g_reason;
 static int scan(struct rxe *rxe)
 {
     if (!rxe) { g_reason = "null expression"; return 1; }
-    if (rxe->flags & RXE_FLAG_LEFT_TO_RIGHT) {
-        g_reason = "left-to-right ordering";
-        return 1;
-    }
     for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next) {
         if (alt->ninf) { g_reason = "infinite set"; return 1; }
         for (struct rxe_node *node = alt->head; node; node = node->next) {
@@ -93,6 +89,21 @@ static void place_after(mpz_t out, struct rxe_node *node)
     mpz_init(c);
     mpz_set_ui(out, 1);
     for (struct rxe_node *m = node->next; m; m = m->next) {
+        if (m->is_backref) continue;
+        node_card(c, m);
+        mpz_mul(out, out, c);
+    }
+    mpz_clear(c);
+}
+
+// Under (?L) the head is the least significant node instead of the tail, so a
+// node's place value is the product of those before it rather than after.
+static void place_before(mpz_t out, struct rxe_node *node)
+{
+    mpz_t c;
+    mpz_init(c);
+    mpz_set_ui(out, 1);
+    for (struct rxe_node *m = node->prev; m; m = m->prev) {
         if (m->is_backref) continue;
         node_card(c, m);
         mpz_mul(out, out, c);
@@ -238,6 +249,7 @@ struct seq_cont {
     struct rxe_node *node;
     const char *s;
     int len;
+    int l2r;
     mpz_ptr acc;
     mpz_ptr place;
     rank_sink sink;
@@ -245,7 +257,7 @@ struct seq_cont {
 };
 
 static int enum_seq(struct rxe_node *node, const char *s, int off, int len,
-                    mpz_ptr acc, rank_sink sink, void *ctx);
+                    int l2r, mpz_ptr acc, rank_sink sink, void *ctx);
 
 static int seq_emit(void *v, mpz_srcptr d, int q)
 {
@@ -254,7 +266,8 @@ static int seq_emit(void *v, mpz_srcptr d, int q)
     mpz_init(acc2);
     mpz_mul(acc2, d, c->place);               // index += d * placevalue
     mpz_add(acc2, acc2, c->acc);
-    int stop = enum_seq(c->node->next, c->s, q, c->len, acc2, c->sink, c->ctx);
+    int stop = enum_seq(c->node->next, c->s, q, c->len, c->l2r, acc2,
+                        c->sink, c->ctx);
     mpz_clear(acc2);
     return stop;
 }
@@ -284,20 +297,23 @@ static int shuf_sink(void *v, mpz_srcptr u)
 }
 
 // --- repetition. Walk the body 0..k times, building the block-and-digit index
-// seek decodes. value accumulates the body digits most significant first
-// (value = value*base + d), placing the last body least significant, as the
-// default right-to-left odometer does. Wherever the count is within range, a
-// run ending there is a valid match.
+// seek decodes. By default the last body is the least significant digit, so
+// value accumulates most significant first (value = value*base + d); under
+// (?L) the first body is least significant, so each body is added at a running
+// weight instead (value += d*weight, weight *= base). Wherever the count is
+// within range, a run ending there is a valid match.
 struct rep_walk {
     struct rxe_node *node;
     const char *s;
     int len;
+    int l2r;
     mpz_srcptr base;                          // body cardinality
     emit_fn emit;
     void *ectx;
 };
 
-static int rep_go(struct rep_walk *w, int p, int j, mpz_srcptr value);
+static int rep_go(struct rep_walk *w, int p, int j,
+                  mpz_srcptr value, mpz_srcptr weight);
 
 // Sum of base^m for m in [mink, k): the indices the shorter runs occupy before
 // this one.
@@ -315,20 +331,32 @@ static void block_offset(mpz_t out, mpz_srcptr base, int mink, int k)
 }
 
 // Continuation for one body match at a fixed end position q.
-struct rep_ext { struct rep_walk *w; int j; mpz_srcptr value; int q; };
+struct rep_ext {
+    struct rep_walk *w; int j; mpz_srcptr value; mpz_srcptr weight; int q;
+};
 static int rep_ext_sink(void *v, mpz_srcptr d)
 {
     struct rep_ext *e = v;
-    mpz_t nv;
+    mpz_t nv, nw;
     mpz_init(nv);
-    mpz_mul(nv, e->value, e->w->base);        // value = value*base + d
-    mpz_add(nv, nv, d);
-    int stop = rep_go(e->w, e->q, e->j + 1, nv);
+    mpz_init(nw);
+    if (e->w->l2r) {
+        mpz_mul(nv, d, e->weight);            // value += d * weight
+        mpz_add(nv, nv, e->value);
+        mpz_mul(nw, e->weight, e->w->base);   // weight *= base
+    } else {
+        mpz_mul(nv, e->value, e->w->base);    // value = value*base + d
+        mpz_add(nv, nv, d);
+        mpz_set(nw, e->weight);               // weight unused, carried along
+    }
+    int stop = rep_go(e->w, e->q, e->j + 1, nv, nw);
     mpz_clear(nv);
+    mpz_clear(nw);
     return stop;
 }
 
-static int rep_go(struct rep_walk *w, int p, int j, mpz_srcptr value)
+static int rep_go(struct rep_walk *w, int p, int j,
+                  mpz_srcptr value, mpz_srcptr weight)
 {
     struct rxe_node *node = w->node;
     if (j >= node->rep_min && j <= node->rep_max) {
@@ -344,21 +372,23 @@ static int rep_go(struct rep_walk *w, int p, int j, mpz_srcptr value)
     }
     if (j >= node->rep_max) return 0;
     for (int q = p; q <= w->len; q++) {
-        struct rep_ext e = { w, j, value, q };
+        struct rep_ext e = { w, j, value, weight, q };
         if (enum_rxe(node->rxe, w->s + p, q - p, rep_ext_sink, &e)) return 1;
     }
     return 0;
 }
 
 static int enum_node(struct rxe_node *node, const char *s, int off, int len,
-                     emit_fn emit, void *ectx)
+                     int l2r, emit_fn emit, void *ectx)
 {
     if (node->is_repeat) {
-        struct rep_walk w = { node, s, len, node->rxe->nitems, emit, ectx };
-        mpz_t z;
+        struct rep_walk w = { node, s, len, l2r, node->rxe->nitems, emit, ectx };
+        mpz_t z, one;
         mpz_init_set_ui(z, 0);
-        int stop = rep_go(&w, off, 0, z);
+        mpz_init_set_ui(one, 1);              // the first body's weight, under (?L)
+        int stop = rep_go(&w, off, 0, z, one);
         mpz_clear(z);
+        mpz_clear(one);
         return stop;
     }
     if (node->is_shuffle) {                   // a keyed group: remap the index
@@ -409,14 +439,15 @@ static int enum_node(struct rxe_node *node, const char *s, int off, int len,
 }
 
 static int enum_seq(struct rxe_node *node, const char *s, int off, int len,
-                    mpz_ptr acc, rank_sink sink, void *ctx)
+                    int l2r, mpz_ptr acc, rank_sink sink, void *ctx)
 {
     if (!node) return off == len ? sink(ctx, acc) : 0;
     mpz_t place;
     mpz_init(place);
-    place_after(place, node);
-    struct seq_cont c = { node, s, len, acc, place, sink, ctx };
-    int stop = enum_node(node, s, off, len, seq_emit, &c);
+    if (l2r) place_before(place, node);
+    else     place_after(place, node);
+    struct seq_cont c = { node, s, len, l2r, acc, place, sink, ctx };
+    int stop = enum_node(node, s, off, len, l2r, seq_emit, &c);
     mpz_clear(place);
     return stop;
 }
@@ -425,12 +456,13 @@ static int enum_rxe(struct rxe *rxe, const char *s, int len,
                     rank_sink sink, void *ctx)
 {
     if (!rxe) return 0;
+    int l2r = (rxe->flags & RXE_FLAG_LEFT_TO_RIGHT) != 0;
     for (struct rxe_alt *alt = rxe->head; alt; alt = alt->next) {
         if (alt->ninf) continue;
         if (!mpz_sgn(alt->nitems)) continue;
         mpz_t acc;
         mpz_init_set(acc, alt->start);
-        int stop = enum_seq(alt->head, s, 0, len, acc, sink, ctx);
+        int stop = enum_seq(alt->head, s, 0, len, l2r, acc, sink, ctx);
         mpz_clear(acc);
         if (stop) return 1;
     }

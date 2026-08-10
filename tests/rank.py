@@ -52,6 +52,10 @@ FINITE = [
     # holds duplicates, so the remap and the duplication compose.
     r"(?~key:[0-9])", r"(?~secret:[a-c]{2})", r"(?~:M{0,3})",
     r"(?~x:(a|a))", r"(?~k:(a|ab)(b|))",
+    # (?L) makes the head the least significant node instead of the tail, so
+    # rank must weight the concatenation and the repeat from the other end.
+    r"(?L)[a-c][0-9]", r"(?L)(a|b)(c|d)(e|f)", r"(?L)[ab]{3}",
+    r"(?L)(ab|cd){2}", r"(?L)(a|a)(b|b)",
     # roman numerals, finite
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
 ]

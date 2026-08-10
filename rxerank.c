@@ -90,7 +90,7 @@ static int rank_one(struct rxe *rxe, const char *s, int mode)
 int main(int argc, char **argv)
 {
     if (argc < 2)
-        die("Usage: rxerank [-is] [-z] [-a|-c|-q] <regex> [string ...]\n"
+        die("Usage: rxerank [-isL] [-z] [-a|-c|-q] <regex> [string ...]\n"
             "  -a  list every index the string reaches (duplicates included)\n"
             "  -c  print how many indices it reaches (>1 means a duplicate)\n"
             "  -q  quiet: no output, exit status is membership\n"
@@ -99,12 +99,13 @@ int main(int argc, char **argv)
 
     int flags = 0, mode = MODE_FIRST, nmode = 0;
     for (;;) {
-        int o = getopt(argc, argv, "iszacq");
+        int o = getopt(argc, argv, "isLzacq");
         if (o < 0) break;
         switch (o) {
-            case 'i': flags |= RXE_CASELESS; break;
-            case 's': flags |= RXE_DOTALL;   break;
-            case 'z': g_offset = 0;          break;
+            case 'i': flags |= RXE_CASELESS;      break;
+            case 's': flags |= RXE_DOTALL;        break;
+            case 'L': flags |= RXE_LEFT_TO_RIGHT; break;
+            case 'z': g_offset = 0;               break;
             case 'a': mode = MODE_ALL;   nmode++; break;
             case 'c': mode = MODE_COUNT; nmode++; break;
             case 'q': mode = MODE_QUIET; nmode++; break;
