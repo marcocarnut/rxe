@@ -1,0 +1,22 @@
+digraph rxe {
+  graph [rankdir=TB, ordering=out, bgcolor="#ffffff", fontname="Helvetica"];
+  node [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=11, margin="0.10,0.05"];
+  edge [arrowsize=0.7, color="#888888"];
+  n0 [shape=box, fillcolor="#333a44", fontcolor="white", style="filled,rounded", label="set\n100000000"];
+  n1 [label="repeat {4}\n10000\n×10000", fillcolor="#d4e4ff"];
+  n2 [label="\\d\n10", fillcolor="#ffffff"];
+  n1 -> n2;
+  n0 -> n1;
+  n3 [label="-\n1", fillcolor="#ffffff"];
+  n0 -> n3;
+  n4 [label="repeat {2}\n100\n×100", fillcolor="#d4e4ff"];
+  n5 [label="\\d\n10", fillcolor="#ffffff"];
+  n4 -> n5;
+  n0 -> n4;
+  n6 [label="-\n1", fillcolor="#ffffff"];
+  n0 -> n6;
+  n7 [label="repeat {2}\n100", fillcolor="#d4e4ff"];
+  n8 [label="\\d\n10", fillcolor="#ffffff"];
+  n7 -> n8;
+  n0 -> n7;
+}

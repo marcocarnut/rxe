@@ -1,0 +1,25 @@
+digraph rxe {
+  graph [rankdir=TB, ordering=out, bgcolor="#ffffff", fontname="Helvetica"];
+  node [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=11, margin="0.10,0.05"];
+  edge [arrowsize=0.7, color="#888888"];
+  labelloc="t"; label=<<FONT FACE="Courier" POINT-SIZE="15">((a|b)(c|d)){2}</FONT>>;
+  n0 [shape=box, fillcolor="#333a44", fontcolor="white", style="filled,rounded", label="set\n16"];
+  n1 [label="repeat {2}\n16", fillcolor="#d4e4ff"];
+  n2 [label="( )\n2\n×2", fillcolor="#eeeeee"];
+  n3 [shape=Mrecord, fillcolor="#fff0c0", label="<p0>0\n+1|<p1>1\n+1"];
+  n2 -> n3;
+  n4 [label="a\n1", fillcolor="#ffffff"];
+  n3:p0 -> n4;
+  n5 [label="b\n1", fillcolor="#ffffff"];
+  n3:p1 -> n5;
+  n1 -> n2;
+  n6 [label="( )\n2", fillcolor="#eeeeee"];
+  n7 [shape=Mrecord, fillcolor="#fff0c0", label="<p0>0\n+1|<p1>1\n+1"];
+  n6 -> n7;
+  n8 [label="c\n1", fillcolor="#ffffff"];
+  n7:p0 -> n8;
+  n9 [label="d\n1", fillcolor="#ffffff"];
+  n7:p1 -> n9;
+  n1 -> n6;
+  n0 -> n1;
+}

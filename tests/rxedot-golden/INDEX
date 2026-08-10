@@ -1,0 +1,70 @@
+3b549c0aaa22 :: rxedot  \[a-z\]\{4\}
+3b549c0aaa22 :: rxedot -c \[a-z\]\{4\}
+3b549c0aaa22 :: rxedot -e \[a-z\]\{4\}
+3b549c0aaa22 :: rxedot -w \[a-z\]\{4\}
+3b549c0aaa22 :: rxedot -u 3 \[a-z\]\{4\}
+d899cda1571c :: rxedot -t \[a-z\]\{4\}
+47e192c379c4 :: rxedot -f 5 \[a-z\]\{4\}
+4d828ebac140 :: rxedot  \\d\{4\}-\\d\{2\}-\\d\{2\}
+4d828ebac140 :: rxedot -c \\d\{4\}-\\d\{2\}-\\d\{2\}
+4d828ebac140 :: rxedot -e \\d\{4\}-\\d\{2\}-\\d\{2\}
+4d828ebac140 :: rxedot -w \\d\{4\}-\\d\{2\}-\\d\{2\}
+fa8f72da939a :: rxedot -u 3 \\d\{4\}-\\d\{2\}-\\d\{2\}
+e43e56b7c070 :: rxedot -t \\d\{4\}-\\d\{2\}-\\d\{2\}
+15a57d5fd949 :: rxedot -f 5 \\d\{4\}-\\d\{2\}-\\d\{2\}
+973bd25c0b9a :: rxedot  \(cat\|dog\|fish\)
+973bd25c0b9a :: rxedot -c \(cat\|dog\|fish\)
+973bd25c0b9a :: rxedot -e \(cat\|dog\|fish\)
+106ca29719ef :: rxedot -w \(cat\|dog\|fish\)
+973bd25c0b9a :: rxedot -u 3 \(cat\|dog\|fish\)
+f070959f5b60 :: rxedot -t \(cat\|dog\|fish\)
+6ef27697698b :: rxedot -f 5 \(cat\|dog\|fish\)
+838f475bef90 :: rxedot  \(\\d\{3\}\)\(\?1\)
+838f475bef90 :: rxedot -c \(\\d\{3\}\)\(\?1\)
+1a15957fa744 :: rxedot -e \(\\d\{3\}\)\(\?1\)
+838f475bef90 :: rxedot -w \(\\d\{3\}\)\(\?1\)
+4bce0fabb3a1 :: rxedot -u 3 \(\\d\{3\}\)\(\?1\)
+f74b6ebcfb98 :: rxedot -t \(\\d\{3\}\)\(\?1\)
+c02bf0826294 :: rxedot -f 5 \(\\d\{3\}\)\(\?1\)
+3a0c68a0bccb :: rxedot  \(\[ab\]\)\\1
+3a0c68a0bccb :: rxedot -c \(\[ab\]\)\\1
+3a0c68a0bccb :: rxedot -e \(\[ab\]\)\\1
+3a0c68a0bccb :: rxedot -w \(\[ab\]\)\\1
+3a0c68a0bccb :: rxedot -u 3 \(\[ab\]\)\\1
+b105170f1db7 :: rxedot -t \(\[ab\]\)\\1
+099cdc51d3a7 :: rxedot -f 5 \(\[ab\]\)\\1
+aa5f66ce7e30 :: rxedot  \(\(a\|b\)\(c\|d\)\)\{2\}
+aa5f66ce7e30 :: rxedot -c \(\(a\|b\)\(c\|d\)\)\{2\}
+aa5f66ce7e30 :: rxedot -e \(\(a\|b\)\(c\|d\)\)\{2\}
+aa5f66ce7e30 :: rxedot -w \(\(a\|b\)\(c\|d\)\)\{2\}
+64bde40cd7e1 :: rxedot -u 3 \(\(a\|b\)\(c\|d\)\)\{2\}
+eed40537c17f :: rxedot -t \(\(a\|b\)\(c\|d\)\)\{2\}
+ca16067f1f53 :: rxedot -f 5 \(\(a\|b\)\(c\|d\)\)\{2\}
+ef53254057ec :: rxedot  \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+ef53254057ec :: rxedot -c \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+ef53254057ec :: rxedot -e \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+ef53254057ec :: rxedot -w \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+ef53254057ec :: rxedot -u 3 \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+777a7414cc73 :: rxedot -t \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+0e1d8668d710 :: rxedot -f 5 \(\[2-9TJQKA\]\[SHDC\]\)\{\{5\}\}
+eb66d17f1cef :: rxedot  a\*b\*
+eb66d17f1cef :: rxedot -c a\*b\*
+eb66d17f1cef :: rxedot -e a\*b\*
+eb66d17f1cef :: rxedot -w a\*b\*
+eb66d17f1cef :: rxedot -u 3 a\*b\*
+5f6f87486998 :: rxedot -t a\*b\*
+8afbe29f5d0c :: rxedot -f 5 a\*b\*
+b8f2b57a8212 :: rxedot  \(\?~k:\[0-9\]\)
+b8f2b57a8212 :: rxedot -c \(\?~k:\[0-9\]\)
+b8f2b57a8212 :: rxedot -e \(\?~k:\[0-9\]\)
+b8f2b57a8212 :: rxedot -w \(\?~k:\[0-9\]\)
+b8f2b57a8212 :: rxedot -u 3 \(\?~k:\[0-9\]\)
+5435b70971b5 :: rxedot -t \(\?~k:\[0-9\]\)
+fd36db6dc519 :: rxedot -f 5 \(\?~k:\[0-9\]\)
+0e3b0b07c57d :: rxedot  M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+0e3b0b07c57d :: rxedot -c M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+0e3b0b07c57d :: rxedot -e M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+0f3fa54db887 :: rxedot -w M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+0e3b0b07c57d :: rxedot -u 3 M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+44c1b1ff6af8 :: rxedot -t M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)
+2f5429303516 :: rxedot -f 5 M\{0\,2\}\(C\{0\,2\}\|CD\|DC\{0\,2\}\|CM\)

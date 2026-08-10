@@ -1,0 +1,20 @@
+digraph rxe {
+  graph [rankdir=TB, ordering=out, bgcolor="#ffffff", fontname="Helvetica"];
+  node [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=11, margin="0.10,0.05"];
+  edge [arrowsize=0.7, color="#888888"];
+  labelloc="t"; label=<<FONT FACE="Courier" POINT-SIZE="15">(\d{3})(?1)</FONT>>;
+  n0 [shape=box, fillcolor="#333a44", fontcolor="white", style="filled,rounded", label="set\n1000000"];
+  n1 [label="( )\n1000\n×1000", fillcolor="#eeeeee"];
+  n2 [label="repeat {3}\n1000", fillcolor="#d4e4ff"];
+  n3 [label="\\d\n10", fillcolor="#ffffff"];
+  n2 -> n3;
+  n4 [label="\\d\n10", fillcolor="#ffffff"];
+  n2 -> n4;
+  n5 [label="\\d\n10", fillcolor="#ffffff"];
+  n2 -> n5;
+  n1 -> n2;
+  n0 -> n1;
+  n6 [label="(?1)\n1000", fillcolor="#ffe0b0"];
+  n6 -> n1 [style=dashed, constraint=false, color="#c07000", arrowsize=0.6];
+  n0 -> n6;
+}
