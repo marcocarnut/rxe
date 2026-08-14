@@ -161,6 +161,55 @@ static int dup_sink(const char *s, size_t len, const mpz_t index, void *v)
     return 0;
 }
 
+/* ------------------------------ dictionaries ------------------------------- */
+/* The same [:name:] word lists rxenum reads: a "name.dict" file, one word per
+ * line, looked up in the -D directories then the current one. Resolution runs
+ * at parse time, before any walk, so the registered words are only ever read
+ * after -- which matters once the walk is threaded. Lifted from rxenum. */
+
+#define MAX_DICT_DIRS 16
+static const char *dict_dirs[MAX_DICT_DIRS];
+static int         ndict_dirs;
+
+static char **load_dict_file(const char *path, int *nwords)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    int cap = 64, n = 0;
+    char **words = malloc(cap * sizeof(char *));
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        int len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+        if (n == cap) { cap *= 2; words = realloc(words, cap * sizeof(char *)); }
+        words[n] = malloc(len + 1);
+        memcpy(words[n], line, len + 1);
+        n++;
+    }
+    fclose(fp);
+    *nwords = n;
+    return words;
+}
+
+// Registers the words with the library, which keeps its own copy, so the
+// loaded ones are freed straight away. Returns 1 if a file was found.
+static int dict_resolver(const char *name)
+{
+    for (int d = -1; d < ndict_dirs; d++) {
+        char path[1024];
+        const char *dir = d < 0 ? "." : dict_dirs[d];
+        snprintf(path, sizeof(path), "%s/%s.dict", dir, name);
+        int nwords;
+        char **words = load_dict_file(path, &nwords);
+        if (!words) continue;
+        rxe_register_dict(name, (const char **)words, nwords);
+        for (int i = 0; i < nwords; i++) free(words[i]);
+        free(words);
+        return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------- the program ------------------------------- */
 
 static const char *prog = "rxedup";
@@ -177,6 +226,7 @@ static void usage(FILE *out)
 "            larger finite one, is walked only that far and the answer is then\n"
 "            inconclusive unless a duplicate turns up.\n"
 "  -w width  render buffer in bytes (default %d); a longer member is refused.\n"
+"  -D dir    also look in 'dir' for a [:name:] dictionary's name.dict file.\n"
 "  -v        after the summary, list the repeated members and their counts.\n"
 "  -q        print nothing; report only through the exit status.\n"
 "\n"
@@ -202,7 +252,7 @@ int main(int argc, char **argv)
     int    opt;
 
     if (argc > 0) prog = argv[0];
-    while ((opt = getopt(argc, argv, "c:w:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:D:vqh")) != -1) {
         switch (opt) {
             case 'c': cap = strtol(optarg, NULL, 10);
                       if (cap < 0) { fprintf(stderr, "%s: -c needs a count >= 0\n", prog); return EX_ERROR; }
@@ -210,6 +260,7 @@ int main(int argc, char **argv)
             case 'w': width = atoi(optarg);
                       if (width < 1) { fprintf(stderr, "%s: -w needs a positive width\n", prog); return EX_ERROR; }
                       break;
+            case 'D': if (ndict_dirs < MAX_DICT_DIRS) dict_dirs[ndict_dirs++] = optarg; break;
             case 'v': verbose = 1; break;
             case 'q': quiet = 1; break;
             case 'h': usage(stdout); return EX_DISTINCT;
@@ -220,6 +271,8 @@ int main(int argc, char **argv)
     const char *pattern = argv[optind];
 
     rxe_init();
+    rxe_set_dict_resolver(dict_resolver);
+    atexit(rxe_free_dicts);
     struct rxe *rxe = rxe_parse(pattern, 0);
     if (rxe_error(rxe) != RXE_OK) {
         if (!quiet)
