@@ -134,6 +134,16 @@ same '(ab|a)(b|)'
 same '(cat|hi)[0-9]'
 same '(a|bc)(d|ef)'
 
+# Bounded variable repeats: finite and place-value ordered, baked as one variable
+# wheel by re-parsing the repeat's own span. Uneven widths, same odometer.
+same 'a{2,4}'
+same '[a-z]{1,2}'
+same 'x[0-9]{1,2}y'
+same '[0-9]{1,3}'
+same 'pre[0-9]{1,2}'
+same '(ab){1,2}'
+same '(a|aa){1,2}'
+
 # The match sink: hits (length 3), no hits (length 2, but 'ab'/'q7' are there),
 # and a mask disjoint from the targets (empty result both ways).
 match '[a-z]{3}'
@@ -171,6 +181,11 @@ structural '(a|a)[a-z]{6}' '617831552 members, 308915776 distinct, 308915776 dup
 dedup '(ab|a)(b|)'
 dedup '(ab|a)(ba|b)(a|)'
 dedup '(cat|hi)(cat|hi)'
+dedup 'a{1,2}a{1,2}'    # repeat aliasing: "aa" is a{2} and a{1}a{1}
+dedup '(a|aa){1,2}'
+
+# A large bounded repeat is past unrolling and must decline, not hang.
+declines '[a-z]{4,6}'
 
 # The -S debug output must be valid standalone C, for each sink.
 emits_compiles '[a-z]{3}[0-9]'

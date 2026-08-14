@@ -9,16 +9,18 @@
  *          by carry, that the system compiler then optimises. No tree, no mpz,
  *          no indirect call.
  *
- *          It handles the fixed-width case: single-character classes, their
- *          exact repeats, and alternations whose branches are all the same
- *          length -- [a-z]{4}[0-9]{2}, (cat|dog)[0-9], the classic mask attack
- *          and a little past it. Each position is a "wheel" of L-byte
- *          alternatives (a class is L=1, an equal-length alternation L>1, baked
- *          out by the interpreter). What it cannot make fixed-width -- an
- *          alternation of uneven lengths, an unbounded or variable repeat, a
- *          dictionary, a backreference -- it declines, naming the reason, so the
- *          interpreter path stays the answer there. It runs the compiled program
- *          (or prints the C with -S) with a chosen sink: write, count, or match.
+ *          Each position of a member is a "wheel": a character class, or an
+ *          alternation or bounded repeat baked out by the interpreter. When a
+ *          wheel's branches are all one length the member sits at compile-time
+ *          offsets, delta-patched as the odometer turns; when they vary
+ *          ([a-z]{1,3}, (cat|hi)) the member is rebuilt each step. So masks,
+ *          equal- and uneven-length alternations, subroutines, and bounded
+ *          repeats all compile -- every finite pattern short of the hard cases.
+ *          An unbounded repeat (which is infinite), a dictionary, a
+ *          backreference, or a set too large to unroll it declines by name, so
+ *          the interpreter path stays the answer there. It runs the compiled
+ *          program (or prints the C with -S) under a chosen sink: write the
+ *          members, count them, match against a target set, or find duplicates.
  *
  *          (C) 2011 Marco "Kiko" Carnut <kiko at postcogito dot org>
  *
@@ -71,6 +73,7 @@ struct build {
     int           nw;
     void        **bake;
     int           nbake, cbake;
+    struct rxe   *root;            // the whole pattern, for a node's source span
 };
 
 static int keep(struct build *b, void *p)   // track an allocation for freeing
@@ -107,11 +110,11 @@ static int add_rxe(struct build *b, struct rxe *rxe);
 static int bake_alt(struct build *b, struct rxe *rxe)
 {
     if (rxe->ninf || !mpz_fits_ulong_p(rxe->nitems)) {
-        reason = "an alternation too large to unroll"; return -1;
+        reason = "too many members to unroll"; return -1;
     }
     unsigned long n = mpz_get_ui(rxe->nitems);
     if (n < 1)       { reason = "an empty alternation"; return -1; }
-    if (n > ALT_CAP) { reason = "an alternation too large to unroll"; return -1; }
+    if (n > ALT_CAP) { reason = "too many members to unroll"; return -1; }
 
     int *aoff = malloc(n * sizeof *aoff);
     int *alen = malloc(n * sizeof *alen);
@@ -173,6 +176,26 @@ static int add_node(struct build *b, struct rxe_node *nd)
         return 0;
     }
 
+    // A bounded variable repeat X{a,b} is finite and place-value ordered (only
+    // an unbounded one is shortlex), but its members vary in width. Re-parse its
+    // own source span into a standalone expression and bake that as one variable
+    // wheel -- the same treatment an uneven alternation gets. Too many members
+    // to unroll, and bake_alt declines it, as it would a huge alternation.
+    if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED && nd->rxe) {
+        int len = nd->src_end - nd->src_start;
+        if (len <= 0 || !b->root->source) { reason = "a variable-count repeat"; return -1; }
+        char *sub = malloc((size_t)len + 1);
+        if (!sub) { reason = "out of memory"; return -1; }
+        memcpy(sub, b->root->source + nd->src_start, (size_t)len);
+        sub[len] = 0;
+        struct rxe *sr = rxe_parse(sub, 0);
+        free(sub);
+        if (rxe_error(sr) != RXE_OK) { rxe_free(sr); reason = "a variable-count repeat"; return -1; }
+        int rc = bake_alt(b, sr);
+        rxe_free(sr);
+        return rc;
+    }
+
     if (nd->rxe && !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
         !nd->is_dict && !nd->is_backref && !nd->is_inf)
         return add_rxe(b, nd->rxe);
@@ -206,7 +229,7 @@ static int add_rxe(struct build *b, struct rxe *rxe)
 // 'reason' set. On success the caller must free the bake buffers (free_build).
 static int collect(struct build *b, struct rxe *rxe)
 {
-    b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0;
+    b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0; b->root = rxe;
     return add_rxe(b, rxe) ? -1 : b->nw;
 }
 
@@ -652,8 +675,8 @@ int main(int argc, char **argv)
                 fprintf(stderr,
 "usage: %s [-S] [-n | -m file | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
-"  Handles a fixed-width mask, and alternations of equal-length branches; other\n"
-"  patterns are declined with a reason.\n"
+"  Handles masks, alternations, and bounded repeats -- any finite pattern short\n"
+"  of a dictionary or backreference, which are declined with a reason.\n"
 "    -S       print the generated C to stdout instead of compiling and running it.\n"
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
