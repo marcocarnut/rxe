@@ -62,12 +62,58 @@ struct entry {
     unsigned long mult;
 };
 
+// A bump allocator for the stored member bytes. Every distinct member used to
+// cost a malloc; a run over a set with a million distinct members made a
+// million of them, and the benchmark showed that -- not the pipe it saves --
+// was where rxedup's time went. The members are only ever added, never freed
+// one at a time, so a stack of big blocks handed out by the byte fits exactly:
+// one allocation per block, and the whole stack freed at the end.
+#define ARENA_BLOCK (1u << 20)
+
+struct arena {
+    char  *cur, *end;              // the free span of the current block
+    char **block;                  // every block, to free them together
+    size_t nblock, cblock;
+};
+
+static char *arena_dup(struct arena *a, const char *s, size_t len)
+{
+    if ((size_t)(a->end - a->cur) < len) {
+        size_t sz = len > ARENA_BLOCK ? len : ARENA_BLOCK;  // outsize member gets its own
+        char *b = malloc(sz);
+        if (!b) return NULL;
+        if (a->nblock == a->cblock) {
+            size_t nc = a->cblock ? a->cblock * 2 : 8;
+            char **nb = realloc(a->block, nc * sizeof *nb);
+            if (!nb) { free(b); return NULL; }
+            a->block = nb; a->cblock = nc;
+        }
+        a->block[a->nblock++] = b;
+        a->cur = b; a->end = b + sz;
+    }
+    char *p = a->cur;
+    memcpy(p, s, len);
+    a->cur += len;
+    return p;
+}
+
+static void arena_free(struct arena *a)
+{
+    for (size_t i = 0; i < a->nblock; i++) free(a->block[i]);
+    free(a->block);
+}
+
 struct hset {
     struct entry *slot;
     size_t        cap;              // a power of two
     size_t        used;            // distinct members held
     int           oom;             // set once an allocation was refused
+    struct arena  arena;           // the members' bytes live here
 };
+
+// A non-NULL, never-dereferenced key for the empty member, so its slot reads as
+// occupied without the arena being asked for a zero-length span.
+static char empty_key;
 
 static uint64_t fnv1a(const char *s, size_t n)
 {
@@ -81,10 +127,11 @@ static uint64_t fnv1a(const char *s, size_t n)
 
 static int hset_init(struct hset *h)
 {
-    h->cap  = 1024;
-    h->used = 0;
-    h->oom  = 0;
-    h->slot = calloc(h->cap, sizeof *h->slot);
+    h->cap   = 1024;
+    h->used  = 0;
+    h->oom   = 0;
+    h->arena = (struct arena){ 0 };
+    h->slot  = calloc(h->cap, sizeof *h->slot);
     return h->slot != NULL;
 }
 
@@ -127,9 +174,8 @@ static int hset_add(struct hset *h, const char *s, size_t len)
         }
         i = (i + 1) & (h->cap - 1);
     }
-    char *copy = malloc(len ? len : 1);
+    char *copy = len ? arena_dup(&h->arena, s, len) : &empty_key;
     if (!copy) { h->oom = 1; return 0; }
-    memcpy(copy, s, len);
     h->slot[i].bytes = copy;
     h->slot[i].len   = len;
     h->slot[i].hash  = hash;
@@ -140,7 +186,7 @@ static int hset_add(struct hset *h, const char *s, size_t len)
 
 static void hset_free(struct hset *h)
 {
-    for (size_t i = 0; i < h->cap; i++) free(h->slot[i].bytes);
+    arena_free(&h->arena);
     free(h->slot);
 }
 
