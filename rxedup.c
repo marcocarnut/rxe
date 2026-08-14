@@ -33,10 +33,13 @@
 #include <string.h>
 #include <stdint.h>
 #include <getopt.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "rxe.h"
 
 #define MAXSTRLEN     2048          // default render width, as rxenum's
 #define DEFAULT_CAP   1000000L      // members walked without an explicit -c
+#define THREAD_MIN    100000L       // below this many members, one thread wins
 
 // Exit status, chosen so a script can branch on the three real answers:
 //   0  every member walked was distinct, and the whole set was walked  -- a
@@ -190,6 +193,42 @@ static void hset_free(struct hset *h)
     free(h->slot);
 }
 
+// Fold one thread's entry into a master table, summing multiplicity: a member
+// distinct within its own shard is still a duplicate if another shard rendered
+// it too. The bytes are not copied -- the master borrows the pointer into the
+// thread's arena, which outlives the merge -- so the master's own arena stays
+// empty and it frees only its slots. Its capacity is sized up front to hold
+// every entry, so no grow (and no allocation) happens here.
+static void hset_absorb(struct hset *m, const struct entry *e)
+{
+    size_t i = e->hash & (m->cap - 1);
+    while (m->slot[i].bytes) {
+        struct entry *x = &m->slot[i];
+        if (x->hash == e->hash && x->len == e->len &&
+            memcmp(x->bytes, e->bytes, e->len) == 0) {
+            x->mult += e->mult;
+            return;
+        }
+        i = (i + 1) & (m->cap - 1);
+    }
+    m->slot[i] = *e;              // shallow: same bytes pointer, mult carried over
+    m->used++;
+}
+
+// A master table sized to hold 'n' entries at under 70% load, so hset_absorb
+// never has to grow. Returns 0 on allocation failure.
+static int hset_init_for(struct hset *h, size_t n)
+{
+    size_t cap = 1024;
+    while (cap * 7 <= n * 10) cap *= 2;
+    h->cap   = cap;
+    h->used  = 0;
+    h->oom   = 0;
+    h->arena = (struct arena){ 0 };
+    h->slot  = calloc(h->cap, sizeof *h->slot);
+    return h->slot != NULL;
+}
+
 /* ------------------------------- the walk ---------------------------------- */
 
 struct run {
@@ -205,6 +244,31 @@ static int dup_sink(const char *s, size_t len, const mpz_t index, void *v)
     hset_add(&r->set, s, len);
     if (r->set.oom) return 1;       // stop cleanly; the caller reports it
     return 0;
+}
+
+// One thread's slice of the walk. The index range [from, from+count) is its
+// own, its rxe is its own clone, and its set has its own arena, so the threads
+// share nothing writable and need no lock. fr is where its rxe_foreach return
+// lands, read back after the join.
+struct shard {
+    struct rxe   *rxe;
+    mpz_t         from, count;
+    int           width;
+    struct run    run;
+    int           fr;
+};
+
+static void *worker(void *arg)
+{
+    struct shard *s = arg;
+    s->fr = rxe_foreach(s->rxe, s->from, s->count, s->width, dup_sink, &s->run);
+    return NULL;
+}
+
+static int nproc(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : (int)n;
 }
 
 /* ------------------------------ dictionaries ------------------------------- */
@@ -263,7 +327,7 @@ static const char *prog = "rxedup";
 static void usage(FILE *out)
 {
     fprintf(out,
-"usage: %s [-c count] [-w width] [-v] [-q] REGEX\n"
+"usage: %s [-c count] [-w width] [-j jobs] [-D dir] [-v] [-q] REGEX\n"
 "\n"
 "Walk the members of the set REGEX describes and report duplicate renderings.\n"
 "\n"
@@ -272,6 +336,8 @@ static void usage(FILE *out)
 "            larger finite one, is walked only that far and the answer is then\n"
 "            inconclusive unless a duplicate turns up.\n"
 "  -w width  render buffer in bytes (default %d); a longer member is refused.\n"
+"  -j jobs   split the walk across this many threads (default: one per CPU);\n"
+"            each takes a contiguous slice of the index range.\n"
 "  -D dir    also look in 'dir' for a [:name:] dictionary's name.dict file.\n"
 "  -v        after the summary, list the repeated members and their counts.\n"
 "  -q        print nothing; report only through the exit status.\n"
@@ -294,17 +360,21 @@ int main(int argc, char **argv)
 {
     long   cap     = DEFAULT_CAP;
     int    width   = MAXSTRLEN;
+    int    jobs    = 0;                 // 0 = one per CPU
     int    verbose = 0, quiet = 0;
     int    opt;
 
     if (argc > 0) prog = argv[0];
-    while ((opt = getopt(argc, argv, "c:w:D:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:j:D:vqh")) != -1) {
         switch (opt) {
             case 'c': cap = strtol(optarg, NULL, 10);
                       if (cap < 0) { fprintf(stderr, "%s: -c needs a count >= 0\n", prog); return EX_ERROR; }
                       break;
             case 'w': width = atoi(optarg);
                       if (width < 1) { fprintf(stderr, "%s: -w needs a positive width\n", prog); return EX_ERROR; }
+                      break;
+            case 'j': jobs = atoi(optarg);
+                      if (jobs < 1) { fprintf(stderr, "%s: -j needs at least one thread\n", prog); return EX_ERROR; }
                       break;
             case 'D': if (ndict_dirs < MAX_DICT_DIRS) dict_dirs[ndict_dirs++] = optarg; break;
             case 'v': verbose = 1; break;
@@ -329,59 +399,134 @@ int main(int argc, char **argv)
 
     int infinite = rxe_is_infinite(rxe);
 
-    // How far to walk. A count of zero into rxe_foreach means "no limit", which
-    // is what an uncapped run of a finite set wants; a positive cap bounds an
-    // infinite or oversized set. The default cap still applies when -c is
-    // absent, so a stray huge set does not thrash unbidden.
-    mpz_t from, count;
-    mpz_init_set_ui(from, 0);
-    mpz_init(count);
-    if (cap == 0) mpz_set_ui(count, 0);            // uncapped, on request
-    else          mpz_set_si(count, cap);
-
-    struct run r;
-    r.total = 0;
-    if (!hset_init(&r.set)) {
-        if (!quiet) fprintf(stderr, "%s: out of memory\n", prog);
-        mpz_clear(from); mpz_clear(count); rxe_free(rxe);
-        return EX_ERROR;
+    // How much of the set the walk covers, as a concrete count the threads can
+    // divide. A finite set is bounded by its own size, capped by -c; an infinite
+    // one only by -c. The one range that cannot be split is an infinite set with
+    // no cap (-c 0) -- it never ends -- so that stays a single unbounded thread.
+    mpz_t nwalk;
+    mpz_init(nwalk);
+    int splittable = 1;
+    if (infinite) {
+        if (cap == 0) splittable = 0;
+        else          mpz_set_si(nwalk, cap);
+    } else if (cap > 0 && mpz_cmp_si(rxe->nitems, cap) > 0) {
+        mpz_set_si(nwalk, cap);
+    } else {
+        mpz_set(nwalk, rxe->nitems);
     }
 
-    int fr = rxe_foreach(rxe, from, count, width, dup_sink, &r);
+    int T = jobs > 0 ? jobs : nproc();
+    if (!splittable || mpz_cmp_ui(nwalk, THREAD_MIN) < 0) T = 1;
+    if (T > 1 && mpz_cmp_ui(nwalk, (unsigned long)T) < 0) T = (int)mpz_get_ui(nwalk);
+    if (T < 1) T = 1;
 
-    unsigned long total    = r.total;
-    unsigned long distinct = (unsigned long)r.set.used;
+    struct shard *sh = calloc((size_t)T, sizeof *sh);
+    if (!sh) { if (!quiet) fprintf(stderr, "%s: out of memory\n", prog);
+               mpz_clear(nwalk); rxe_free(rxe); return EX_ERROR; }
+
+    // Build the shards. Shard 0 keeps the already-parsed rxe; the rest each get
+    // an independent clone. The index range is split as evenly as it divides,
+    // the first 'rem' shards taking one extra. A single thread keeps the old
+    // semantics exactly: the whole set, or -c members, count 0 meaning no limit.
+    int ok = 1;
+    if (T == 1) {
+        mpz_init_set_ui(sh[0].from, 0);
+        mpz_init(sh[0].count);
+        if (cap > 0) mpz_set_si(sh[0].count, cap);     // else 0 = unlimited
+        sh[0].width = width;
+        sh[0].rxe   = rxe;
+        ok = hset_init(&sh[0].run.set);
+    } else {
+        mpz_t base, off;
+        mpz_init(base);
+        mpz_init_set_ui(off, 0);
+        unsigned long rem = 0;
+        { mpz_t r; mpz_init(r); mpz_tdiv_qr_ui(base, r, nwalk, (unsigned long)T);
+          rem = mpz_get_ui(r); mpz_clear(r); }
+        for (int t = 0; t < T; t++) {
+            mpz_init_set(sh[t].from, off);
+            mpz_init_set(sh[t].count, base);
+            if ((unsigned long)t < rem) mpz_add_ui(sh[t].count, sh[t].count, 1);
+            mpz_add(off, off, sh[t].count);
+            sh[t].width = width;
+            sh[t].rxe   = t == 0 ? rxe : rxe_deep_clone(rxe);
+            if (!sh[t].rxe || !hset_init(&sh[t].run.set)) ok = 0;
+        }
+        mpz_clear(base);
+        mpz_clear(off);
+    }
+    if (!ok) { if (!quiet) fprintf(stderr, "%s: out of memory\n", prog);
+               for (int t = 0; t < T; t++) { hset_free(&sh[t].run.set);
+                   if (sh[t].rxe) rxe_free(sh[t].rxe);
+                   mpz_clear(sh[t].from); mpz_clear(sh[t].count); }
+               free(sh); mpz_clear(nwalk); return EX_ERROR; }
+
+    // Run them: a thread each for shards 1..T-1, shard 0 on this thread, then
+    // join. A thread that will not spawn is simply run here instead.
+    pthread_t *tid  = calloc((size_t)T, sizeof *tid);
+    char      *spun = calloc((size_t)T, 1);
+    for (int t = 1; t < T; t++)
+        if (pthread_create(&tid[t], NULL, worker, &sh[t]) == 0) spun[t] = 1;
+        else worker(&sh[t]);
+    worker(&sh[0]);
+    for (int t = 1; t < T; t++) if (spun[t]) pthread_join(tid[t], NULL);
+    free(tid);
+    free(spun);
+
+    // Gather the shards. total is the members walked; a too-big member or an
+    // out-of-memory in any shard colours the whole answer.
+    unsigned long total = 0;
+    int any_toobig = 0, any_oom = 0;
+    for (int t = 0; t < T; t++) {
+        total += sh[t].run.total;
+        if (sh[t].fr == RXE_FOREACH_TOOBIG) any_toobig = 1;
+        if (sh[t].run.set.oom)              any_oom = 1;
+    }
+
+    // Distinct count. One shard's set is the answer outright; several must be
+    // merged, since a member distinct within each shard is still a duplicate if
+    // two shards rendered it. The merge borrows the shards' stored bytes, so the
+    // shard sets must outlive it.
+    struct hset  master;
+    int          have_master = 0;
+    struct hset *dset = &sh[0].run.set;
+    if (T > 1) {
+        size_t sumused = 0;
+        for (int t = 0; t < T; t++) sumused += sh[t].run.set.used;
+        if (!hset_init_for(&master, sumused)) {
+            any_oom = 1;
+        } else {
+            have_master = 1;
+            for (int t = 0; t < T; t++) {
+                struct hset *s = &sh[t].run.set;
+                for (size_t i = 0; i < s->cap; i++)
+                    if (s->slot[i].bytes) hset_absorb(&master, &s->slot[i]);
+            }
+            dset = &master;
+        }
+    }
+    unsigned long distinct = (unsigned long)dset->used;
     unsigned long dups     = total - distinct;
 
-    // Whether the whole set was seen. A finite set is whole when the walk ran
-    // to its end rather than stopping on the count; rxe_foreach reports END for
-    // both, so compare against the known size. An infinite set is never whole.
-    int whole = 0;
-    if (!infinite) {
-        // total == nitems exactly when nothing was left unwalked.
-        mpz_t n;
-        mpz_init_set(n, rxe->nitems);
-        whole = (mpz_cmp_ui(n, total) == 0);
-        mpz_clear(n);
-    }
+    // Whether the whole set was seen -- a finite set walked to its size, none of
+    // it left behind. An infinite set never is.
+    int whole = !infinite && mpz_cmp_ui(rxe->nitems, total) == 0;
 
+    // A found duplicate is conclusive however the walk fared, so it wins over a
+    // too-big or out-of-memory that only clouds the rest.
     int status;
-    if (fr == RXE_FOREACH_TOOBIG || (r.set.oom && dups == 0 && !whole && total == 0)) {
-        // A render overflow, or memory gone before a single member landed.
-        if (!quiet)
-            fprintf(stderr, "%s: %s\n", prog,
-                fr == RXE_FOREACH_TOOBIG
-                    ? "a member is larger than the render width; raise -w"
-                    : "out of memory");
-        status = EX_ERROR;
-    } else if (dups > 0) {
+    if (dups > 0) {
         if (!quiet)
             printf("%lu member%s, %lu distinct, %lu duplicate%s -- NOT distinct\n",
                    total, total == 1 ? "" : "s", distinct,
                    dups, dups == 1 ? "" : "s");
-        if (verbose && !quiet) list_repeats(&r.set);
+        if (verbose && !quiet) list_repeats(dset);
         status = EX_DUPLICATE;
-    } else if (r.set.oom) {
+    } else if (any_toobig) {
+        if (!quiet)
+            fprintf(stderr, "%s: a member is larger than the render width; raise -w\n", prog);
+        status = EX_ERROR;
+    } else if (any_oom) {
         if (!quiet)
             printf("%lu members, all distinct so far, then out of memory "
                    "-- inconclusive\n", total);
@@ -392,15 +537,20 @@ int main(int argc, char **argv)
         status = EX_DISTINCT;
     } else {
         if (!quiet)
-            printf("%lu member%s walked, all distinct -- inconclusive "
-                   "(%s)\n", total, total == 1 ? "" : "s",
+            printf("%lu member%s walked, all distinct -- inconclusive (%s)\n",
+                   total, total == 1 ? "" : "s",
                    infinite ? "the set is infinite" : "the walk was capped");
         status = EX_PARTIAL;
     }
 
-    hset_free(&r.set);
-    mpz_clear(from);
-    mpz_clear(count);
-    rxe_free(rxe);
+    if (have_master) hset_free(&master);
+    for (int t = 0; t < T; t++) {
+        hset_free(&sh[t].run.set);
+        rxe_free(sh[t].rxe);           // shard 0's is the original; freed once, here
+        mpz_clear(sh[t].from);
+        mpz_clear(sh[t].count);
+    }
+    free(sh);
+    mpz_clear(nwalk);
     return status;
 }

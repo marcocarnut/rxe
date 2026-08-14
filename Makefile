@@ -29,7 +29,7 @@ rxerank.o: rxerank.c rxe.h
 # A sibling tool: brute-force duplicate detection. Walks the set through
 # rxe_foreach, hashing each member, and reports repeats. Not built by 'all'.
 rxedup: rxedup.o librxe.a rxe.h
-	$(CC) rxedup.o -g -L. -lgmp -lm -lrxe -o rxedup
+	$(CC) rxedup.o -g -L. -lgmp -lm -lrxe -lpthread -o rxedup
 
 rxedup.o: rxedup.c rxe.h
 
@@ -92,7 +92,7 @@ rxerank-asan: rxerank.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 
 rxedup-asan: rxedup.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 	$(CC) $(WARNFLAGS) $(SANFLAGS) rxedup.c \
-	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxedup-asan
+	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -lpthread -o rxedup-asan
 
 test-asan: rxenum-asan rxerank-asan tests/api-asan
 	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
