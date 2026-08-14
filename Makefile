@@ -104,6 +104,11 @@ test-asan: rxenum-asan rxerank-asan tests/api-asan
 	        python3 tests/rank.py; \
 	fi
 
+# A speed comparison of rxedup against rxenum piped into a deduper. Not a test
+# (nothing here passes or fails); just numbers. See tests/bench.sh.
+bench: rxenum rxedup
+	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
+
 clean:
 	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan tests/api tests/api-asan
 
@@ -126,5 +131,5 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/rxe.h
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
 
-.PHONY: all test test-asan clean install uninstall
+.PHONY: all test test-asan bench clean install uninstall
 
