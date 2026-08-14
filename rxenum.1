@@ -85,8 +85,8 @@ If no switches are specified,
 will count the number of elements in the set specified by
 .B regex
 and display the count in three forms: as an arbitrary precision
-exact integer, as an truncated approximate power of ten and a truncated
-approximated power of two. When the approximations turn out to be exact,
+exact integer, as a truncated approximate power of ten and a truncated
+approximate power of two. When the approximations turn out to be exact,
 the powers are preceded by an equal sign; otherwise, they will be preceded
 by a tilde.
 .TP
@@ -528,12 +528,13 @@ not fixed and so neither is which one the backreference should copy.
 Reformulate it, for instance as "([ab])\\1|([ab]){2}\\2", to say explicitly which
 repetition you mean.
 
-To emulate Perl behavior, two sucessive quantifiers (say, "a?{2}") gives
+To emulate Perl behavior, two successive quantifiers (say, "a?{2}") gives
 an error. And again just like Perl, you can easily work around it by using
 subexpressions, say, "(a?){2}".
 
 .SH LIMITATIONS
-Works only in 8-bit characters and ASCII. No Unicode support.
+Works on bytes, not Unicode: an element is a string of 8-bit bytes, matched
+and counted byte by byte, with no Unicode-aware matching.
 
 Neither detects nor skips duplicates:
 
@@ -549,12 +550,16 @@ rxenum -n '(a?){2}'
 4 aa
 .RE
 
-A generated element is truncated at 2048 characters, without saying so. Wide
-and unbounded repetitions are counted and seeked correctly but cannot be
-printed in full past that: "a{1,100000}" and "a*" both hit it.
+A rendered element longer than the display width, 2048 bytes by default, is cut
+off on output, and silently, though it is still counted and seeked in full.
+Raise \fB-w\fR to print longer members, as far as \fB-M\fR allows one to be
+built; "a{1,100000}" and "a*" both reach this.
 
-POSIX character classes are currently unimplemented, as are many backslash
-special characters. Named backreferences are also currently unimplemented.
+A few backslash escapes are unimplemented -- the Unicode properties "\\p" and
+"\\P", case folding "\\l" and "\\u", and "\\Q ... \\E" quoting among them -- as
+are named backreferences. The common "\\d", "\\w" and "\\s" and their
+complements do work, and the POSIX classes are available in their "[:name:]"
+form (see DICTIONARIES).
 
 .SH AUTHOR
 Marco "Kiko" Carnut <kiko at postcogito dot org>
