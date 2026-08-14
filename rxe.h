@@ -262,8 +262,10 @@ void rxe_set_max_member(size_t bytes);
 
 // Raised whenever a render is refused or truncated for exceeding rxe_max_member.
 // A front-end resets it before rendering and reads it after to tell a genuine
-// member from a stub. rxe_check_overflow reads and clears it in one step.
-extern int rxe_member_overflow;
+// member from a stub. rxe_check_overflow reads and clears it in one step. It is
+// thread-local -- the latch of the thread that rendered, so parallel walks do
+// not share one -- which is transparent to a single-threaded caller.
+extern _Thread_local int rxe_member_overflow;
 int rxe_check_overflow(void);
 
 

@@ -46,7 +46,13 @@ void (*rxe_mem_alloc_failed)(size_t size, const char *file, int line);
 // pass off a stub as the real thing. Reset it before an operation, read it
 // after; rxe_check_overflow does both.
 size_t rxe_max_member = RXE_DEFAULT_MAX_MEMBER;
-int    rxe_member_overflow;
+// Thread-local: the latch is a transient marker of the operation just done --
+// set by a render, read and cleared by the caller right after -- so it belongs
+// to whichever thread is rendering, not to the process. That lets several
+// threads each drive their own rxe_foreach at once, as rxedup -j does, without
+// one thread's overflow clobbering another's. Single-threaded callers see no
+// difference: there is only ever the one thread's copy.
+_Thread_local int rxe_member_overflow;
 
 void rxe_set_max_member(size_t bytes)
 {
