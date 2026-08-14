@@ -143,6 +143,21 @@ dedup '(a|a)(b|b)'
 dedup '(foo|bar|foo)[a-z]{2}'
 dedup 'x(a|a|a)y'
 
+# Structural dedup answers a set far too large to enumerate, instantly, from the
+# closed form (distinct = product of each wheel's distinct alternatives).
+structural() {
+    got=$("$RXEJIT" -d "$1"); e=$?
+    if [ "$got" = "$2" ] && [ "$e" = "$3" ]; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  structural %s\n        got [%s] exit %s, want [%s] exit %s\n' \
+               "$1" "$got" "$e" "$2" "$3"
+        fail=$((fail + 1))
+    fi
+}
+structural '[a-z]{7}'      '8031810176 members, all distinct' 0
+structural '(a|a)[a-z]{6}' '617831552 members, 308915776 distinct, 308915776 duplicates -- NOT distinct' 1
+
 # The -S debug output must be valid standalone C, for each sink.
 emits_compiles '[a-z]{3}[0-9]'
 emits_compiles 'abc'
