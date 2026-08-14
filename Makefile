@@ -39,7 +39,15 @@ rxedup.o: rxedup.c rxe.h
 rxejit: rxejit.o librxe.a rxe.h
 	$(CC) rxejit.o -g -L. -lrxe -lgmp -lm -o rxejit
 
-rxejit.o: rxejit.c rxe.h
+rxejit.o: rxejit.c rxe.h rxejit_rt_embed.h
+
+# The runtime the generated enumerator links in line, turned into a C string so
+# rxejit can write it verbatim into each generated program. Kept as real C in
+# rxejit_rt.h (compilable, testable); this escapes it line by line.
+rxejit_rt_embed.h: rxejit_rt.h
+	@printf 'static const char RXEJIT_RT[] =\n' > $@
+	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
+	@printf ';\n' >> $@
 
 rxenum.o: rxenum.c rxe.h
 
@@ -103,8 +111,8 @@ rxedup-asan: rxedup.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 	$(CC) $(WARNFLAGS) $(SANFLAGS) rxedup.c \
 	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -lpthread -o rxedup-asan
 
-rxejit-asan: rxejit.c $(filter-out rxenum.c,$(SRC)) $(HDR)
-	$(CC) $(WARNFLAGS) $(SANFLAGS) rxejit.c \
+rxejit-asan: rxejit.c rxejit_rt_embed.h $(filter-out rxenum.c,$(SRC)) $(HDR)
+	$(CC) $(WARNFLAGS) $(SANFLAGS) -I. rxejit.c \
 	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxejit-asan
 
 test-asan: rxenum-asan rxerank-asan tests/api-asan
@@ -123,7 +131,7 @@ bench: rxenum rxedup
 	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan tests/api tests/api-asan
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h tests/api tests/api-asan
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.

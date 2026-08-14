@@ -16,6 +16,10 @@ tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 pass=0 fail=0
 
+# A target set for the match sink: some are members of the masks below, some
+# are not, some are the wrong length -- only the length-matching members hit.
+printf 'cat\ndog\nfox\nbat\nxyz\nzzz\nhello\nq7\nab\n' > "$tmp/targets"
+
 # same <pattern> -- compiling and running rxejit's output agrees with rxenum -e,
 # and its -n count agrees with the member total. This exercises the whole path:
 # codegen, the internal compile, the seeded run, and the count sink.
@@ -36,6 +40,19 @@ same() {
         pass=$((pass + 1))
     else
         printf 'FAIL  %s\n        -n counted %s, expected %s\n' "$1" "$n" "$want"
+        fail=$((fail + 1))
+    fi
+}
+
+# match <pattern> -- the -m sink prints exactly the members that are in the
+# target set, in order: the same as filtering rxenum -e through the file.
+match() {
+    "$RXEJIT" -m "$tmp/targets" "$1" 2>/dev/null > "$tmp/jit"
+    "$RXENUM" -e "$1" | grep -Fxf "$tmp/targets" > "$tmp/ref"
+    if cmp -s "$tmp/jit" "$tmp/ref"; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  match %s\n        -m output differs from rxenum -e filtered by the target set\n' "$1"
         fail=$((fail + 1))
     fi
 }
@@ -71,6 +88,13 @@ same '[a-z]{2}[0-9]{2}'
 same 'q[0-9]w[a-f]'
 same '[A-Fa-f0-9]{2}'
 same '[0-9]'
+
+# The match sink: hits (length 3), no hits (length 2, but 'ab'/'q7' are there),
+# and a mask disjoint from the targets (empty result both ways).
+match '[a-z]{3}'
+match '[a-z][0-9]'
+match '[a-z]{2}'
+match '[0-9]{4}'
 
 # The -S debug output must be valid standalone C.
 emits_compiles '[a-z]{3}[0-9]'
