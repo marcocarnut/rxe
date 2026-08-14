@@ -160,6 +160,41 @@ fail:
     return -1;
 }
 
+// A dictionary is a wheel whose alternatives are its words -- built straight
+// from the word list rather than enumerated, but otherwise an uneven-length
+// alternation like any other. So [:bip39en:]{4} is four such wheels.
+static int bake_dict(struct build *b, struct rxe_node *nd)
+{
+    int n = nd->nwords;
+    if (n < 1)       { reason = "an empty dictionary"; return -1; }
+    if (n > ALT_CAP) { reason = "too many members to unroll"; return -1; }
+
+    int *aoff = malloc((size_t)n * sizeof *aoff);
+    int *alen = malloc((size_t)n * sizeof *alen);
+    if (!aoff || !alen) { free(aoff); free(alen); reason = "out of memory"; return -1; }
+
+    unsigned long total = 0;
+    for (int i = 0; i < n; i++) {
+        int L = (int)strlen(nd->words[i]);
+        aoff[i] = (int)total; alen[i] = L; total += (unsigned long)L;
+    }
+    char *buf = malloc(total ? total : 1);
+    if (!buf) { free(aoff); free(alen); reason = "out of memory"; return -1; }
+    for (int i = 0; i < n; i++) memcpy(buf + aoff[i], nd->words[i], (size_t)alen[i]);
+
+    int fixed = 1;
+    for (int i = 1; i < n; i++) if (alen[i] != alen[0]) { fixed = 0; break; }
+
+    if (keep(b, buf)) { free(buf); free(aoff); free(alen); return -1; }
+    if (fixed) {
+        int L0 = alen[0];
+        free(aoff); free(alen);
+        return add_wheel(b, buf, n, L0, NULL, NULL);
+    }
+    if (keep(b, aoff) || keep(b, alen)) { free(aoff); free(alen); return -1; }
+    return add_wheel(b, buf, n, 0, aoff, alen);
+}
+
 // One node -> wheel(s): a plain class is one L==1 wheel; an exact {k} repeat is
 // its body's wheels laid down k times; a group recurses into its subexpression.
 static int add_node(struct build *b, struct rxe_node *nd)
@@ -168,6 +203,9 @@ static int add_node(struct build *b, struct rxe_node *nd)
                 !nd->is_dict && !nd->is_backref && !nd->is_inf && !nd->rxe;
     if (plain)
         return add_wheel(b, nd->str, nd->len, 1, NULL, NULL);
+
+    if (nd->is_dict)
+        return bake_dict(b, nd);
 
     if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED &&
         nd->rep_min == nd->rep_max && nd->rxe) {
@@ -673,6 +711,51 @@ done:
     return ret;
 }
 
+/* The same [:name:] word lists rxenum reads: a name.dict file, one word per
+ * line, looked up in the -D directories then the current one. Resolution runs
+ * at parse time; bake_dict then copies the words it needs. Lifted from rxedup. */
+
+#define MAX_DICT_DIRS 16
+static const char *dict_dirs[MAX_DICT_DIRS];
+static int         ndict_dirs;
+
+static char **load_dict_file(const char *path, int *nwords)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    int cap = 64, n = 0;
+    char **words = malloc(cap * sizeof *words);
+    char line[1024];
+    while (fgets(line, sizeof line, fp)) {
+        int len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
+        if (n == cap) { cap *= 2; words = realloc(words, cap * sizeof *words); }
+        words[n] = malloc(len + 1);
+        memcpy(words[n], line, len + 1);
+        n++;
+    }
+    fclose(fp);
+    *nwords = n;
+    return words;
+}
+
+static int dict_resolver(const char *name)
+{
+    for (int d = -1; d < ndict_dirs; d++) {
+        char path[1024];
+        const char *dir = d < 0 ? "." : dict_dirs[d];
+        snprintf(path, sizeof path, "%s/%s.dict", dir, name);
+        int nwords;
+        char **words = load_dict_file(path, &nwords);
+        if (!words) continue;
+        rxe_register_dict(name, (const char **)words, nwords);
+        for (int i = 0; i < nwords; i++) free(words[i]);
+        free(words);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *prog = argc > 0 ? argv[0] : "rxejit";
@@ -680,7 +763,7 @@ int main(int argc, char **argv)
     const char *jobs = NULL;              // thread count, forwarded to the exe
     const char *matchfile = NULL;         // target file for -m
 
-    while ((opt = getopt(argc, argv, "Sndvj:m:H:h")) != -1) {
+    while ((opt = getopt(argc, argv, "Sndvj:m:H:D:h")) != -1) {
         switch (opt) {
             case 'S': emit_only = 1; break;
             case 'n': sink = SINK_COUNT; break;
@@ -688,6 +771,7 @@ int main(int argc, char **argv)
             case 'v': verbose = 1; break;
             case 'j': jobs = optarg; break;
             case 'm': sink = SINK_MATCH; matchfile = optarg; break;
+            case 'D': if (ndict_dirs < MAX_DICT_DIRS) dict_dirs[ndict_dirs++] = optarg; break;
             case 'H': sink = SINK_MATCH; hash = 1;
                       if (strcmp(optarg, "md5") != 0) {
                           fprintf(stderr, "%s: -H: only md5 is supported\n", prog);
@@ -711,7 +795,8 @@ int main(int argc, char **argv)
 "             merge at the join. Exit 0 if all distinct, 1 if a duplicate.\n"
 "    -v       with -d, list the repeated members and their counts.\n"
 "    -j jobs  threads for -n, -m and -d (default: one per CPU). Printing stays\n"
-"             single-threaded and ordered.\n",
+"             single-threaded and ordered.\n"
+"    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
         }
@@ -727,6 +812,8 @@ int main(int argc, char **argv)
     const char *pattern = argv[optind];
 
     rxe_init();
+    rxe_set_dict_resolver(dict_resolver);
+    atexit(rxe_free_dicts);
     struct rxe *rxe = rxe_parse(pattern, 0);
     if (rxe_error(rxe) != RXE_OK) {
         fprintf(stderr, "%s: %s\n", prog, rxe_error_message(rxe));

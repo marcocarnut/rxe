@@ -20,6 +20,9 @@ pass=0 fail=0
 # are not, some are the wrong length -- only the length-matching members hit.
 printf 'cat\ndog\nfox\nbat\nxyz\nzzz\nhello\nq7\nab\n' > "$tmp/targets"
 
+# A small dictionary for the [:name:] tests -- 'red' twice, for the dedup one.
+printf 'red\ngreen\nblue\nred\n' > "$tmp/pal.dict"
+
 # same <pattern> -- compiling and running rxejit's output agrees with rxenum -e,
 # and its -n count agrees with the member total. This exercises the whole path:
 # codegen, the internal compile, the seeded run, and the count sink.
@@ -210,6 +213,28 @@ dedup '(a|aa){1,2}'
 
 # A large bounded repeat is past unrolling and must decline, not hang.
 declines '[a-z]{4,6}'
+
+# Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
+# count agree with rxenum -e; dedup finds the word repeated in the list.
+dict_ok() {
+    "$RXEJIT" -D "$tmp" "$1" 2>/dev/null > "$tmp/jit"
+    "$RXENUM" -D "$tmp" -e "$1" 2>/dev/null > "$tmp/ref"
+    n=$("$RXEJIT" -D "$tmp" -n "$1" 2>/dev/null)
+    if cmp -s "$tmp/jit" "$tmp/ref" && [ "$n" = "$(wc -l < "$tmp/ref")" ]; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  dict %s\n' "$1"; fail=$((fail + 1))
+    fi
+}
+dict_ok '[:pal:]'
+dict_ok '[:pal:]{2}'
+dict_ok '[:pal:]-[0-9]'
+d=$("$RXEJIT" -D "$tmp" -d '[:pal:]'); de=$?
+if [ "$d" = "4 members, 3 distinct, 1 duplicate -- NOT distinct" ] && [ "$de" = 1 ]; then
+    pass=$((pass + 1))
+else
+    printf 'FAIL  dict dedup: [%s] exit %s\n' "$d" "$de"; fail=$((fail + 1))
+fi
 
 # The -S debug output must be valid standalone C, for each sink.
 emits_compiles '[a-z]{3}[0-9]'
