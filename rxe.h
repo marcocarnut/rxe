@@ -295,6 +295,39 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe);
 int rxe_iterate(struct rxe *rxe);
 int rxe_seek(struct rxe *rxe, mpz_t pos);
 
+// rxe_foreach -- walk a contiguous range of the set and hand each member to a
+// sink. It is the increment path made whole: seek to 'from' once, then step the
+// odometer with rxe_iterate, so a division is paid only at the start and the
+// member is stepped after. Random access and keyed shuffle are the seek path
+// and are deliberately not this function; a shard is a [from, count) slice, so
+// several non-overlapping rxe_foreach calls cover one set in parallel.
+//
+// 'from' is the first index. 'count' is how many members to visit; a count of
+// zero means no limit -- to the end of a finite set, or, for an infinite one,
+// until the sink stops it. 'maxlen' bounds the rendered member exactly as
+// rxe_current's does: a member longer than that is truncated (size 'maxlen' to
+// the longest member if the sink hashes what it is handed), and a closed-form
+// repeat too large to build at all stops the walk with RXE_FOREACH_TOOBIG.
+//
+// The sink is called once per member with the rendered bytes, their length, and
+// the member's index -- the same index rxe_seek and rxe_rank use, so a sink may
+// store an index in place of the string it stands for. It returns zero to go on
+// and non-zero to stop the walk early; that value is not otherwise read, so a
+// sink is free to encode why it stopped and recover it from its own ctx.
+//
+// Returns RXE_FOREACH_END when the range ran out or the count was met,
+// RXE_FOREACH_STOP when a sink asked to stop, RXE_FOREACH_RANGE when 'from' is
+// already past the end of a finite set (nothing was emitted), and
+// RXE_FOREACH_TOOBIG when a member overflowed what could be built.
+typedef int (*rxe_sink)(const char *str, size_t len, const mpz_t index,
+                        void *ctx);
+
+enum { RXE_FOREACH_END    =  0, RXE_FOREACH_STOP   =  1,
+       RXE_FOREACH_RANGE  = -1, RXE_FOREACH_TOOBIG = -2 };
+
+int rxe_foreach(struct rxe *rxe, const mpz_t from, const mpz_t count,
+                int maxlen, rxe_sink emit, void *ctx);
+
 // rank -- the inverse of seek. Given a string, find where it sits in the set.
 // A member can appear at more than one index (a set may hold duplicates), so
 // rank is many-valued: rxe_rank returns the smallest index the string reaches,

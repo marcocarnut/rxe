@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c graph.c
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c graph.c foreach.c
 HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h rxe_graph.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -53,8 +53,10 @@ rank.o: rank.c rxe.h
 
 graph.o: graph.c rxe.h rxe_graph.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o
+foreach.o: foreach.c rxe.h
+
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api

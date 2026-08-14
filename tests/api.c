@@ -32,6 +32,31 @@ static void check_int(const char *what, long want, long got)
     check(what, w, g);
 }
 
+// A sink for rxe_foreach: joins members with '/' just as collect() does, so the
+// two walks can be compared byte for byte. It also records the last index it
+// was handed and, when stop_after is set, asks to stop once it has seen that
+// many members -- the early-exit contract a keycracker uses.
+struct catctx {
+    char  *out;
+    size_t outsz;
+    long   stop_after;   // 0 never stops; else stop when 'seen' reaches it
+    long   seen;
+    char   lastidx[64];  // the index of the last member, for an order check
+};
+
+static int cat_sink(const char *s, size_t len, const mpz_t index, void *v)
+{
+    struct catctx *c = v;
+    (void)len;
+    if (strlen(c->out) + strlen(s) + 2 < c->outsz) {
+        strcat(c->out, s);
+        strcat(c->out, "/");
+    }
+    gmp_sprintf(c->lastidx, "%Zd", index);
+    c->seen++;
+    return (c->stop_after && c->seen >= c->stop_after) ? 7 : 0;
+}
+
 // Walks the whole set, joining members with '/' so empty ones stay visible.
 static void collect(struct rxe *rxe, char *out, size_t outsz)
 {
@@ -403,6 +428,85 @@ int main(void)
         check_int("a nested error is refused", RXE_UNTERMINATED_CLASS,
                   rxe_error(rxe));
         check_int("and points inside the group", 5, rxe_error_pos(rxe));
+        rxe_free(rxe);
+    }
+
+    {
+        // rxe_foreach is the enumeration driver a bruteforcer wants. Its whole
+        // job is to agree with the seek/step loop above, so pin it against
+        // collect() and then exercise the range, count, stop and error edges.
+        struct rxe *rxe = rxe_parse("[ab][cd]", 0);   // ac ad bc bd, cardinality 4
+        char want[256], got[256];
+        collect(rxe, want, sizeof(want));
+
+        mpz_t from, count;
+        mpz_init(from);
+        mpz_init(count);
+        struct catctx c;
+
+        // A full walk (from 0, count 0 = no limit) reproduces collect() exactly.
+        c = (struct catctx){ got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("foreach over the whole set ends cleanly",
+                  RXE_FOREACH_END, rxe_foreach(rxe, from, count, 64, cat_sink, &c));
+        check("foreach agrees with the seek/step walk", want, got);
+
+        // A [from, count) slice is the shard a parallel run is handed.
+        mpz_set_ui(from, 1);
+        mpz_set_ui(count, 2);
+        c = (struct catctx){ got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("a two-member slice ends cleanly",
+                  RXE_FOREACH_END, rxe_foreach(rxe, from, count, 64, cat_sink, &c));
+        check("the slice from index 1 is the middle two", "ad/bc/", got);
+
+        // A sink that returns non-zero stops the walk where it says.
+        mpz_set_ui(from, 0);
+        mpz_set_ui(count, 0);
+        c = (struct catctx){ got, sizeof(got), 2, 0, "" };   // stop after two
+        got[0] = 0;
+        check_int("a sink can stop the walk early",
+                  RXE_FOREACH_STOP, rxe_foreach(rxe, from, count, 64, cat_sink, &c));
+        check("and it stopped exactly where it asked", "ac/ad/", got);
+
+        // The index reaches the sink: seek to 3, one member, read it back.
+        mpz_set_ui(from, 3);
+        mpz_set_ui(count, 1);
+        c = (struct catctx){ got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        rxe_foreach(rxe, from, count, 64, cat_sink, &c);
+        check("the last member is bd", "bd/", got);
+        check("and the sink saw its index", "3", c.lastidx);
+
+        // A 'from' past the end of a finite set emits nothing and says so.
+        mpz_set_ui(from, 9);
+        mpz_set_ui(count, 0);
+        c = (struct catctx){ got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("a start past the end is refused",
+                  RXE_FOREACH_RANGE, rxe_foreach(rxe, from, count, 64, cat_sink, &c));
+        check_int("and nothing was emitted", 0, c.seen);
+
+        mpz_clear(from);
+        mpz_clear(count);
+        rxe_free(rxe);
+    }
+
+    {
+        // An infinite set has no last member, so only the count (or the sink)
+        // bounds the walk. 'a*' is shortlex: "", a, aa, aaa, ...
+        struct rxe *rxe = rxe_parse("a*", 0);
+        char got[256];
+        mpz_t from, count;
+        mpz_init_set_ui(from, 0);
+        mpz_init_set_ui(count, 4);
+        struct catctx c = { got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("a bounded walk of an infinite set meets its count",
+                  RXE_FOREACH_END, rxe_foreach(rxe, from, count, 64, cat_sink, &c));
+        check("and yields the four shortest members", "/a/aa/aaa/", got);
+        mpz_clear(from);
+        mpz_clear(count);
         rxe_free(rxe);
     }
 
