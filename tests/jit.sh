@@ -76,6 +76,16 @@ same '[0-9]'
 emits_compiles '[a-z]{3}[0-9]'
 emits_compiles 'abc'
 
+# The threaded count must not depend on how many threads run it.
+one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')
+many=$("$RXEJIT" -n -j 8 '[a-z]{3}[a-z]')
+if [ "$one" = "$many" ] && [ "$one" = "456976" ]; then
+    pass=$((pass + 1))
+else
+    printf 'FAIL  count thread-invariance: -j1=%s -j8=%s (want 456976)\n' "$one" "$many"
+    fail=$((fail + 1))
+fi
+
 # Patterns outside the subset it must decline rather than miscompile.
 declines '(a|b)'
 declines '[a-z]+'
