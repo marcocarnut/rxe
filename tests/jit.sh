@@ -45,14 +45,15 @@ same() {
 }
 
 # match <pattern> -- the -m sink prints exactly the members that are in the
-# target set, in order: the same as filtering rxenum -e through the file.
+# target set: the same set as filtering rxenum -e through the file. Compared as
+# a set (sorted), since across threads the hits come out interleaved, as found.
 match() {
-    "$RXEJIT" -m "$tmp/targets" "$1" 2>/dev/null > "$tmp/jit"
-    "$RXENUM" -e "$1" | grep -Fxf "$tmp/targets" > "$tmp/ref"
+    "$RXEJIT" -m "$tmp/targets" "$1" 2>/dev/null | sort > "$tmp/jit"
+    "$RXENUM" -e "$1" | grep -Fxf "$tmp/targets" | sort > "$tmp/ref"
     if cmp -s "$tmp/jit" "$tmp/ref"; then
         pass=$((pass + 1))
     else
-        printf 'FAIL  match %s\n        -m output differs from rxenum -e filtered by the target set\n' "$1"
+        printf 'FAIL  match %s\n        -m hit set differs from rxenum -e filtered by the target set\n' "$1"
         fail=$((fail + 1))
     fi
 }
