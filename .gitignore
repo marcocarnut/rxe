@@ -7,5 +7,7 @@ rxedot
 rxedot-asan
 rxerank
 rxerank-asan
+rxedup
+rxedup-asan
 tests/api
 tests/api-asan

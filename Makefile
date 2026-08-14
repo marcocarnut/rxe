@@ -26,6 +26,13 @@ rxerank: rxerank.o librxe.a rxe.h
 
 rxerank.o: rxerank.c rxe.h
 
+# A sibling tool: brute-force duplicate detection. Walks the set through
+# rxe_foreach, hashing each member, and reports repeats. Not built by 'all'.
+rxedup: rxedup.o librxe.a rxe.h
+	$(CC) rxedup.o -g -L. -lgmp -lm -lrxe -o rxedup
+
+rxedup.o: rxedup.c rxe.h
+
 rxenum.o: rxenum.c rxe.h
 
 rxe.o: rxe.c rxe.h parse.h repeat.h pair.h lens.h
@@ -83,6 +90,10 @@ rxerank-asan: rxerank.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 	$(CC) $(WARNFLAGS) $(SANFLAGS) rxerank.c \
 	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxerank-asan
 
+rxedup-asan: rxedup.c $(filter-out rxenum.c,$(SRC)) $(HDR)
+	$(CC) $(WARNFLAGS) $(SANFLAGS) rxedup.c \
+	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxedup-asan
+
 test-asan: rxenum-asan rxerank-asan tests/api-asan
 	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
 	ASAN_OPTIONS=detect_leaks=1 ./tests/api-asan
@@ -94,7 +105,7 @@ test-asan: rxenum-asan rxerank-asan tests/api-asan
 	fi
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxerank rxerank-asan tests/api tests/api-asan
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan tests/api tests/api-asan
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
