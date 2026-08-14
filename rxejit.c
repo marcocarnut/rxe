@@ -54,28 +54,44 @@ enum { SINK_WRITE, SINK_COUNT, SINK_MATCH, SINK_DUP };
 
 #define ALT_CAP 65536              // most members a baked alternation may hold
 
-// One odometer wheel: n alternatives, each L bytes, at 'base' laid end to end
-// (alternative i is base + i*L). A character class is the L==1 case, its bytes
-// the class string; an alternation of equal-length branches is L>1, its bytes
-// the members baked out by the interpreter. Stepping the wheel copies L bytes.
-struct wheel { const char *base; int n; int L; };
+// One odometer wheel: n alternatives at 'base'. When every alternative is the
+// same length it is fixed -- L bytes, alternative i at base + i*L, the fast
+// case (a class is L==1). When they differ it is variable -- L is 0, and aoff[i]
+// / alen[i] give alternative i's start and length in 'base'. A member's fixed
+// wheels sit at compile-time offsets; a variable one makes the offsets of every
+// wheel after it depend on the choice, so such members are rebuilt each step.
+struct wheel { const char *base; int n; int L; const int *aoff; const int *alen; };
 
 static const char *reason;         // why a pattern was declined, for the message
 
-// The running build: the wheels gathered so far, plus the buffers baked for
-// alternations (freed once the code is emitted).
+// The running build: the wheels gathered so far, plus every buffer baked for an
+// alternation -- bytes and the offset/length arrays -- freed once code is out.
 struct build {
     struct wheel *w;
     int           nw;
-    char        **bake;
+    void        **bake;
     int           nbake, cbake;
 };
 
-static int add_wheel(struct build *b, const char *base, int n, int L)
+static int keep(struct build *b, void *p)   // track an allocation for freeing
+{
+    if (!p) { reason = "out of memory"; return -1; }
+    if (b->nbake == b->cbake) {
+        int nc = b->cbake ? b->cbake * 2 : 8;
+        void **nb = realloc(b->bake, (size_t)nc * sizeof *nb);
+        if (!nb) { reason = "out of memory"; return -1; }
+        b->bake = nb; b->cbake = nc;
+    }
+    b->bake[b->nbake++] = p;
+    return 0;
+}
+
+static int add_wheel(struct build *b, const char *base, int n, int L,
+                     const int *aoff, const int *alen)
 {
     if (n < 1)         { reason = "an empty class"; return -1; }
     if (b->nw >= MAXW) { reason = "too many positions to unroll"; return -1; }
-    b->w[b->nw].base = base; b->w[b->nw].n = n; b->w[b->nw].L = L;
+    b->w[b->nw] = (struct wheel){ base, n, L, aoff, alen };
     b->nw++;
     return 0;
 }
@@ -84,11 +100,10 @@ static int add_rxe(struct build *b, struct rxe *rxe);
 
 // An alternation becomes one wheel by baking its members: enumerate them with
 // the interpreter, in seek order -- the very order the parent odometer drives
-// this position through -- and store them as the wheel's alternatives. They
-// must all be the same byte length (the flat buffer has no room for a position
-// that changes width) and few enough to unroll. Duplicate branches like (a|a)
-// bake to repeated alternatives, so the odometer visits the repeat and a dedup
-// sink can see it -- which is the point of taking alternations at all.
+// this position through -- and store them as the wheel's alternatives. Equal
+// lengths give a fixed wheel, uneven ones a variable wheel. Duplicate branches
+// like (a|a) bake to repeated alternatives, so the odometer visits the repeat
+// and a dedup sink can see it -- which is the point of taking alternations.
 static int bake_alt(struct build *b, struct rxe *rxe)
 {
     if (rxe->ninf || !mpz_fits_ulong_p(rxe->nitems)) {
@@ -98,38 +113,46 @@ static int bake_alt(struct build *b, struct rxe *rxe)
     if (n < 1)       { reason = "an empty alternation"; return -1; }
     if (n > ALT_CAP) { reason = "an alternation too large to unroll"; return -1; }
 
+    int *aoff = malloc(n * sizeof *aoff);
+    int *alen = malloc(n * sizeof *alen);
+    char *buf = NULL;
+    unsigned long cap = 0, total = 0;
     char tmp[4096];
     mpz_t idx;
     mpz_init(idx);
-    int L = -1;
-    char *buf = NULL;
+    if (!aoff || !alen) { reason = "out of memory"; goto fail; }
+
     for (unsigned long i = 0; i < n; i++) {
         mpz_set_ui(idx, i);
         if (rxe_seek(rxe, idx)) { reason = "an alternation that would not seek"; goto fail; }
         char *end = rxe_current(tmp, (int)sizeof tmp - 1, rxe);
         int len = (int)(end - tmp);
-        if (i == 0) {
-            L = len;
-            if (L < 1 || L >= (int)sizeof tmp - 1) { reason = "an alternation member too long"; goto fail; }
-            buf = malloc((size_t)n * L);
-            if (!buf) { reason = "out of memory"; goto fail; }
-        } else if (len != L) {
-            reason = "an alternation with uneven member lengths"; goto fail;
+        if (len >= (int)sizeof tmp - 1) { reason = "an alternation member too long"; goto fail; }
+        if (total + (unsigned long)len > cap) {
+            cap = (total + (unsigned long)len) * 2 + 16;
+            char *nb = realloc(buf, cap);
+            if (!nb) { reason = "out of memory"; goto fail; }
+            buf = nb;
         }
-        memcpy(buf + (size_t)i * L, tmp, L);
+        memcpy(buf + total, tmp, (size_t)len);
+        aoff[i] = (int)total; alen[i] = len; total += (unsigned long)len;
     }
     mpz_clear(idx);
+    if (!buf) { buf = malloc(1); if (!buf) { reason = "out of memory"; free(aoff); free(alen); return -1; } }
 
-    if (b->nbake == b->cbake) {
-        int nc = b->cbake ? b->cbake * 2 : 8;
-        char **nb = realloc(b->bake, (size_t)nc * sizeof *nb);
-        if (!nb) { free(buf); reason = "out of memory"; return -1; }
-        b->bake = nb; b->cbake = nc;
+    int fixed = 1;
+    for (unsigned long i = 1; i < n; i++) if (alen[i] != alen[0]) { fixed = 0; break; }
+
+    if (keep(b, buf)) { free(buf); free(aoff); free(alen); return -1; }
+    if (fixed) {
+        int L0 = alen[0];
+        free(aoff); free(alen);
+        return add_wheel(b, buf, (int)n, L0, NULL, NULL);
     }
-    b->bake[b->nbake++] = buf;
-    return add_wheel(b, buf, (int)n, L);
+    if (keep(b, aoff) || keep(b, alen)) { free(aoff); free(alen); return -1; }
+    return add_wheel(b, buf, (int)n, 0, aoff, alen);
 fail:
-    free(buf);
+    free(buf); free(aoff); free(alen);
     mpz_clear(idx);
     return -1;
 }
@@ -141,7 +164,7 @@ static int add_node(struct build *b, struct rxe_node *nd)
     int plain = !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
                 !nd->is_dict && !nd->is_backref && !nd->is_inf && !nd->rxe;
     if (plain)
-        return add_wheel(b, nd->str, nd->len, 1);
+        return add_wheel(b, nd->str, nd->len, 1, NULL, NULL);
 
     if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED &&
         nd->rep_min == nd->rep_max && nd->rxe) {
@@ -257,12 +280,32 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     int threaded = (acc || dup) && nmemb;       // split [0,N) when N fits 64 bits
     int rt       = match || dup;                // needs the embedded runtime
 
-    // Dedup is a closed form here: each wheel owns a disjoint slice of the
-    // member, so distinct = product of each wheel's distinct alternatives, and
-    // the whole verdict follows without enumerating anything -- which is what
-    // lets -d answer a set of any size at once. Only -d -v, which must show the
-    // repeated members, enumerates, and only when the set is small enough to.
-    if (dup) {
+    // Sizing. A variable wheel (an uneven alternation) has L==0 and per-branch
+    // aoff/alen; it makes a member's length depend on the choice, so offsets go
+    // dynamic and the member is rebuilt each step rather than delta-patched.
+    // bufcap is the most a member can hold; multi marks memcpy (and string.h).
+    int variable = 0, bufcap = 0, multi = 0;
+    for (int i = 0; i < nw; i++) {
+        if (w[i].L == 0) {
+            variable = 1; multi = 1;
+            int m = 0;
+            for (int j = 0; j < w[i].n; j++) if (w[i].alen[j] > m) m = w[i].alen[j];
+            bufcap += m;
+        } else {
+            if (w[i].L > 1) multi = 1;
+            bufcap += w[i].L;
+        }
+    }
+    int off[MAXW], TL = 0;
+    if (!variable) for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; }
+
+    // Dedup is a closed form for the fixed case: each wheel owns a disjoint slice
+    // of the member, so distinct = product of each wheel's distinct alternatives,
+    // and the verdict follows without enumerating, at any size. A variable wheel
+    // breaks that -- members alias across positions -- so those fall through to
+    // the enumerate-and-hash path. Only -d -v enumerates in the fixed case, to
+    // show the repeats, and only when the set is small enough.
+    if (dup && !variable) {
         mpz_t total, distinct, dups;
         mpz_init_set_ui(total, 1);
         mpz_init_set_ui(distinct, 1);
@@ -294,12 +337,6 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
         // listable: fall through to the enumerate-and-hash code below.
     }
 
-    // Buffer offsets: each wheel lays L bytes, so a wider one (an alternation)
-    // pushes those after it along. TL is the member length; multi marks whether
-    // any wheel is wider than a byte, which is when memcpy (and string.h) enter.
-    int off[MAXW], TL = 0, multi = 0;
-    for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; if (w[i].L > 1) multi = 1; }
-
     fputs("/* generated by rxejit from: ", o);
     emit_comment(o, pattern);
     fputs(" */\n#include <stdio.h>\n", o);
@@ -321,46 +358,88 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
         ? "static void run(unsigned long long from, unsigned long long count, unsigned long long *acc)\n{\n"
         : "static void run(unsigned long long from, unsigned long long count)\n{\n", o);
 
+    // Alphabet tables: each wheel's bytes, plus offset/length tables for a
+    // variable wheel, whose branches are not evenly spaced.
     for (int i = 0; i < nw; i++) {
+        int bytes = w[i].L ? w[i].n * w[i].L
+                           : w[i].aoff[w[i].n - 1] + w[i].alen[w[i].n - 1];
         fprintf(o, "    static const unsigned char A%d[] = {", i);
-        for (int j = 0; j < w[i].n * w[i].L; j++)
+        if (bytes == 0) fputs("0", o);              // all-empty branches; never read
+        for (int j = 0; j < bytes; j++)
             fprintf(o, "%s%d", j ? "," : "", (unsigned char)w[i].base[j]);
         fputs("};\n", o);
+        if (w[i].L == 0) {
+            fprintf(o, "    static const int A%do[] = {", i);
+            for (int j = 0; j < w[i].n; j++) fprintf(o, "%s%d", j ? "," : "", w[i].aoff[j]);
+            fputs("};\n", o);
+            fprintf(o, "    static const int A%dl[] = {", i);
+            for (int j = 0; j < w[i].n; j++) fprintf(o, "%s%d", j ? "," : "", w[i].alen[j]);
+            fputs("};\n", o);
+        }
     }
 
-    fprintf(o, "    unsigned char buf[%d];\n", TL + 1);
-    fprintf(o, "    buf[%d] = '\\n';\n", TL);
+    fprintf(o, "    unsigned char buf[%d];\n", bufcap + 1);
+    if (!variable) fprintf(o, "    buf[%d] = '\\n';\n", TL);
 
     // Seed each wheel from 'from': digit = from %% radix, then from /= radix,
-    // walking from the least significant wheel up, so the buffer starts on the
-    // member at index 'from' rather than always at zero.
+    // walking from the least significant wheel up, so the walk starts at 'from'.
     fputs("    unsigned long long f = from;\n", o);
     for (int i = nw - 1; i >= 0; i--)
         fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, w[i].n, w[i].n);
-    for (int i = 0; i < nw; i++) {
-        char e[16]; snprintf(e, sizeof e, "i%d", i);
-        fputs("    ", o); emit_lay(o, i, off[i], w[i].L, e); fputc('\n', o);
-    }
+    if (!variable)                                  // fixed: lay the initial member once
+        for (int i = 0; i < nw; i++) {
+            char e[16]; snprintf(e, sizeof e, "i%d", i);
+            fputs("    ", o); emit_lay(o, i, off[i], w[i].L, e); fputc('\n', o);
+        }
+
+    // The member length reaching the sink: a compile-time constant when fixed,
+    // the running length 'p' when variable (rebuilt at the top of the loop).
+    char len[16], lenp1[16];
+    if (variable) { strcpy(len, "p"); strcpy(lenp1, "p + 1"); }
+    else { snprintf(len, sizeof len, "%d", TL); snprintf(lenp1, sizeof lenp1, "%d", TL + 1); }
 
     if (acc) fputs("    unsigned long long n = 0;\n", o);
     fputs("    unsigned long long done = 0;\n", o);
     fputs("    for (;;) {\n", o);
-    if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %d);\n", TL);
-    else if (match) fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %d))"
-                               " { pthread_mutex_lock(&MX); fwrite(buf, 1, %d, stdout);"
-                               " pthread_mutex_unlock(&MX); n++; }\n", TL, TL + 1);
-    else if (count) fputs("        n++;\n", o);
-    else            fprintf(o, "        fwrite(buf, 1, %d, stdout);\n", TL + 1);
-    fputs("        if (count && ++done == count) break;\n", o);
-    for (int i = nw - 1; i >= 0; i--) {
-        char e[16]; snprintf(e, sizeof e, "i%d", i);
-        fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
-        emit_lay(o, i, off[i], w[i].L, e);
-        fprintf(o, " continue; } i%d = 0; ", i);
-        emit_lay(o, i, off[i], w[i].L, "0");
-        fputc('\n', o);
+    if (variable) {
+        // Rebuild the member: concatenate each wheel's current branch, tracking
+        // the running length p, since a variable wheel shifts everything after it.
+        fputs("        int p = 0;\n", o);
+        for (int i = 0; i < nw; i++)
+            if (w[i].L)
+                fprintf(o, "        memcpy(buf + p, A%d + i%d * %d, %d); p += %d;\n",
+                        i, i, w[i].L, w[i].L, w[i].L);
+            else
+                fprintf(o, "        memcpy(buf + p, A%d + A%do[i%d], A%dl[i%d]);"
+                           " p += A%dl[i%d];\n", i, i, i, i, i, i, i);
+        fputs("        buf[p] = '\\n';\n", o);
     }
-    fputs("        break;\n    }\n", o);
+    if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
+    else if (match) fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %s))"
+                               " { pthread_mutex_lock(&MX); fwrite(buf, 1, %s, stdout);"
+                               " pthread_mutex_unlock(&MX); n++; }\n", len, lenp1);
+    else if (count) fputs("        n++;\n", o);
+    else            fprintf(o, "        fwrite(buf, 1, %s, stdout);\n", lenp1);
+    fputs("        if (count && ++done == count) break;\n", o);
+    if (variable) {
+        // Advance the odometer without touching the buffer; it is rebuilt above.
+        fputs("        {\n            int c = 1;\n", o);
+        for (int i = nw - 1; i >= 0; i--)
+            fprintf(o, "            if (c) { if (++i%d < %d) c = 0; else i%d = 0; }\n",
+                    i, w[i].n, i);
+        fputs("            if (c) break;\n        }\n", o);
+    } else {
+        for (int i = nw - 1; i >= 0; i--) {
+            char e[16]; snprintf(e, sizeof e, "i%d", i);
+            fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
+            emit_lay(o, i, off[i], w[i].L, e);
+            fprintf(o, " continue; } i%d = 0; ", i);
+            emit_lay(o, i, off[i], w[i].L, "0");
+            fputc('\n', o);
+        }
+        fputs("        break;\n", o);
+    }
+    fputs("    }\n", o);
     if (acc) fputs("    *acc += n;\n", o);
     fputs("}\n\n", o);
 

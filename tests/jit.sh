@@ -123,9 +123,16 @@ same 'pre(0|1|2)'
 same '(a|b)'
 same '(ab)(?1)'        # a subroutine call: an independent copy of the group
 
-# Uneven-length alternations are out of the fixed-width subset: decline them.
-declines 'cat|hi'
-declines '(a|bc)'
+# Variable-length: uneven-length alternations and empty branches. Same place-
+# value order as rxenum -e, but members change width, so they are rebuilt each
+# step rather than delta-patched.
+same '(cat|hi)'
+same '(a|bc)d'
+same 'x(a|bc)'
+same '(a|)'
+same '(ab|a)(b|)'
+same '(cat|hi)[0-9]'
+same '(a|bc)(d|ef)'
 
 # The match sink: hits (length 3), no hits (length 2, but 'ab'/'q7' are there),
 # and a mask disjoint from the targets (empty result both ways).
@@ -133,6 +140,7 @@ match '[a-z]{3}'
 match '[a-z][0-9]'
 match '[a-z]{2}'
 match '[0-9]{4}'
+match '(a|ab)'          # variable-length: 'a' misses (len 1 vs targets), 'ab' hits
 
 # The dedup sink: all-distinct masks, and the duplicate-bearing alternations,
 # including ones whose repeats fall in different shards under threading.
@@ -158,11 +166,19 @@ structural() {
 structural '[a-z]{7}'      '8031810176 members, all distinct' 0
 structural '(a|a)[a-z]{6}' '617831552 members, 308915776 distinct, 308915776 duplicates -- NOT distinct' 1
 
+# Variable-length dedup: the alias "ab" from (ab|a)(b|) spans two positions, so
+# the closed form cannot see it -- these must take the enumerate-and-hash path.
+dedup '(ab|a)(b|)'
+dedup '(ab|a)(ba|b)(a|)'
+dedup '(cat|hi)(cat|hi)'
+
 # The -S debug output must be valid standalone C, for each sink.
 emits_compiles '[a-z]{3}[0-9]'
 emits_compiles 'abc'
 emits_compiles -d '(a|a)'
 emits_compiles -n '[a-z]{3}'
+emits_compiles '(a|bc)d'          # variable-length write
+emits_compiles -d '(ab|a)(b|)'    # variable-length dedup
 
 # The threaded count must not depend on how many threads run it.
 one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')
