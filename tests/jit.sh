@@ -58,12 +58,32 @@ match() {
     fi
 }
 
-# emits_compiles <pattern> -- the -S debug output is valid, standalone C.
-emits_compiles() {
-    if "$RXEJIT" -S "$1" 2>/dev/null | "$CC" -O2 -x c - -o "$tmp/s" 2>"$tmp/e"; then
+# dedup <pattern> -- the -d sink's counts and verdict match the oracle: total
+# members from rxenum -e, distinct from sort -u, duplicates their difference.
+dedup() {
+    out=$("$RXEJIT" -d "$1"); je=$?
+    total=$("$RXENUM" -e "$1" | wc -l | tr -d ' ')
+    distinct=$("$RXENUM" -e "$1" | sort -u | wc -l | tr -d ' ')
+    dups=$((total - distinct))
+    got=$(printf '%s' "$out" | grep -oE '[0-9]+' | tr '\n' ' ')
+    if [ "$dups" -gt 0 ]; then want="$total $distinct $dups "; want_e=1
+    else                        want="$total "; want_e=0; fi
+    if [ "$je" = "$want_e" ] && [ "$got" = "$want" ]; then
         pass=$((pass + 1))
     else
-        printf 'FAIL  %s\n        -S output did not compile:\n%s\n' "$1" "$(cat "$tmp/e")"
+        printf 'FAIL  dedup %s\n        got [%s] exit %s, want [%s] exit %s\n' \
+               "$1" "$got" "$je" "$want" "$want_e"
+        fail=$((fail + 1))
+    fi
+}
+
+# emits_compiles <args...> -- the -S debug output for these args is valid,
+# standalone C (with -pthread, since the threaded sinks link it).
+emits_compiles() {
+    if "$RXEJIT" -S "$@" 2>/dev/null | "$CC" -O2 -pthread -x c - -o "$tmp/s" 2>"$tmp/e"; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  %s\n        -S output did not compile:\n%s\n' "$*" "$(cat "$tmp/e")"
         fail=$((fail + 1))
     fi
 }
@@ -114,9 +134,20 @@ match '[a-z][0-9]'
 match '[a-z]{2}'
 match '[0-9]{4}'
 
-# The -S debug output must be valid standalone C.
+# The dedup sink: all-distinct masks, and the duplicate-bearing alternations,
+# including ones whose repeats fall in different shards under threading.
+dedup '[a-z]{3}'
+dedup '(a|a)'
+dedup '(cat|dog|cat)'
+dedup '(a|a)(b|b)'
+dedup '(foo|bar|foo)[a-z]{2}'
+dedup 'x(a|a|a)y'
+
+# The -S debug output must be valid standalone C, for each sink.
 emits_compiles '[a-z]{3}[0-9]'
 emits_compiles 'abc'
+emits_compiles -d '(a|a)'
+emits_compiles -n '[a-z]{3}'
 
 # The threaded count must not depend on how many threads run it.
 one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')
