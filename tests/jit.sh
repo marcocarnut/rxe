@@ -16,22 +16,36 @@ tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 pass=0 fail=0
 
-# same <pattern> -- the generated enumerator agrees with rxenum -e
+# same <pattern> -- compiling and running rxejit's output agrees with rxenum -e,
+# and its -n count agrees with the member total. This exercises the whole path:
+# codegen, the internal compile, the seeded run, and the count sink.
 same() {
-    if ! "$RXEJIT" "$1" > "$tmp/g.c" 2> "$tmp/e"; then
-        printf 'FAIL  %s\n        rxejit declined: %s\n' "$1" "$(cat "$tmp/e")"
+    if ! "$RXEJIT" "$1" > "$tmp/jit" 2> "$tmp/e"; then
+        printf 'FAIL  %s\n        rxejit: %s\n' "$1" "$(cat "$tmp/e")"
         fail=$((fail + 1)); return
     fi
-    if ! "$CC" -O2 "$tmp/g.c" -o "$tmp/g" 2> "$tmp/e"; then
-        printf 'FAIL  %s\n        generated C did not compile:\n%s\n' "$1" "$(cat "$tmp/e")"
-        fail=$((fail + 1)); return
-    fi
-    "$tmp/g" > "$tmp/jit"
     "$RXENUM" -e "$1" > "$tmp/ref"
-    if cmp -s "$tmp/jit" "$tmp/ref"; then
+    if ! cmp -s "$tmp/jit" "$tmp/ref"; then
+        printf 'FAIL  %s\n        generated output differs from rxenum -e\n' "$1"
+        fail=$((fail + 1)); return
+    fi
+    # The -n count sink must match the number of members.
+    n=$("$RXEJIT" -n "$1")
+    want=$(wc -l < "$tmp/ref")
+    if [ "$n" = "$want" ]; then
         pass=$((pass + 1))
     else
-        printf 'FAIL  %s\n        generated output differs from rxenum -e\n' "$1"
+        printf 'FAIL  %s\n        -n counted %s, expected %s\n' "$1" "$n" "$want"
+        fail=$((fail + 1))
+    fi
+}
+
+# emits_compiles <pattern> -- the -S debug output is valid, standalone C.
+emits_compiles() {
+    if "$RXEJIT" -S "$1" 2>/dev/null | "$CC" -O2 -x c - -o "$tmp/s" 2>"$tmp/e"; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  %s\n        -S output did not compile:\n%s\n' "$1" "$(cat "$tmp/e")"
         fail=$((fail + 1))
     fi
 }
@@ -57,6 +71,10 @@ same '[a-z]{2}[0-9]{2}'
 same 'q[0-9]w[a-f]'
 same '[A-Fa-f0-9]{2}'
 same '[0-9]'
+
+# The -S debug output must be valid standalone C.
+emits_compiles '[a-z]{3}[0-9]'
+emits_compiles 'abc'
 
 # Patterns outside the subset it must decline rather than miscompile.
 declines '(a|b)'
