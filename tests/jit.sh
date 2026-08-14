@@ -152,6 +152,30 @@ match '[a-z]{2}'
 match '[0-9]{4}'
 match '(a|ab)'          # variable-length: 'a' misses (len 1 vs targets), 'ab' hits
 
+# keycrack <pattern> <plaintext...> -- -H md5 recovers the plaintexts whose MD5
+# digests are in the file, printed as digest:plaintext. md5sum builds the
+# targets; skipped where it is absent.
+keycrack() {
+    pat=$1; shift
+    : > "$tmp/kh"
+    for pt in "$@"; do printf '%s' "$pt" | md5sum | cut -d' ' -f1 >> "$tmp/kh"; done
+    got=$("$RXEJIT" -m "$tmp/kh" -H md5 "$pat" 2>/dev/null | sort)
+    want=$(for pt in "$@"; do printf '%s:%s\n' "$(printf '%s' "$pt" | md5sum | cut -d' ' -f1)" "$pt"; done | sort)
+    if [ "$got" = "$want" ]; then
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  keycrack %s\n        got [%s] want [%s]\n' "$pat" "$got" "$want"
+        fail=$((fail + 1))
+    fi
+}
+if command -v md5sum >/dev/null 2>&1; then
+    keycrack '[0-9]{4}' 1234 0042 9999
+    keycrack '[a-z]{3}' cat dog
+    keycrack '(cat|hi)[0-9]' hi7    # variable-length keyspace
+else
+    printf 'keycrack: skipped, md5sum not found\n'
+fi
+
 # The dedup sink: all-distinct masks, and the duplicate-bearing alternations,
 # including ones whose repeats fall in different shards under threading.
 dedup '[a-z]{3}'
@@ -194,6 +218,7 @@ emits_compiles -d '(a|a)'
 emits_compiles -n '[a-z]{3}'
 emits_compiles '(a|bc)d'          # variable-length write
 emits_compiles -d '(ab|a)(b|)'    # variable-length dedup
+emits_compiles -m /dev/null -H md5 '[0-9]{4}'   # keycracking
 
 # The threaded count must not depend on how many threads run it.
 one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')

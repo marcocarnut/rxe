@@ -113,6 +113,128 @@ static void rt_set_free(struct rt_set *s)
     free(s->key); free(s->len); free(s->hash); free(s->store);
 }
 
+/* ---- MD5, for keycracking -------------------------------------------------
+ * The candidate is hashed and its digest looked up in the target set, so the
+ * targets are hashes of unknown plaintexts and a hit is a crack. RFC 1321,
+ * whole-message (candidates are short), no allocation on the hot path: full
+ * 64-byte blocks are consumed in place and only the tail is padded in a local
+ * buffer. rt_md5 needs unsigned int to be 32 bits, which it is everywhere here.
+ */
+
+#define RT_ROTL(x, c) (((x) << (c)) | ((x) >> (32 - (c))))
+
+static void rt_md5_block(unsigned int abcd[4], const unsigned char *p)
+{
+    static const unsigned int K[64] = {
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+    static const unsigned char S[64] = {
+        7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+    unsigned int M[16];
+    for (int i = 0; i < 16; i++)
+        M[i] =  (unsigned int)p[i*4]
+             | ((unsigned int)p[i*4+1] << 8)
+             | ((unsigned int)p[i*4+2] << 16)
+             | ((unsigned int)p[i*4+3] << 24);
+    unsigned int A = abcd[0], B = abcd[1], C = abcd[2], D = abcd[3];
+    for (int i = 0; i < 64; i++) {
+        unsigned int F; int g;
+        if      (i < 16) { F = (B & C) | (~B & D);        g = i;             }
+        else if (i < 32) { F = (D & B) | (~D & C);        g = (5*i + 1) & 15; }
+        else if (i < 48) { F = B ^ C ^ D;                 g = (3*i + 5) & 15; }
+        else             { F = C ^ (B | ~D);              g = (7*i)     & 15; }
+        F += A + K[i] + M[g];
+        A = D; D = C; C = B; B += RT_ROTL(F, S[i]);
+    }
+    abcd[0] += A; abcd[1] += B; abcd[2] += C; abcd[3] += D;
+}
+
+static void rt_md5(const unsigned char *msg, unsigned long len, unsigned char out[16])
+{
+    unsigned int abcd[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    unsigned long i = 0;
+    for (; i + 64 <= len; i += 64) rt_md5_block(abcd, msg + i);
+
+    unsigned char tail[128];
+    memset(tail, 0, sizeof tail);
+    unsigned long r = len - i;
+    memcpy(tail, msg + i, r);
+    tail[r] = 0x80;
+    unsigned long padlen = r < 56 ? 64 : 128;
+    unsigned long long bits = (unsigned long long)len * 8;
+    for (int k = 0; k < 8; k++) tail[padlen - 8 + k] = (unsigned char)((bits >> (8*k)) & 0xff);
+    rt_md5_block(abcd, tail);
+    if (padlen == 128) rt_md5_block(abcd, tail + 64);
+
+    for (int k = 0; k < 4; k++) {
+        out[k*4]   = (unsigned char)(abcd[k]        & 0xff);
+        out[k*4+1] = (unsigned char)((abcd[k] >> 8) & 0xff);
+        out[k*4+2] = (unsigned char)((abcd[k] >> 16)& 0xff);
+        out[k*4+3] = (unsigned char)((abcd[k] >> 24)& 0xff);
+    }
+}
+
+/* Load a file of hex digests, one per line, into the set as raw bytes: each
+ * line must be exactly 2*dglen hex characters, decoded in place (the decoded
+ * bytes are shorter, so they fit over the front of the line). Malformed lines
+ * are skipped. Returns 0 on success. */
+static int rt_hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int rt_load_hashes(struct rt_set *s, const char *path, int dglen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    rewind(f);
+    char *buf = malloc((unsigned long)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    unsigned long got = fread(buf, 1, (unsigned long)sz, f);
+    fclose(f);
+    buf[got] = 0;
+
+    unsigned long lines = 1;
+    for (unsigned long i = 0; i < got; i++) if (buf[i] == '\n') lines++;
+    if (!rt_set_init(s, lines)) { free(buf); return -1; }
+    s->store = buf;
+
+    unsigned long start = 0;
+    for (unsigned long i = 0; i <= got; i++) {
+        if (i == got || buf[i] == '\n') {
+            unsigned long e = i;
+            while (e > start && buf[e - 1] == '\r') e--;
+            if ((long)(e - start) == 2 * dglen) {
+                int ok = 1;
+                for (int k = 0; k < dglen; k++) {
+                    int hi = rt_hexval((unsigned char)buf[start + 2*k]);
+                    int lo = rt_hexval((unsigned char)buf[start + 2*k + 1]);
+                    if (hi < 0 || lo < 0) { ok = 0; break; }
+                    buf[start + k] = (char)((hi << 4) | lo);
+                }
+                if (ok) rt_set_add(s, buf + start, (unsigned long)dglen);
+            }
+            start = i + 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- a bump arena + a growing multiset, for the dedup sink ----------------
  * Each thread dedups its shard into its own rt_dup, so the hot loop shares
  * nothing and needs no lock; the sets are merged once, at the join. The members

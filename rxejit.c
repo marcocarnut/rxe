@@ -294,11 +294,15 @@ static int wheel_distinct(const struct wheel *w)
 // interleave, and generation to a pipe is I/O-bound anyway, so there is nothing
 // to win there.
 static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
-                 int sink, const char *nmemb, int verbose)
+                 int sink, const char *nmemb, int verbose, int hash)
 {
     int count    = sink == SINK_COUNT;
     int match    = sink == SINK_MATCH;
     int dup      = sink == SINK_DUP;
+    // How the match sink loads its targets: raw plaintext lines, or hex MD5
+    // digests decoded to 16 bytes (keycracking, hash the candidate then probe).
+    const char *load = hash ? "rt_load_hashes(&TB, argv[1], 16)"
+                            : "rt_load(&TB, argv[1])";
     int acc      = count || match;              // sinks that tally into *acc
     int threaded = (acc || dup) && nmemb;       // split [0,N) when N fits 64 bits
     int rt       = match || dup;                // needs the embedded runtime
@@ -427,6 +431,13 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     if (variable) {
         // Rebuild the member: concatenate each wheel's current branch, tracking
         // the running length p, since a variable wheel shifts everything after it.
+        //
+        // TODO(perf): this rebuilds the whole member every step (a memcpy per
+        // wheel), ~7-10x slower than the fixed delta path. Most steps only turn
+        // the last wheel, so re-laying just the suffix from the wheel that
+        // carried -- tracking each wheel's current offset -- would collapse the
+        // common case back toward fixed speed. Left out of the first correct
+        // version; worth it only if a variable-length workload is throughput-bound.
         fputs("        int p = 0;\n", o);
         for (int i = 0; i < nw; i++)
             if (w[i].L)
@@ -438,6 +449,13 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
         fputs("        buf[p] = '\\n';\n", o);
     }
     if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
+    else if (match && hash)
+                    fprintf(o, "        { unsigned char dg[16]; rt_md5(buf, %s, dg);\n"
+                               "          if (rt_set_has(&TB, (const char *)dg, 16)) {\n"
+                               "            pthread_mutex_lock(&MX);\n"
+                               "            for (int h = 0; h < 16; h++) printf(\"%%02x\", dg[h]);\n"
+                               "            putchar(':'); fwrite(buf, 1, %s, stdout); putchar('\\n');\n"
+                               "            pthread_mutex_unlock(&MX); n++; } }\n", len, len);
     else if (match) fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %s))"
                                " { pthread_mutex_lock(&MX); fwrite(buf, 1, %s, stdout);"
                                " pthread_mutex_unlock(&MX); n++; }\n", len, lenp1);
@@ -538,11 +556,11 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
               "    return 0;\n"
               "}\n\n"
               "int main(int argc, char **argv)\n{\n", o);
-        if (match)
-            fputs("    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE [jobs]\\n\", argv[0]); return 2; }\n"
-                  "    if (rt_load(&TB, argv[1])) { fprintf(stderr, \"rxejit: cannot read %s\\n\", argv[1]); return 2; }\n"
-                  "    int argoff = 2;\n", o);
-        else
+        if (match) {
+            fputs("    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE [jobs]\\n\", argv[0]); return 2; }\n", o);
+            fprintf(o, "    if (%s) { fprintf(stderr, \"rxejit: cannot read %%s\\n\", argv[1]); return 2; }\n", load);
+            fputs("    int argoff = 2;\n", o);
+        } else
             fputs("    int argoff = 1;\n", o);
         fputs("    long np = sysconf(_SC_NPROCESSORS_ONLN);\n"
               "    int T = np < 1 ? 1 : (int)np;\n"
@@ -574,9 +592,9 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     } else if (match) {
         // N over 64 bits: unsplittable, so one thread (the mutex uncontended).
         fputs("int main(int argc, char **argv)\n{\n"
-              "    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE\\n\", argv[0]); return 2; }\n"
-              "    if (rt_load(&TB, argv[1])) { fprintf(stderr, \"rxejit: cannot read %s\\n\", argv[1]); return 2; }\n"
-              "    unsigned long long acc = 0;\n"
+              "    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE\\n\", argv[0]); return 2; }\n", o);
+        fprintf(o, "    if (%s) { fprintf(stderr, \"rxejit: cannot read %%s\\n\", argv[1]); return 2; }\n", load);
+        fputs("    unsigned long long acc = 0;\n"
               "    run(0, 0, &acc);\n"
               "    fprintf(stderr, \"%llu matches\\n\", acc);\n"
               "    rt_set_free(&TB);\n"
@@ -610,7 +628,7 @@ static int spawn(char *const argv[])
 // code.
 static int compile_and_run(const char *pattern, struct wheel *w, int nw,
                            int sink, const char *nmemb, const char *jobs,
-                           const char *matchfile, int verbose)
+                           const char *matchfile, int verbose, int hash)
 {
     char dir[] = "/tmp/rxejit.XXXXXX";
     if (!mkdtemp(dir)) { perror("rxejit: mkdtemp"); return 2; }
@@ -622,7 +640,7 @@ static int compile_and_run(const char *pattern, struct wheel *w, int nw,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    emit(f, pattern, w, nw, sink, nmemb, verbose);
+    emit(f, pattern, w, nw, sink, nmemb, verbose, hash);
     fclose(f);
 
     const char *cc = getenv("CC");
@@ -658,11 +676,11 @@ done:
 int main(int argc, char **argv)
 {
     const char *prog = argc > 0 ? argv[0] : "rxejit";
-    int emit_only = 0, sink = SINK_WRITE, verbose = 0, opt;
+    int emit_only = 0, sink = SINK_WRITE, verbose = 0, hash = 0, opt;
     const char *jobs = NULL;              // thread count, forwarded to the exe
     const char *matchfile = NULL;         // target file for -m
 
-    while ((opt = getopt(argc, argv, "Sndvj:m:h")) != -1) {
+    while ((opt = getopt(argc, argv, "Sndvj:m:H:h")) != -1) {
         switch (opt) {
             case 'S': emit_only = 1; break;
             case 'n': sink = SINK_COUNT; break;
@@ -670,10 +688,16 @@ int main(int argc, char **argv)
             case 'v': verbose = 1; break;
             case 'j': jobs = optarg; break;
             case 'm': sink = SINK_MATCH; matchfile = optarg; break;
+            case 'H': sink = SINK_MATCH; hash = 1;
+                      if (strcmp(optarg, "md5") != 0) {
+                          fprintf(stderr, "%s: -H: only md5 is supported\n", prog);
+                          return 2;
+                      }
+                      break;
             case 'h':
             default:
                 fprintf(stderr,
-"usage: %s [-S] [-n | -m file | -d [-v]] [-j jobs] REGEX\n"
+"usage: %s [-S] [-n | -m file [-H md5] | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
 "  Handles masks, alternations, and bounded repeats -- any finite pattern short\n"
 "  of a dictionary or backreference, which are declined with a reason.\n"
@@ -681,17 +705,23 @@ int main(int argc, char **argv)
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
 "             the mask is a keyspace, 'file' the set to sift it against.\n"
+"    -H md5   with -m, 'file' holds MD5 hex digests: hash each candidate and\n"
+"             print <digest>:<plaintext> for a hit -- keycracking.\n"
 "    -d       report duplicate members: hash each into a per-thread set and\n"
 "             merge at the join. Exit 0 if all distinct, 1 if a duplicate.\n"
 "    -v       with -d, list the repeated members and their counts.\n"
-"    -j jobs  threads for -n and -d (default: one per CPU). Printing stays\n"
+"    -j jobs  threads for -n, -m and -d (default: one per CPU). Printing stays\n"
 "             single-threaded and ordered.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
         }
     }
+    if (hash && !matchfile) {
+        fprintf(stderr, "%s: -H needs -m with a file of digests\n", prog);
+        return 2;
+    }
     if (optind != argc - 1) {
-        fprintf(stderr, "usage: %s [-S] [-n | -m file | -d [-v]] [-j jobs] REGEX\n", prog);
+        fprintf(stderr, "usage: %s [-S] [-n | -m file [-H md5] | -d [-v]] [-j jobs] REGEX\n", prog);
         return 2;
     }
     const char *pattern = argv[optind];
@@ -725,8 +755,8 @@ int main(int argc, char **argv)
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
 
-        if (emit_only) { emit(stdout, pattern, b.w, nw, sink, nmemb, verbose); ret = 0; }
-        else           ret = compile_and_run(pattern, b.w, nw, sink, nmemb, jobs, matchfile, verbose);
+        if (emit_only) { emit(stdout, pattern, b.w, nw, sink, nmemb, verbose, hash); ret = 0; }
+        else           ret = compile_and_run(pattern, b.w, nw, sink, nmemb, jobs, matchfile, verbose, hash);
         mpz_clear(N);
     }
 
