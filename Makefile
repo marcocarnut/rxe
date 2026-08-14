@@ -33,6 +33,14 @@ rxedup: rxedup.o librxe.a rxe.h
 
 rxedup.o: rxedup.c rxe.h
 
+# A sibling tool: compile a mask regex into C that enumerates it. Emits the C
+# to stdout; tests/jit.sh compiles it and checks it against rxenum -e. Not
+# built by 'all'.
+rxejit: rxejit.o librxe.a rxe.h
+	$(CC) rxejit.o -g -L. -lrxe -lgmp -lm -o rxejit
+
+rxejit.o: rxejit.c rxe.h
+
 rxenum.o: rxenum.c rxe.h
 
 rxe.o: rxe.c rxe.h parse.h repeat.h pair.h lens.h
@@ -68,9 +76,10 @@ librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
 
-test: rxenum rxerank tests/api
+test: rxenum rxerank rxejit tests/api
 	sh tests/run.sh
 	./tests/api
+	sh tests/jit.sh
 	@if command -v python3 >/dev/null 2>&1; then \
 	    python3 tests/oracle.py && python3 tests/shortlex.py && python3 tests/rank.py; \
 	else \
@@ -94,6 +103,10 @@ rxedup-asan: rxedup.c $(filter-out rxenum.c,$(SRC)) $(HDR)
 	$(CC) $(WARNFLAGS) $(SANFLAGS) rxedup.c \
 	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -lpthread -o rxedup-asan
 
+rxejit-asan: rxejit.c $(filter-out rxenum.c,$(SRC)) $(HDR)
+	$(CC) $(WARNFLAGS) $(SANFLAGS) rxejit.c \
+	    $(filter-out rxenum.c,$(SRC)) -lgmp -lm -o rxejit-asan
+
 test-asan: rxenum-asan rxerank-asan tests/api-asan
 	ASAN_OPTIONS=detect_leaks=1 RXENUM=./rxenum-asan sh tests/run.sh
 	ASAN_OPTIONS=detect_leaks=1 ./tests/api-asan
@@ -110,7 +123,7 @@ bench: rxenum rxedup
 	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan tests/api tests/api-asan
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan tests/api tests/api-asan
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
