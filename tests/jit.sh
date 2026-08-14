@@ -90,6 +90,23 @@ same 'q[0-9]w[a-f]'
 same '[A-Fa-f0-9]{2}'
 same '[0-9]'
 
+# Alternations of equal-length branches: grouped, top-level, embedded, repeated,
+# and the duplicate-bearing ones (a dedup sink's reason to exist).
+same '(cat|dog)'
+same 'cat|dog'
+same 'x(a|b)y'
+same '(foo|bar)[0-9]{2}'
+same '([a-z]|[0-9]){2}'
+same '(a|a)'
+same '(cat|dog|cat)'
+same 'pre(0|1|2)'
+same '(a|b)'
+same '(ab)(?1)'        # a subroutine call: an independent copy of the group
+
+# Uneven-length alternations are out of the fixed-width subset: decline them.
+declines 'cat|hi'
+declines '(a|bc)'
+
 # The match sink: hits (length 3), no hits (length 2, but 'ab'/'q7' are there),
 # and a mask disjoint from the targets (empty result both ways).
 match '[a-z]{3}'
@@ -112,10 +129,8 @@ else
 fi
 
 # Patterns outside the subset it must decline rather than miscompile.
-declines '(a|b)'
 declines '[a-z]+'
 declines 'a*'
-declines '(ab)(?1)'
 declines '[:bip39en:]{2}'
 
 printf 'jit: %d passed, %d failed\n' "$pass" "$fail"

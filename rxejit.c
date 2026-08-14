@@ -9,15 +9,16 @@
  *          by carry, that the system compiler then optimises. No tree, no mpz,
  *          no indirect call.
  *
- *          This first cut handles the fixed-width mask -- a run of single-
- *          character classes and their exact repeats, [a-z]{4}[0-9]{2} and the
- *          like, the classic shape of a mask attack. Anything else (an
- *          alternation, a dictionary, an unbounded or variable repeat, a
- *          backreference) it declines, naming what it could not take, so the
- *          interpreter path stays the answer for those. The C it prints is a
- *          standalone program that writes every member to stdout, in exactly
- *          rxenum -e's order; a later cut compiles and runs it, and swaps the
- *          write for a chosen sink.
+ *          It handles the fixed-width case: single-character classes, their
+ *          exact repeats, and alternations whose branches are all the same
+ *          length -- [a-z]{4}[0-9]{2}, (cat|dog)[0-9], the classic mask attack
+ *          and a little past it. Each position is a "wheel" of L-byte
+ *          alternatives (a class is L=1, an equal-length alternation L>1, baked
+ *          out by the interpreter). What it cannot make fixed-width -- an
+ *          alternation of uneven lengths, an unbounded or variable repeat, a
+ *          dictionary, a backreference -- it declines, naming the reason, so the
+ *          interpreter path stays the answer there. It runs the compiled program
+ *          (or prints the C with -S) with a chosen sink: write, count, or match.
  *
  *          (C) 2011 Marco "Kiko" Carnut <kiko at postcogito dot org>
  *
@@ -49,70 +50,159 @@
 // set loaded at runtime and prints the hits (a mask being a keyspace to sift).
 enum { SINK_WRITE, SINK_COUNT, SINK_MATCH };
 
-// One odometer wheel: the ordered bytes a single position steps through, drawn
-// straight from a class node's string so the order is the enumeration's.
-struct wheel { const char *a; int n; };
+#define ALT_CAP 65536              // most members a baked alternation may hold
+
+// One odometer wheel: n alternatives, each L bytes, at 'base' laid end to end
+// (alternative i is base + i*L). A character class is the L==1 case, its bytes
+// the class string; an alternation of equal-length branches is L>1, its bytes
+// the members baked out by the interpreter. Stepping the wheel copies L bytes.
+struct wheel { const char *base; int n; int L; };
 
 static const char *reason;         // why a pattern was declined, for the message
 
-// A plain single-character class -- none of the compound flags, no
-// subexpression -- yields one wheel. Returns 0 and fills a/n, or -1.
-static int class_of(struct rxe_node *nd, const char **a, int *n)
+// The running build: the wheels gathered so far, plus the buffers baked for
+// alternations (freed once the code is emitted).
+struct build {
+    struct wheel *w;
+    int           nw;
+    char        **bake;
+    int           nbake, cbake;
+};
+
+static int add_wheel(struct build *b, const char *base, int n, int L)
 {
-    if (nd->is_repeat || nd->is_comb || nd->is_shuffle ||
-        nd->is_dict || nd->is_backref || nd->is_inf || nd->rxe)
-        return -1;
-    *a = nd->str;
-    *n = nd->len;
+    if (n < 1)         { reason = "an empty class"; return -1; }
+    if (b->nw >= MAXW) { reason = "too many positions to unroll"; return -1; }
+    b->w[b->nw].base = base; b->w[b->nw].n = n; b->w[b->nw].L = L;
+    b->nw++;
     return 0;
 }
 
-// Flatten a mask into its wheels, left to right. Returns the count, or -1 with
-// 'reason' set for the first thing that is not a fixed run of classes.
-static int collect(struct rxe *rxe, struct wheel *w)
+static int add_rxe(struct build *b, struct rxe *rxe);
+
+// An alternation becomes one wheel by baking its members: enumerate them with
+// the interpreter, in seek order -- the very order the parent odometer drives
+// this position through -- and store them as the wheel's alternatives. They
+// must all be the same byte length (the flat buffer has no room for a position
+// that changes width) and few enough to unroll. Duplicate branches like (a|a)
+// bake to repeated alternatives, so the odometer visits the repeat and a dedup
+// sink can see it -- which is the point of taking alternations at all.
+static int bake_alt(struct build *b, struct rxe *rxe)
+{
+    if (rxe->ninf || !mpz_fits_ulong_p(rxe->nitems)) {
+        reason = "an alternation too large to unroll"; return -1;
+    }
+    unsigned long n = mpz_get_ui(rxe->nitems);
+    if (n < 1)       { reason = "an empty alternation"; return -1; }
+    if (n > ALT_CAP) { reason = "an alternation too large to unroll"; return -1; }
+
+    char tmp[4096];
+    mpz_t idx;
+    mpz_init(idx);
+    int L = -1;
+    char *buf = NULL;
+    for (unsigned long i = 0; i < n; i++) {
+        mpz_set_ui(idx, i);
+        if (rxe_seek(rxe, idx)) { reason = "an alternation that would not seek"; goto fail; }
+        char *end = rxe_current(tmp, (int)sizeof tmp - 1, rxe);
+        int len = (int)(end - tmp);
+        if (i == 0) {
+            L = len;
+            if (L < 1 || L >= (int)sizeof tmp - 1) { reason = "an alternation member too long"; goto fail; }
+            buf = malloc((size_t)n * L);
+            if (!buf) { reason = "out of memory"; goto fail; }
+        } else if (len != L) {
+            reason = "an alternation with uneven member lengths"; goto fail;
+        }
+        memcpy(buf + (size_t)i * L, tmp, L);
+    }
+    mpz_clear(idx);
+
+    if (b->nbake == b->cbake) {
+        int nc = b->cbake ? b->cbake * 2 : 8;
+        char **nb = realloc(b->bake, (size_t)nc * sizeof *nb);
+        if (!nb) { free(buf); reason = "out of memory"; return -1; }
+        b->bake = nb; b->cbake = nc;
+    }
+    b->bake[b->nbake++] = buf;
+    return add_wheel(b, buf, (int)n, L);
+fail:
+    free(buf);
+    mpz_clear(idx);
+    return -1;
+}
+
+// One node -> wheel(s): a plain class is one L==1 wheel; an exact {k} repeat is
+// its body's wheels laid down k times; a group recurses into its subexpression.
+static int add_node(struct build *b, struct rxe_node *nd)
+{
+    int plain = !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
+                !nd->is_dict && !nd->is_backref && !nd->is_inf && !nd->rxe;
+    if (plain)
+        return add_wheel(b, nd->str, nd->len, 1);
+
+    if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED &&
+        nd->rep_min == nd->rep_max && nd->rxe) {
+        for (int k = 0; k < nd->rep_min; k++)
+            if (add_rxe(b, nd->rxe)) return -1;
+        return 0;
+    }
+
+    if (nd->rxe && !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
+        !nd->is_dict && !nd->is_backref && !nd->is_inf)
+        return add_rxe(b, nd->rxe);
+
+    reason = nd->is_inf     ? "an unbounded repeat"
+           : nd->is_dict    ? "a dictionary"
+           : nd->is_backref ? "a backreference"
+           : nd->is_comb    ? "a combination"
+           : nd->is_shuffle ? "a shuffle"
+           : nd->is_repeat  ? "a variable-count repeat"
+           :                  "an unsupported element";
+    return -1;
+}
+
+// An expression -> wheels: an alternation (more than one branch) bakes to one
+// wheel; a single branch is its nodes in order.
+static int add_rxe(struct build *b, struct rxe *rxe)
 {
     if (rxe->flags & (RXE_FLAG_LEFT_TO_RIGHT | RXE_FLAG_SHORTLEX)) {
         reason = "a non-default enumeration order"; return -1;
     }
-    if (!rxe->head || rxe->head->next) {       // more than one alternation
-        reason = "a top-level alternation"; return -1;
-    }
-    int nw = 0;
-    for (struct rxe_node *nd = rxe->head->head; nd; nd = nd->next) {
-        const char *a; int n, reps = 1;
-        if (class_of(nd, &a, &n) != 0) {
-            // The one compound we take: an exact {k} repeat of a plain class.
-            struct rxe *b = nd->rxe;
-            if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED &&
-                nd->rep_min == nd->rep_max &&
-                b && b->head && !b->head->next && b->head->head &&
-                !b->head->head->next && class_of(b->head->head, &a, &n) == 0) {
-                reps = nd->rep_min;
-            } else {
-                reason = nd->is_inf     ? "an unbounded repeat"
-                       : nd->is_dict    ? "a dictionary"
-                       : nd->is_backref ? "a backreference"
-                       : nd->is_comb    ? "a combination"
-                       : nd->is_shuffle ? "a shuffle"
-                       : nd->is_repeat  ? "a variable-count repeat"
-                       : nd->rxe        ? "a group"
-                       :                  "an unsupported element";
-                return -1;
-            }
-        }
-        if (n < 1) { reason = "an empty class"; return -1; }
-        for (int k = 0; k < reps; k++) {
-            if (nw >= MAXW) { reason = "too many positions to unroll"; return -1; }
-            w[nw].a = a; w[nw].n = n; nw++;
-        }
-    }
-    return nw;
+    if (!rxe->head) { reason = "an empty expression"; return -1; }
+    if (rxe->head->next)
+        return bake_alt(b, rxe);
+    for (struct rxe_node *nd = rxe->head->head; nd; nd = nd->next)
+        if (add_node(b, nd)) return -1;
+    return 0;
+}
+
+// Gather the wheels for the whole pattern. Returns the count, or -1 with
+// 'reason' set. On success the caller must free the bake buffers (free_build).
+static int collect(struct build *b, struct rxe *rxe)
+{
+    b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0;
+    return add_rxe(b, rxe) ? -1 : b->nw;
+}
+
+static void free_build(struct build *b)
+{
+    for (int i = 0; i < b->nbake; i++) free(b->bake[i]);
+    free(b->bake);
 }
 
 // Print the pattern into a C comment, defusing any */ that would close it.
 static void emit_comment(FILE *o, const char *s)
 {
     for (; *s; s++) fputc((*s == '*' && s[1] == '/') ? ' ' : *s, o);
+}
+
+// Emit the statement that lays wheel i's alternative 'idx' into the buffer at
+// 'off': a single byte for a class, a memcpy for a wider alternation branch.
+static void emit_lay(FILE *o, int i, int off, int L, const char *idx)
+{
+    if (L == 1) fprintf(o, "buf[%d] = A%d[%s];", off, i, idx);
+    else        fprintf(o, "memcpy(buf + %d, A%d + (%s) * %d, %d);", off, i, idx, L, L);
 }
 
 // The generated program. Its core is run(from, count): seed the odometer to
@@ -139,9 +229,16 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     int acc      = count || match;              // sinks that tally into *acc
     int threaded = acc && nmemb;                // split [0,N) when N fits 64 bits
 
+    // Buffer offsets: each wheel lays L bytes, so a wider one (an alternation)
+    // pushes those after it along. TL is the member length; multi marks whether
+    // any wheel is wider than a byte, which is when memcpy (and string.h) enter.
+    int off[MAXW], TL = 0, multi = 0;
+    for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; if (w[i].L > 1) multi = 1; }
+
     fputs("/* generated by rxejit from: ", o);
     emit_comment(o, pattern);
     fputs(" */\n#include <stdio.h>\n", o);
+    if (multi && !match) fputs("#include <string.h>\n", o);   // match gets it via the runtime
     // match keeps a mutex for the rare hit print even on one thread, so pthread
     // comes in for it too; the count sink needs pthread only when it threads.
     if (threaded || match) fputs("#include <stdlib.h>\n#include <pthread.h>\n#include <unistd.h>\n", o);
@@ -159,13 +256,13 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
 
     for (int i = 0; i < nw; i++) {
         fprintf(o, "    static const unsigned char A%d[] = {", i);
-        for (int j = 0; j < w[i].n; j++)
-            fprintf(o, "%s%d", j ? "," : "", (unsigned char)w[i].a[j]);
+        for (int j = 0; j < w[i].n * w[i].L; j++)
+            fprintf(o, "%s%d", j ? "," : "", (unsigned char)w[i].base[j]);
         fputs("};\n", o);
     }
 
-    fprintf(o, "    unsigned char buf[%d];\n", nw + 1);
-    fprintf(o, "    buf[%d] = '\\n';\n", nw);
+    fprintf(o, "    unsigned char buf[%d];\n", TL + 1);
+    fprintf(o, "    buf[%d] = '\\n';\n", TL);
 
     // Seed each wheel from 'from': digit = from %% radix, then from /= radix,
     // walking from the least significant wheel up, so the buffer starts on the
@@ -173,22 +270,28 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     fputs("    unsigned long long f = from;\n", o);
     for (int i = nw - 1; i >= 0; i--)
         fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, w[i].n, w[i].n);
-    for (int i = 0; i < nw; i++)
-        fprintf(o, "    buf[%d] = A%d[i%d];\n", i, i, i);
+    for (int i = 0; i < nw; i++) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fputs("    ", o); emit_lay(o, i, off[i], w[i].L, e); fputc('\n', o);
+    }
 
     if (acc) fputs("    unsigned long long n = 0;\n", o);
     fputs("    unsigned long long done = 0;\n", o);
     fputs("    for (;;) {\n", o);
     if (match)      fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %d))"
                                " { pthread_mutex_lock(&MX); fwrite(buf, 1, %d, stdout);"
-                               " pthread_mutex_unlock(&MX); n++; }\n", nw, nw + 1);
+                               " pthread_mutex_unlock(&MX); n++; }\n", TL, TL + 1);
     else if (count) fputs("        n++;\n", o);
-    else            fprintf(o, "        fwrite(buf, 1, %d, stdout);\n", nw + 1);
+    else            fprintf(o, "        fwrite(buf, 1, %d, stdout);\n", TL + 1);
     fputs("        if (count && ++done == count) break;\n", o);
-    for (int i = nw - 1; i >= 0; i--)
-        fprintf(o, "        if (++i%d < %d) { buf[%d] = A%d[i%d]; continue; }"
-                   " i%d = 0; buf[%d] = A%d[0];\n",
-                i, w[i].n, i, i, i, i, i, i);
+    for (int i = nw - 1; i >= 0; i--) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
+        emit_lay(o, i, off[i], w[i].L, e);
+        fprintf(o, " continue; } i%d = 0; ", i);
+        emit_lay(o, i, off[i], w[i].L, "0");
+        fputc('\n', o);
+    }
     fputs("        break;\n    }\n", o);
     if (acc) fputs("    *acc += n;\n", o);
     fputs("}\n\n", o);
@@ -363,10 +466,11 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    struct wheel *w = malloc(MAXW * sizeof *w);
-    if (!w) { fprintf(stderr, "%s: out of memory\n", prog); rxe_free(rxe); return 2; }
+    struct build b;
+    b.w = malloc(MAXW * sizeof *b.w);
+    if (!b.w) { fprintf(stderr, "%s: out of memory\n", prog); rxe_free(rxe); return 2; }
 
-    int nw = collect(rxe, w);
+    int nw = collect(&b, rxe);
     int ret;
     if (nw < 0) {
         fprintf(stderr, "%s: cannot compile this pattern yet -- it has %s.\n",
@@ -378,17 +482,18 @@ int main(int argc, char **argv)
         // thread -- a set that large is past enumerating whole regardless.
         mpz_t N;
         mpz_init_set_ui(N, 1);
-        for (int i = 0; i < nw; i++) mpz_mul_ui(N, N, (unsigned long)w[i].n);
+        for (int i = 0; i < nw; i++) mpz_mul_ui(N, N, (unsigned long)b.w[i].n);
         char nbuf[32];
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
 
-        if (emit_only) { emit(stdout, pattern, w, nw, sink, nmemb); ret = 0; }
-        else           ret = compile_and_run(pattern, w, nw, sink, nmemb, jobs, matchfile);
+        if (emit_only) { emit(stdout, pattern, b.w, nw, sink, nmemb); ret = 0; }
+        else           ret = compile_and_run(pattern, b.w, nw, sink, nmemb, jobs, matchfile);
         mpz_clear(N);
     }
 
-    free(w);
+    free_build(&b);
+    free(b.w);
     rxe_free(rxe);
     return ret;
 }
