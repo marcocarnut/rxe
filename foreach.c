@@ -41,7 +41,11 @@ int rxe_foreach(struct rxe *rxe, const mpz_t from, const mpz_t count,
 {
     if (!rxe || maxlen < 1) return RXE_FOREACH_RANGE;
 
-    char *str = malloc((size_t)maxlen + 1);
+    // One byte over the width, so a member of exactly 'maxlen' bytes fits whole
+    // and one of maxlen+1 spills into the extra byte -- which is how a member
+    // too long to render is told apart from one that just fills the width. The
+    // sink is never handed a truncated member.
+    char *str = malloc((size_t)maxlen + 2);
     if (!str) return RXE_FOREACH_TOOBIG;
 
     // idx is the absolute index handed to the sink and stepped alongside the
@@ -66,13 +70,15 @@ int rxe_foreach(struct rxe *rxe, const mpz_t from, const mpz_t count,
     }
 
     for (;;) {
-        char *end = rxe_current(str, maxlen, rxe);
-        if (rxe_member_overflow) {          // a repeat too big to render whole
-            rxe_member_overflow = 0;
-            rc = RXE_FOREACH_TOOBIG;
-            break;
-        }
-        if (emit && emit(str, (size_t)(end - str), idx, ctx)) {
+        char *end = rxe_current(str, maxlen + 1, rxe);
+        size_t len = (size_t)(end - str);
+        // Two ways a member cannot be delivered whole: the render path raised
+        // the overflow latch on a closed-form repeat too big to build, or the
+        // rendered member ran past the width and would reach the sink cut short.
+        // Either stops the walk rather than passing off a stub.
+        if (rxe_member_overflow) { rxe_member_overflow = 0; rc = RXE_FOREACH_TOOBIG; break; }
+        if (len > (size_t)maxlen)                { rc = RXE_FOREACH_TOOBIG; break; }
+        if (emit && emit(str, len, idx, ctx)) {
             rc = RXE_FOREACH_STOP;
             break;
         }

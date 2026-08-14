@@ -493,6 +493,35 @@ int main(void)
     }
 
     {
+        // 'maxlen' is the longest member the sink accepts: one that just fits
+        // is delivered, one byte longer stops the walk with TOOBIG rather than
+        // reaching the sink truncated.
+        char got[64];
+        mpz_t from, count;
+        mpz_init_set_ui(from, 0);
+        mpz_init_set_ui(count, 0);
+
+        struct rxe *fit = rxe_parse("a{3}", 0);        // one member, "aaa"
+        struct catctx c = { got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("a member exactly the width fits",
+                  RXE_FOREACH_END, rxe_foreach(fit, from, count, 3, cat_sink, &c));
+        check("and reaches the sink whole", "aaa/", got);
+        rxe_free(fit);
+
+        struct rxe *big = rxe_parse("a{4}", 0);        // one member, "aaaa"
+        c = (struct catctx){ got, sizeof(got), 0, 0, "" };
+        got[0] = 0;
+        check_int("a member past the width is refused",
+                  RXE_FOREACH_TOOBIG, rxe_foreach(big, from, count, 3, cat_sink, &c));
+        check_int("and the truncated member never reached the sink", 0, c.seen);
+        rxe_free(big);
+
+        mpz_clear(from);
+        mpz_clear(count);
+    }
+
+    {
         // An infinite set has no last member, so only the count (or the sink)
         // bounds the walk. 'a*' is shortlex: "", a, aa, aaa, ...
         struct rxe *rxe = rxe_parse("a*", 0);

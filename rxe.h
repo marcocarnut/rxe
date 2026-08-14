@@ -304,10 +304,11 @@ int rxe_seek(struct rxe *rxe, mpz_t pos);
 //
 // 'from' is the first index. 'count' is how many members to visit; a count of
 // zero means no limit -- to the end of a finite set, or, for an infinite one,
-// until the sink stops it. 'maxlen' bounds the rendered member exactly as
-// rxe_current's does: a member longer than that is truncated (size 'maxlen' to
-// the longest member if the sink hashes what it is handed), and a closed-form
-// repeat too large to build at all stops the walk with RXE_FOREACH_TOOBIG.
+// until the sink stops it. 'maxlen' is the longest member the sink will accept:
+// a member longer than that stops the walk with RXE_FOREACH_TOOBIG rather than
+// reaching the sink truncated, so a sink may treat what it is handed as a whole
+// member and hash it as one. (A closed-form repeat too large to build even in
+// principle stops the walk the same way.)
 //
 // The sink is called once per member with the rendered bytes, their length, and
 // the member's index -- the same index rxe_seek and rxe_rank use, so a sink may
