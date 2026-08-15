@@ -343,6 +343,26 @@ if gpu_avail; then
         then printf 'FAIL  -G should decline %s\n' "$p"; fail=$((fail + 1))
         else pass=$((pass + 1)); fi
     done
+    # The generic split: a pattern with structure in the head but a fixed-class
+    # tail large enough for the GPU -- rxejit enumerates the head, the GPU sweeps
+    # the tail. Uneven alternations, mixed tails, variable-length heads, and dicts
+    # all reduce to that, and the GPU's hits must still be the CPU's set.
+    printf 'cat\nhello\nfoo\nquux\n' > "$tmp/gw.dict"
+    for w in cathello hixyzzy cataa11 foo9x8y7 x1234567 yy0000000 quuxwxyz; do
+        printf '%s' "$w" | md5sum | cut -d' ' -f1; done >> "$tmp/md5t"
+    for p in '(cat|hi)[a-z]{5}' '(cat|hi)[a-z]{3}[0-9]{2}' '(x|yy)[0-9]{7}' '[:gw:][a-z]{5}'; do
+        "$RXEJIT" -G -D "$tmp" -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/gpu"
+        "$RXEJIT"    -D "$tmp" -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/cpu"
+        if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G (generic) %s\n        GPU hit set differs from CPU\n' "$p"; fail=$((fail + 1)); fi
+    done
+    # A head-side backref, or a tail too small to be worth the GPU, must decline.
+    for p in '([a-z]{3})\1[a-z]{5}' '(cat|hi)[a-z]{2}'; do
+        if "$RXEJIT" -G -m "$tmp/md5t" -H md5 "$p" >/dev/null 2>&1
+        then printf 'FAIL  -G should decline %s\n' "$p"; fail=$((fail + 1))
+        else pass=$((pass + 1)); fi
+    done
+
     # The -p occupancy monitor is timing-only (stderr) and must not change the hits.
     "$RXEJIT" -G      -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp0"
     "$RXEJIT" -G -p 1 -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp1"
