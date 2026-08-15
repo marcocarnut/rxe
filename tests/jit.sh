@@ -343,6 +343,11 @@ if gpu_avail; then
         then printf 'FAIL  -G should decline %s\n' "$p"; fail=$((fail + 1))
         else pass=$((pass + 1)); fi
     done
+    # The -p occupancy monitor is timing-only (stderr) and must not change the hits.
+    "$RXEJIT" -G      -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp0"
+    "$RXEJIT" -G -p 1 -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp1"
+    if cmp -s "$tmp/gp0" "$tmp/gp1"; then pass=$((pass + 1)); else
+        printf 'FAIL  -G -p changed the hit set\n'; fail=$((fail + 1)); fi
     printf 'jit: -G tested on the local OpenCL device\n'
 else
     printf 'jit: -G skipped (no OpenCL GPU here)\n'
