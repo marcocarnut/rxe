@@ -416,6 +416,26 @@ static int wheel_distinct(const struct wheel *w)
     return d;
 }
 
+// The per-member sink action, using 'len' as the member length expression (a
+// constant when fixed, "p" when variable) and 'lenp1' as length+1 for a write.
+static void emit_sink(FILE *o, int dup, int match, int count, int hash,
+                      const char *len, const char *lenp1)
+{
+    if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
+    else if (match && hash)
+                    fprintf(o, "        { unsigned char dg[16]; rt_md5(buf, %s, dg);\n"
+                               "          if (rt_set_has(&TB, (const char *)dg, 16)) {\n"
+                               "            pthread_mutex_lock(&MX);\n"
+                               "            for (int h = 0; h < 16; h++) printf(\"%%02x\", dg[h]);\n"
+                               "            putchar(':'); fwrite(buf, 1, %s, stdout); putchar('\\n');\n"
+                               "            pthread_mutex_unlock(&MX); n++; } }\n", len, len);
+    else if (match) fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %s))"
+                               " { pthread_mutex_lock(&MX); fwrite(buf, 1, %s, stdout);"
+                               " pthread_mutex_unlock(&MX); n++; }\n", len, lenp1);
+    else if (count) fputs("        n++;\n", o);
+    else            fprintf(o, "        fwrite(buf, 1, %s, stdout);\n", lenp1);
+}
+
 // The generated program. Its core is run(from, count): seed the odometer to
 // the member at index 'from' -- the mixed-radix digits of 'from', least
 // significant wheel first -- then step it, handing 'count' members to the sink
@@ -558,52 +578,70 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     }
 
     fprintf(o, "    unsigned char buf[%d];\n", bufcap + 1);
-    if (!variable) fprintf(o, "    buf[%d] = '\\n';\n", TL);
 
     // Seed each wheel from 'from': digit = from %% radix, then from /= radix,
     // walking from the least significant wheel up, so the walk starts at 'from'.
     fputs("    unsigned long long f = from;\n", o);
     for (int i = nw - 1; i >= 0; i--)
         fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, w[i].n, w[i].n);
-    if (!variable)                                  // fixed: lay the initial member once
+    if (acc) fputs("    unsigned long long n = 0;\n", o);
+    fputs("    unsigned long long done = 0;\n", o);
+
+    if (!variable) {
+        // Fixed width: lay the member once, then a loop whose step delta-patches
+        // only the byte(s) that turned. The length is a compile-time constant.
+        char len[16], lenp1[16];
+        snprintf(len, sizeof len, "%d", TL);
+        snprintf(lenp1, sizeof lenp1, "%d", TL + 1);
+        fprintf(o, "    buf[%d] = '\\n';\n", TL);
         for (int i = 0; i < nw; i++) {
             char e[16]; snprintf(e, sizeof e, "i%d", i);
             fputs("    ", o); emit_lay(o, i, off[i], w[i].L, e); fputc('\n', o);
         }
-
-    // The member length reaching the sink: a compile-time constant when fixed,
-    // the running length 'p' when variable (rebuilt at the top of the loop).
-    char len[16], lenp1[16];
-    if (variable) { strcpy(len, "p"); strcpy(lenp1, "p + 1"); }
-    else { snprintf(len, sizeof len, "%d", TL); snprintf(lenp1, sizeof lenp1, "%d", TL + 1); }
-
-    if (acc) fputs("    unsigned long long n = 0;\n", o);
-    fputs("    unsigned long long done = 0;\n", o);
-    fputs("    for (;;) {\n", o);
-    if (variable) {
-        // Rebuild the member: walk the op list, laying each wheel's current
-        // branch and copying any backreferenced group's bytes, tracking the
-        // running length p (a variable wheel or a copy shifts everything after).
-        //
-        // TODO(perf): this rebuilds the whole member every step (a memcpy per
-        // wheel), ~7-10x slower than the fixed delta path. Most steps only turn
-        // the last wheel, so re-laying just the suffix from the wheel that
-        // carried -- tracking each wheel's current offset -- would collapse the
-        // common case back toward fixed speed. Left out of the first correct
-        // version; worth it only if a variable-length workload is throughput-bound.
+        fputs("    for (;;) {\n", o);
+        emit_sink(o, dup, match, count, hash, len, lenp1);
+        fputs("        if (count && ++done == count) break;\n", o);
+        for (int i = nw - 1; i >= 0; i--) {
+            char e[16]; snprintf(e, sizeof e, "i%d", i);
+            fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
+            emit_lay(o, i, off[i], w[i].L, e);
+            fprintf(o, " continue; } i%d = 0; ", i);
+            emit_lay(o, i, off[i], w[i].L, "0");
+            fputc('\n', o);
+        }
+        fputs("        break;\n    }\n", o);
+        if (acc) fputs("    *acc += n;\n", o);
+    } else {
+        // Variable width: a goto-threaded odometer. Each wheel keeps its current
+        // byte position; the step jumps to the relay for the wheel that turned,
+        // which rebuilds only the suffix from there. Since the least significant
+        // wheel turns nearly every step, most members re-lay just a byte or two,
+        // recovering the delta speed the fixed path has while still handling a
+        // member whose width the choice decides. The relay blocks fall through,
+        // so each wheel's lay is emitted once (the code is O(wheels), not O(n^2)).
+        for (int i = 0; i < nw; i++) fprintf(o, "    int pos%d = 0;\n", i);
         for (int g = 0; g < B->ngroup; g++)
-            fprintf(o, "        int g%d_pos = 0, g%d_len = 0;\n", g, g);
-        fputs("        int p = 0;\n", o);
+            fprintf(o, "    int g%d_pos = 0, g%d_len = 0;\n", g, g);
+        fputs("    int p = 0;\n"
+              "    goto R_init;\n"
+              "  R_emit:\n"
+              "    buf[p] = '\\n';\n", o);
+        emit_sink(o, dup, match, count, hash, "p", "p + 1");
+        fputs("    if (count && ++done == count) goto R_done;\n", o);
+        for (int i = nw - 1; i >= 0; i--)
+            fprintf(o, "    if (++i%d < %d) { p = pos%d; goto R_%d; } i%d = 0;\n",
+                    i, w[i].n, i, i, i);
+        fputs("    goto R_done;\n  R_init:\n", o);
         for (int k = 0; k < B->nops; k++) {
             struct op op = B->ops[k];
             int i = op.arg;
             if (op.kind == OP_LAY) {
                 if (w[i].L)
-                    fprintf(o, "        memcpy(buf + p, A%d + i%d * %d, %d); p += %d;\n",
-                            i, i, w[i].L, w[i].L, w[i].L);
+                    fprintf(o, "  R_%d: pos%d = p; memcpy(buf + p, A%d + i%d * %d, %d); p += %d;\n",
+                            i, i, i, i, w[i].L, w[i].L, w[i].L);
                 else
-                    fprintf(o, "        memcpy(buf + p, A%d + A%do[i%d], A%dl[i%d]);"
-                               " p += A%dl[i%d];\n", i, i, i, i, i, i, i);
+                    fprintf(o, "  R_%d: pos%d = p; memcpy(buf + p, A%d + A%do[i%d], A%dl[i%d]);"
+                               " p += A%dl[i%d];\n", i, i, i, i, i, i, i, i, i);
             } else if (op.kind == OP_OPEN) {
                 fprintf(o, "        g%d_pos = p;\n", i);
             } else if (op.kind == OP_CLOSE) {
@@ -613,42 +651,10 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
                         i, i, i);
             }
         }
-        fputs("        buf[p] = '\\n';\n", o);
+        fputs("    goto R_emit;\n  R_done:\n", o);
+        if (acc) fputs("    *acc += n;\n", o);
+        fputs("    return;\n", o);
     }
-    if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
-    else if (match && hash)
-                    fprintf(o, "        { unsigned char dg[16]; rt_md5(buf, %s, dg);\n"
-                               "          if (rt_set_has(&TB, (const char *)dg, 16)) {\n"
-                               "            pthread_mutex_lock(&MX);\n"
-                               "            for (int h = 0; h < 16; h++) printf(\"%%02x\", dg[h]);\n"
-                               "            putchar(':'); fwrite(buf, 1, %s, stdout); putchar('\\n');\n"
-                               "            pthread_mutex_unlock(&MX); n++; } }\n", len, len);
-    else if (match) fprintf(o, "        if (rt_set_has(&TB, (const char *)buf, %s))"
-                               " { pthread_mutex_lock(&MX); fwrite(buf, 1, %s, stdout);"
-                               " pthread_mutex_unlock(&MX); n++; }\n", len, lenp1);
-    else if (count) fputs("        n++;\n", o);
-    else            fprintf(o, "        fwrite(buf, 1, %s, stdout);\n", lenp1);
-    fputs("        if (count && ++done == count) break;\n", o);
-    if (variable) {
-        // Advance the odometer without touching the buffer; it is rebuilt above.
-        fputs("        {\n            int c = 1;\n", o);
-        for (int i = nw - 1; i >= 0; i--)
-            fprintf(o, "            if (c) { if (++i%d < %d) c = 0; else i%d = 0; }\n",
-                    i, w[i].n, i);
-        fputs("            if (c) break;\n        }\n", o);
-    } else {
-        for (int i = nw - 1; i >= 0; i--) {
-            char e[16]; snprintf(e, sizeof e, "i%d", i);
-            fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
-            emit_lay(o, i, off[i], w[i].L, e);
-            fprintf(o, " continue; } i%d = 0; ", i);
-            emit_lay(o, i, off[i], w[i].L, "0");
-            fputc('\n', o);
-        }
-        fputs("        break;\n", o);
-    }
-    fputs("    }\n", o);
-    if (acc) fputs("    *acc += n;\n", o);
     fputs("}\n\n", o);
 
     if (dup) {
