@@ -1438,6 +1438,27 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
 // backrefs -- so -G reaches far past a plain mask. A kernel is built per total
 // member length on demand (its width and MD5 length baked), so every sweep runs
 // at the fixed path's speed. Hits are plaintext, re-hashed on the host.
+// The widest member in bytes -- backref copies included, walked over the op list
+// the way emit()'s bufcap is. The generic path needs it for the buffer cap and
+// the plaintext hit-row stride, since a head backref lays bytes no wheel counts.
+static int gpu_maxwidth(const struct build *B)
+{
+    int wmax[MAXW];
+    for (int i = 0; i < B->nw; i++) {
+        if (B->w[i].L) wmax[i] = B->w[i].L;
+        else { int m = 0; for (int j = 0; j < B->w[i].n; j++) if (B->w[i].alen[j] > m) m = B->w[i].alen[j]; wmax[i] = m; }
+    }
+    int gpos[MAXW], glen[MAXW], p = 0;
+    for (int k = 0; k < B->nops; k++) {
+        struct op op = B->ops[k];
+        if      (op.kind == OP_LAY)   p += wmax[op.arg];
+        else if (op.kind == OP_OPEN)  gpos[op.arg] = p;
+        else if (op.kind == OP_CLOSE) glen[op.arg] = p - gpos[op.arg];
+        else                          p += glen[op.arg];      // OP_COPY
+    }
+    return p;
+}
+
 static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G, int psec)
 {
     int nw = B->nw;
@@ -1446,11 +1467,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     for (int g = 0; g < G; g++) { lwoff[g] = lowwidth; lowwidth += lw[g].L; }
     unsigned long long lon = 1;
     for (int g = 0; g < G; g++) lon *= (unsigned long long)lw[g].n;
-    int maxw = 0;                                 // widest member (bufcap)
-    for (int i = 0; i < nw; i++) maxw += (B->w[i].L ? B->w[i].L : 0);
-    // a variable head wheel can be wider than its L=0 says; use its longest branch
-    for (int i = 0; i < nw - G; i++)
-        if (B->w[i].L == 0) { int m = 0; for (int j = 0; j < B->w[i].n; j++) if (B->w[i].alen[j] > m) m = B->w[i].alen[j]; maxw += m; }
+    int maxw = gpu_maxwidth(B);
     if (maxw < 1) maxw = 1;
 
     char *ksrc = NULL; size_t ksz = 0;
@@ -1921,29 +1938,29 @@ int main(int argc, char **argv)
             else gpu_kind = 2;
         } else if (gpu) {
             // A fixed mask is one grid; a pattern with structure but a fixed-class
-            // tail is the generic split -- rxejit enumerates the head, the GPU
-            // sweeps the tail. The candidate must still fit one MD5 block.
-            int anyvar = 0, totw = 0;
-            for (int i = 0; i < nw; i++) {
-                if (b.w[i].L == 0) { anyvar = 1;
-                    int m = 0; for (int j = 0; j < b.w[i].n; j++) if (b.w[i].alen[j] > m) m = b.w[i].alen[j];
-                    totw += m;
-                } else totw += b.w[i].L;
-            }
-            if (b.has_backref && !anyvar) anyvar = 1;   // a backref makes the render variable too
+            // tail is the generic split -- rxejit enumerates the head (backrefs
+            // and all), the GPU sweeps the tail. The candidate must fit one MD5
+            // block, backref copies counted.
+            int anyvar = b.has_backref;             // a backref makes the render variable
+            for (int i = 0; i < nw; i++) if (b.w[i].L == 0) anyvar = 1;
+            int totw = gpu_maxwidth(&b);
             if (totw >= 56) gpu_no = "a candidate wider than one MD5 block";
-            else if (!anyvar && !b.has_backref) {       // a pure fixed mask
+            else if (!anyvar) {                     // a pure fixed mask
                 if (!nmemb) gpu_no = "more members than fit 64 bits";
                 else gpu_kind = 1;
-            } else if (b.has_backref) {
-                gpu_no = "a backreference";             // generic path does not take these yet
             } else {
                 // The low block: the largest fixed-class tail whose sweep is a fat
                 // batch (>= ~1M) and stays a sane width, leaving a non-empty head.
-                int lowwidth = 0; unsigned long long Plow = 1;
-                for (int i = nw - 1; i >= 0 && b.w[i].L > 0
-                        && lowwidth + b.w[i].L <= 40 && Plow < (1ULL << 32); i--) {
-                    lowwidth += b.w[i].L; Plow *= (unsigned long long)b.w[i].n; gpu_G++;
+                // Walked over the ops from the end, so a backref copy (OP_COPY) or
+                // a group boundary ends it -- a backref that straddles into the
+                // tail declines, only a head-side one is taken.
+                int lowwidth = 0, expect = nw - 1; unsigned long long Plow = 1;
+                for (int k = b.nops - 1; k >= 0; k--) {
+                    struct op op = b.ops[k];
+                    if (op.kind != OP_LAY || op.arg != expect) break;
+                    struct wheel *lwh = &b.w[op.arg];
+                    if (lwh->L == 0 || lowwidth + lwh->L > 40 || Plow >= (1ULL << 32)) break;
+                    lowwidth += lwh->L; Plow *= (unsigned long long)lwh->n; gpu_G++; expect--;
                 }
                 if (gpu_G >= 1 && gpu_G < nw && Plow >= (1u << 20)) gpu_kind = 3;
                 else gpu_no = "no fixed-class tail large enough for the GPU";
