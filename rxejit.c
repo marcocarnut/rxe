@@ -1237,50 +1237,59 @@ static void emit_gpu(FILE *o, const char *pattern, const struct build *B, const 
           "    return 0;\n}\n", o);
 }
 
-// The -G backend for a variable-count repeat X{a,b} (a bare, single-wheel body:
-// [a-z]{1,8} and the like). A variable length would diverge lanes within a wave,
-// so it is split by length instead: one grid launch per segment k = a..b, each a
-// fixed-width X{k} keycrack. All lanes in a launch share k, so the unrank loop is
-// uniform -- no divergence -- and the top segment (k=b, all but 1/radix of the
-// members) runs at full width. A lane writes its hit's plaintext (the length
-// varies by segment, so an index would not reconstruct without knowing k); the
-// host re-hashes it for the <digest>:<plaintext> line, as the CPU prints.
-static void emit_gpu_var(FILE *o, const char *pattern, const struct build *B)
+// The -G hybrid backend for a bare variable-count repeat X{a,b} ([a-z]{1,8}).
+// The CPU owns the high wheels, the GPU a fixed block of low ones. For each
+// member length k the CPU sweeps the high (k - GW) wheels, handing the GPU an
+// opaque prefix (bytes, already laid); the GPU brute-forces GW low wheels,
+// prepends the prefix, hashes, and keeps the rare hit. The kernel never knows
+// what produced the prefix -- so the same engine will drive an arbitrary
+// structure once a producer other than this odometer feeds it (the path to
+// backrefs/alternations on the GPU). A kernel is built per member length via
+// -D, so its width and MD5 length are compile-time constants -- the fixed
+// path's speed, no runtime k. GW is picked so the low sweep is a fat batch
+// (>= ~4M lanes); RXEJIT_GW overrides it for testing the prefix path on small
+// masks. Hits are plaintext (length varies by length), re-hashed on the host.
+static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B)
 {
-    const struct wheel *sw = &B->lr_sw[0];   // the single body wheel
+    const struct wheel *sw = &B->lr_sw[0];
     int R = sw->n, L = sw->L, a = B->lr_a, b = B->lr_b;
     int maxw = b * L;
 
-    // One kernel over all segment lengths, k passed per launch. (A kernel per
-    // length would let the compiler bake k and keep buf in registers, but it
-    // re-inlines the whole MD5 b times, and the Intel offline compiler's build
-    // time blows up -- 60s for b=7. One kernel, one MD5, builds fast; k is
-    // uniform within a launch, so there is still no divergence.) maxw is the
-    // widest member and the stride of the plaintext hit rows.
+    // GW: the low wheels the GPU sweeps. Smallest g whose R^g clears ~4M lanes,
+    // capped at b; the env var forces it, to exercise the prefix path on a small
+    // mask where the adaptive choice would put the whole thing on the GPU.
+    long long gpow = 1; int gt = b;
+    for (int g = 1; g <= b; g++) { gpow *= R; if (gpow >= (1 << 22)) { gt = g; break; } }
+    const char *ge = getenv("RXEJIT_GW");
+    if (ge) { int v = atoi(ge); if (v >= 1 && v <= b) gt = v; }
+
     char *ksrc = NULL; size_t ksz = 0;
     FILE *ms = open_memstream(&ksrc, &ksz);
     fputs(RXEJIT_CL, ms);
     fprintf(ms, "__constant uchar A0[] = {");
     for (int j = 0; j < R * L; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)sw->base[j]);
     fputs("};\n", ms);
+    // T (total bytes), PLEN (prefix bytes), GW (low wheels) come in per length
+    // via -D; R, L, MAXW, MAXHITS are the same for every length, baked here.
     fprintf(ms,
-        "__kernel void crackv(ulong base, ulong Nk, uint k, __global const uchar *tgt, uint ntgt,\n"
+        "__kernel void crackL(ulong lo_base, ulong lo_N, __global const uchar *pfx,\n"
+        "                     __global const uchar *tgt, uint ntgt,\n"
         "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
-        "    ulong j = base + (ulong)get_global_id(0);\n"
-        "    if (j >= Nk) return;\n"
-        "    uchar buf[%d];\n    ulong f = j;\n"
-        "    for (int c = (int)k - 1; c >= 0; c--) { uint d = f %% %d; f /= %d;\n", maxw, R, R);
-    if (L == 1) fputs("        buf[c] = A0[d];\n", ms);
-    else for (int t = 0; t < L; t++) fprintf(ms, "        buf[c*%d + %d] = A0[d*%d + %d];\n", L, t, L, t);
+        "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n"
+        "    uchar buf[T];\n"
+        "    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n"
+        "    ulong f = j;\n"
+        "    for (int c = GW - 1; c >= 0; c--) { uint d = f %% %d; f /= %d;\n", R, R);
+    if (L == 1) fputs("        buf[PLEN + c] = A0[d];\n", ms);
+    else for (int t = 0; t < L; t++) fprintf(ms, "        buf[PLEN + c*%d + %d] = A0[d*%d + %d];\n", L, t, L, t);
     fprintf(ms,
-        "    }\n    uint Lt = k * %d;\n"
-        "    uchar dg[16]; cl_md5(buf, Lt, dg);\n"
+        "    }\n    uchar dg[16]; cl_md5(buf, T, dg);\n"
         "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
-        "        if (s < (1<<20)) { hlen[s] = Lt; for (uint t = 0; t < Lt; t++) hbuf[s*%d + t] = buf[t]; } }\n"
-        "}\n", L, maxw);
+        "        if (s < %d) { hlen[s] = T; for (int t = 0; t < T; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+        "}\n", 1 << 20, maxw);
     fclose(ms);
 
-    fputs("/* generated by rxejit -G from: ", o);
+    fputs("/* generated by rxejit -G (hybrid) from: ", o);
     emit_comment(o, pattern);
     fputs(" */\n#define CL_TARGET_OPENCL_VERSION 300\n"
           "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <CL/cl.h>\n\n", o);
@@ -1291,14 +1300,16 @@ static void emit_gpu_var(FILE *o, const char *pattern, const struct build *B)
     fputs(";\n\n", o);
     free(ksrc);
 
-    fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define RADIX %dULL\n#define AMIN %d\n#define BMAX %d\n\n",
-            maxw, R, a, b);
+    fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define R %dULL\n#define L %d\n"
+               "#define AMIN %d\n#define BMAX %d\n#define GT %d\n\n", maxw, R, L, a, b, gt);
+    fprintf(o, "static const unsigned char A0h[] = {");
+    for (int j = 0; j < R * L; j++) fprintf(o, "%s%d", j ? "," : "", (unsigned char)sw->base[j]);
+    fputs("};\n\n", o);
 
     fputs("static int cmp16(const void *a, const void *b) { return memcmp(a, b, 16); }\n"
           "static unsigned char *load_targets(const char *path, unsigned *ntgt)\n{\n"
           "    FILE *fp = fopen(path, \"r\");\n    if (!fp) return NULL;\n"
-          "    unsigned cap = 1024, n = 0;\n"
-          "    unsigned char *t = malloc((size_t)cap * 16);\n"
+          "    unsigned cap = 1024, n = 0;\n    unsigned char *t = malloc((size_t)cap * 16);\n"
           "    char line[256];\n"
           "    while (fgets(line, sizeof line, fp)) {\n"
           "        int ok = 1; unsigned char d[16];\n"
@@ -1307,52 +1318,66 @@ static void emit_gpu_var(FILE *o, const char *pattern, const struct build *B)
           "        if (!ok) continue;\n"
           "        if (n == cap) { cap *= 2; t = realloc(t, (size_t)cap * 16); }\n"
           "        memcpy(t + (size_t)n * 16, d, 16); n++;\n"
-          "    }\n    fclose(fp);\n"
-          "    qsort(t, n, 16, cmp16);\n    *ntgt = n;\n    return t;\n}\n\n", o);
+          "    }\n    fclose(fp);\n    qsort(t, n, 16, cmp16);\n    *ntgt = n;\n    return t;\n}\n\n", o);
 
     fputs("#define CK(call) do { cl_int e_ = (call); if (e_ != CL_SUCCESS) {\\\n"
           "    fprintf(stderr, \"rxejit -G: %s failed (%d)\\n\", #call, e_); return 2; } } while (0)\n\n", o);
 
     fputs("int main(int argc, char **argv)\n{\n"
           "    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE\\n\", argv[0]); return 2; }\n"
-          "    unsigned ntgt = 0;\n"
-          "    unsigned char *tgt = load_targets(argv[1], &ntgt);\n"
+          "    unsigned ntgt = 0;\n    unsigned char *tgt = load_targets(argv[1], &ntgt);\n"
           "    if (!tgt) { fprintf(stderr, \"rxejit -G: cannot read %s\\n\", argv[1]); return 2; }\n"
           "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n\n"
           "    cl_platform_id plat; cl_device_id dev; cl_int e;\n"
           "    if (clGetPlatformIDs(1, &plat, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL platform\\n\"); return 2; }\n"
           "    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL GPU\\n\"); return 2; }\n"
           "    cl_context ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &e); CK(e);\n"
-          "    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, NULL, &e); CK(e);\n"
-          "    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e); CK(e);\n"
-          "    if (clBuildProgram(pr, 1, &dev, \"\", NULL, NULL) != CL_SUCCESS) {\n"
-          "        size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
-          "        char *log = malloc(ls + 1); clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, ls, log, NULL); log[ls] = 0;\n"
-          "        fprintf(stderr, \"rxejit -G: kernel build failed:\\n%s\\n\", log); return 2; }\n"
-          "    cl_kernel k = clCreateKernel(pr, \"crackv\", &e); CK(e);\n\n"
+          "    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, NULL, &e); CK(e);\n\n"
+          "    /* One program+kernel per member length k, its width and MD5 length baked. */\n"
+          "    cl_kernel kern[BMAX + 1] = {0};\n"
+          "    for (int k = AMIN; k <= BMAX; k++) {\n"
+          "        int gw = k < GT ? k : GT, plen = (k - gw) * L, t = k * L;\n"
+          "        char opts[96]; snprintf(opts, sizeof opts, \"-D T=%d -D PLEN=%d -D GW=%d\", t, plen, gw);\n"
+          "        cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e); CK(e);\n"
+          "        if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
+          "            size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
+          "            char *log = malloc(ls + 1); clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, ls, log, NULL); log[ls] = 0;\n"
+          "            fprintf(stderr, \"rxejit -G: build (k=%d) failed:\\n%s\\n\", k, log); return 2; }\n"
+          "        kern[k] = clCreateKernel(pr, \"crackL\", &e); CK(e);\n"
+          "    }\n\n"
           "    cl_mem mt = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, (size_t)ntgt * 16, tgt, &e); CK(e);\n"
-          "    cl_uint *hlen = calloc(MAXHITS, sizeof *hlen);\n"
-          "    unsigned char *hbuf = calloc((size_t)MAXHITS, MAXW);\n"
+          "    cl_uint *hlen = calloc(MAXHITS, sizeof *hlen);\n    unsigned char *hbuf = calloc((size_t)MAXHITS, MAXW);\n"
           "    cl_uint nhits = 0;\n"
           "    cl_mem mhl = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * sizeof(cl_uint), NULL, &e); CK(e);\n"
           "    cl_mem mhb = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * MAXW, NULL, &e); CK(e);\n"
           "    cl_mem mn = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof nhits, &nhits, &e); CK(e);\n"
-          "    CK(clSetKernelArg(k, 3, sizeof mt, &mt));\n"
-          "    CK(clSetKernelArg(k, 4, sizeof ntgt, &ntgt));\n"
-          "    CK(clSetKernelArg(k, 5, sizeof mhl, &mhl));\n"
-          "    CK(clSetKernelArg(k, 6, sizeof mhb, &mhb));\n"
-          "    CK(clSetKernelArg(k, 7, sizeof mn, &mn));\n\n"
+          "    cl_mem mpfx = clCreateBuffer(ctx, CL_MEM_READ_ONLY, MAXW, NULL, &e); CK(e);\n"
+          "    for (int k = AMIN; k <= BMAX; k++) {\n"
+          "        CK(clSetKernelArg(kern[k], 2, sizeof mpfx, &mpfx));\n"
+          "        CK(clSetKernelArg(kern[k], 3, sizeof mt, &mt));\n"
+          "        CK(clSetKernelArg(kern[k], 4, sizeof ntgt, &ntgt));\n"
+          "        CK(clSetKernelArg(kern[k], 5, sizeof mhl, &mhl));\n"
+          "        CK(clSetKernelArg(kern[k], 6, sizeof mhb, &mhb));\n"
+          "        CK(clSetKernelArg(kern[k], 7, sizeof mn, &mn));\n"
+          "    }\n\n"
           "    cl_ulong TILE = 1ULL << 24;\n"
-          "    for (cl_uint kk = AMIN; kk <= BMAX; kk++) {\n"
-          "        cl_ulong Nk = 1; for (cl_uint i = 0; i < kk; i++) Nk *= RADIX;\n"
-          "        CK(clSetKernelArg(k, 1, sizeof Nk, &Nk));\n"
-          "        CK(clSetKernelArg(k, 2, sizeof kk, &kk));\n"
-          "        for (cl_ulong base = 0; base < Nk; base += TILE) {\n"
-          "            cl_ulong n = (Nk - base < TILE) ? (Nk - base) : TILE;\n"
-          "            size_t global = (size_t)((n + 255) / 256) * 256;\n"
-          "            CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
-          "            CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, NULL));\n"
-          "            CK(clFinish(q));\n"
+          "    for (int k = AMIN; k <= BMAX; k++) {\n"
+          "        int gw = k < GT ? k : GT, hi = k - gw, plen = hi * L;\n"
+          "        cl_ulong loN = 1; for (int i = 0; i < gw; i++) loN *= R;\n"
+          "        cl_ulong npfx = 1; for (int i = 0; i < hi; i++) npfx *= R;\n"
+          "        CK(clSetKernelArg(kern[k], 1, sizeof loN, &loN));\n"
+          "        for (cl_ulong pi = 0; pi < npfx; pi++) {\n"
+          "            unsigned char pbuf[MAXW]; cl_ulong pf = pi;\n"
+          "            for (int hp = hi - 1; hp >= 0; hp--) { unsigned dd = pf % R; pf /= R;\n"
+          "                for (int t = 0; t < L; t++) pbuf[hp*L + t] = A0h[dd*L + t]; }\n"
+          "            if (plen) CK(clEnqueueWriteBuffer(q, mpfx, CL_TRUE, 0, plen, pbuf, 0, NULL, NULL));\n"
+          "            for (cl_ulong base = 0; base < loN; base += TILE) {\n"
+          "                cl_ulong n = (loN - base < TILE) ? (loN - base) : TILE;\n"
+          "                size_t global = (size_t)((n + 255) / 256) * 256;\n"
+          "                CK(clSetKernelArg(kern[k], 0, sizeof base, &base));\n"
+          "                CK(clEnqueueNDRangeKernel(q, kern[k], 1, NULL, &global, NULL, 0, NULL, NULL));\n"
+          "                CK(clFinish(q));\n"
+          "            }\n"
           "        }\n"
           "    }\n"
           "    CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof nhits, &nhits, 0, NULL, NULL));\n"
@@ -1367,8 +1392,7 @@ static void emit_gpu_var(FILE *o, const char *pattern, const struct build *B)
           "    }\n"
           "    if (nhits > MAXHITS) fprintf(stderr, \"rxejit -G: %u hits, only %u recorded\\n\", nhits, MAXHITS);\n"
           "    fprintf(stderr, \"%u matches\\n\", nhits);\n"
-          "    free(tgt); free(hlen); free(hbuf);\n"
-          "    return 0;\n}\n", o);
+          "    free(tgt); free(hlen); free(hbuf);\n    return 0;\n}\n", o);
 }
 
 // Run argv to completion, its stdout inherited so a generated enumerator's
@@ -1402,7 +1426,7 @@ static int compile_and_run(const char *pattern, const struct build *B,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    if (gpu == 2)   emit_gpu_var(f, pattern, B);
+    if (gpu == 2)   emit_gpu_hybrid(f, pattern, B);
     else if (gpu)   emit_gpu(f, pattern, B, nmemb);
     else            emit(f, pattern, B, sink, nmemb, verbose, hash, psec);
     fclose(f);
@@ -1632,7 +1656,7 @@ int main(int argc, char **argv)
         if (gpu && gpu_no) {
             fprintf(stderr, "%s: the GPU path needs a fixed-width mask or a bare X{a,b} -- this has %s.\n", prog, gpu_no);
             ret = 1;
-        } else if (emit_only && gpu_kind == 2) { emit_gpu_var(stdout, pattern, &b); ret = 0; }
+        } else if (emit_only && gpu_kind == 2) { emit_gpu_hybrid(stdout, pattern, &b); ret = 0; }
         else if (emit_only && gpu_kind == 1) { emit_gpu(stdout, pattern, &b, nmemb); ret = 0; }
         else if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash, psec); ret = 0; }
         else if (gpu)       ret = compile_and_run(pattern, &b, sink, nmemb, NULL, matchfile, verbose, hash, psec, gpu_kind);
