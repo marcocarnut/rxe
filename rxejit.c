@@ -453,7 +453,7 @@ static void emit_sink(FILE *o, int dup, int match, int count, int hash,
 // interleave, and generation to a pipe is I/O-bound anyway, so there is nothing
 // to win there.
 static void emit(FILE *o, const char *pattern, const struct build *B,
-                 int sink, const char *nmemb, int verbose, int hash)
+                 int sink, const char *nmemb, int verbose, int hash, int psec)
 {
     struct wheel *w = B->w;
     int nw = B->nw;
@@ -467,6 +467,7 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     int acc      = count || match;              // sinks that tally into *acc
     int threaded = (acc || dup) && nmemb;       // split [0,N) when N fits 64 bits
     int rt       = match || dup;                // needs the embedded runtime
+    int progress = psec > 0 && (count || match) && threaded;  // -p live reporter
 
     // Sizing. A member is rebuilt each step (not delta-patched) when a wheel is
     // variable-width, or a backreference copies a group -- either makes offsets
@@ -543,6 +544,7 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     // match keeps a mutex for the rare hit print even on one thread, so pthread
     // comes in for it too; count and dup need pthread only when they thread.
     if (threaded || match) fputs("#include <stdlib.h>\n#include <pthread.h>\n#include <unistd.h>\n", o);
+    if (progress) fputs("#include <time.h>\n", o);
     fputc('\n', o);
 
     if (rt) fputs(RXEJIT_RT, o), fputc('\n', o);
@@ -553,6 +555,8 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
 
     fputs(dup
         ? "static void run(unsigned long long from, unsigned long long count, struct rt_dup *d)\n{\n"
+        : acc && progress
+        ? "static void run(unsigned long long from, unsigned long long count, unsigned long long *acc, unsigned long long *prog)\n{\n"
         : acc
         ? "static void run(unsigned long long from, unsigned long long count, unsigned long long *acc)\n{\n"
         : "static void run(unsigned long long from, unsigned long long count)\n{\n", o);
@@ -601,6 +605,7 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         fputs("    for (;;) {\n", o);
         emit_sink(o, dup, match, count, hash, len, lenp1);
         fputs("        if (count && ++done == count) break;\n", o);
+        if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
         for (int i = nw - 1; i >= 0; i--) {
             char e[16]; snprintf(e, sizeof e, "i%d", i);
             fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
@@ -628,6 +633,7 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
               "    buf[p] = '\\n';\n", o);
         emit_sink(o, dup, match, count, hash, "p", "p + 1");
         fputs("    if (count && ++done == count) goto R_done;\n", o);
+        if (progress) fputs("    if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
         for (int i = nw - 1; i >= 0; i--)
             fprintf(o, "    if (++i%d < %d) { p = pos%d; goto R_%d; } i%d = 0;\n",
                     i, w[i].n, i, i, i);
@@ -720,15 +726,44 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         // A thread per shard of [0, N). Count and match share the whole split;
         // only the setup (match loads the targets first, taking its jobs arg one
         // later) and the report (match to stderr, and it frees the set) differ.
-        fprintf(o, "#define NMEMB %sULL\n#define MAXT  256\n\n", nmemb);
-        fputs("struct shard { unsigned long long from, count, total; };\n\n"
-              "static void *worker(void *p)\n{\n"
+        fprintf(o, "#define NMEMB %sULL\n#define MAXT  256\n", nmemb);
+        if (progress) fprintf(o, "#define PSEC  %d\n", psec);
+        fputc('\n', o);
+        fputs(progress
+            ? "struct shard { unsigned long long from, count, total, done; };\n\n"
+            : "struct shard { unsigned long long from, count, total; };\n\n", o);
+        fputs("static void *worker(void *p)\n{\n"
               "    struct shard *s = p;\n"
-              "    s->total = 0;\n"
-              "    run(s->from, s->count, &s->total);\n"
-              "    return 0;\n"
-              "}\n\n"
-              "int main(int argc, char **argv)\n{\n", o);
+              "    s->total = 0;\n", o);
+        fputs(progress
+            ? "    s->done = 0;\n    run(s->from, s->count, &s->total, &s->done);\n"
+            : "    run(s->from, s->count, &s->total);\n", o);
+        fputs("    return 0;\n}\n\n", o);
+        if (progress)
+            // A monitor thread every PSEC seconds: sum the shards' progress (a
+            // relaxed atomic, so no lock and no torn read TSan complains of),
+            // and print percent / rate / elapsed / eta. Cancelled at the join so
+            // a short run does not wait out a sleep.
+            fputs("static struct shard *SH; static int NT;\n"
+                  "static unsigned long long NALL; static int RUNNING = 1;\n"
+                  "static double T0;\n"
+                  "static double rt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }\n"
+                  "static void *monitor(void *u)\n{\n"
+                  "    (void)u;\n"
+                  "    while (__atomic_load_n(&RUNNING, __ATOMIC_RELAXED)) {\n"
+                  "        sleep(PSEC);\n"
+                  "        if (!__atomic_load_n(&RUNNING, __ATOMIC_RELAXED)) break;\n"
+                  "        unsigned long long d = 0;\n"
+                  "        for (int t = 0; t < NT; t++) d += __atomic_load_n(&SH[t].done, __ATOMIC_RELAXED);\n"
+                  "        double el = rt_now() - T0;\n"
+                  "        double fr = NALL ? (double)d / (double)NALL : 0;\n"
+                  "        double rate = el > 0 ? d / el : 0;\n"
+                  "        double eta = fr > 0 ? el * (1 - fr) / fr : 0;\n"
+                  "        fprintf(stderr, \"progress: %5.1f%%  %llu/%llu  %.3g/s  elapsed %.0fs  eta %.0fs\\n\",\n"
+                  "                fr * 100, d, NALL, rate, el, eta);\n"
+                  "    }\n"
+                  "    return 0;\n}\n\n", o);
+        fputs("int main(int argc, char **argv)\n{\n", o);
         if (match) {
             fputs("    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE [jobs]\\n\", argv[0]); return 2; }\n", o);
             fprintf(o, "    if (%s) { fprintf(stderr, \"rxejit: cannot read %%s\\n\", argv[1]); return 2; }\n", load);
@@ -750,13 +785,19 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
               "                       rem  = N % (unsigned long long)T, off = 0;\n"
               "    for (int t = 0; t < T; t++) {\n"
               "        sh[t].from = off;\n"
-              "        sh[t].count = base + ((unsigned long long)t < rem ? 1 : 0);\n"
-              "        off += sh[t].count;\n"
-              "    }\n"
-              "    for (int t = 1; t < T; t++) pthread_create(&tid[t], 0, worker, &sh[t]);\n"
+              "        sh[t].count = base + ((unsigned long long)t < rem ? 1 : 0);\n", o);
+        if (progress) fputs("        sh[t].done = 0;\n", o);
+        fputs("        off += sh[t].count;\n"
+              "    }\n", o);
+        if (progress)
+            fputs("    SH = sh; NT = T; NALL = N; T0 = rt_now();\n"
+                  "    pthread_t montid; pthread_create(&montid, 0, monitor, 0);\n", o);
+        fputs("    for (int t = 1; t < T; t++) pthread_create(&tid[t], 0, worker, &sh[t]);\n"
               "    worker(&sh[0]);\n"
-              "    for (int t = 1; t < T; t++) pthread_join(tid[t], 0);\n"
-              "    unsigned long long total = 0;\n"
+              "    for (int t = 1; t < T; t++) pthread_join(tid[t], 0);\n", o);
+        if (progress)
+            fputs("    __atomic_store_n(&RUNNING, 0, __ATOMIC_RELAXED); pthread_cancel(montid); pthread_join(montid, 0);\n", o);
+        fputs("    unsigned long long total = 0;\n"
               "    for (int t = 0; t < T; t++) total += sh[t].total;\n", o);
         fputs(match
               ? "    fprintf(stderr, \"%llu matches\\n\", total);\n    rt_set_free(&TB);\n"
@@ -801,7 +842,7 @@ static int spawn(char *const argv[])
 // code.
 static int compile_and_run(const char *pattern, const struct build *B,
                            int sink, const char *nmemb, const char *jobs,
-                           const char *matchfile, int verbose, int hash)
+                           const char *matchfile, int verbose, int hash, int psec)
 {
     char dir[] = "/tmp/rxejit.XXXXXX";
     if (!mkdtemp(dir)) { perror("rxejit: mkdtemp"); return 2; }
@@ -813,7 +854,7 @@ static int compile_and_run(const char *pattern, const struct build *B,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    emit(f, pattern, B, sink, nmemb, verbose, hash);
+    emit(f, pattern, B, sink, nmemb, verbose, hash, psec);
     fclose(f);
 
     const char *cc = getenv("CC");
@@ -894,13 +935,16 @@ static int dict_resolver(const char *name)
 int main(int argc, char **argv)
 {
     const char *prog = argc > 0 ? argv[0] : "rxejit";
-    int emit_only = 0, sink = SINK_WRITE, verbose = 0, hash = 0, opt;
+    int emit_only = 0, sink = SINK_WRITE, verbose = 0, hash = 0, psec = 0, opt;
     const char *jobs = NULL;              // thread count, forwarded to the exe
     const char *matchfile = NULL;         // target file for -m
 
-    while ((opt = getopt(argc, argv, "Sndvj:m:H:D:h")) != -1) {
+    while ((opt = getopt(argc, argv, "Sndvj:m:H:D:p:h")) != -1) {
         switch (opt) {
             case 'S': emit_only = 1; break;
+            case 'p': psec = atoi(optarg);
+                      if (psec < 1) { fprintf(stderr, "%s: -p needs seconds >= 1\n", prog); return 2; }
+                      break;
             case 'n': sink = SINK_COUNT; break;
             case 'd': sink = SINK_DUP; break;
             case 'v': verbose = 1; break;
@@ -932,6 +976,8 @@ int main(int argc, char **argv)
 "    -v       with -d, list the repeated members and their counts.\n"
 "    -j jobs  threads for -n, -m and -d (default: one per CPU). Printing stays\n"
 "             single-threaded and ordered.\n"
+"    -p sec   every 'sec' seconds print progress to stderr -- percent done,\n"
+"             rate, elapsed and ETA. For the threaded -n and -m runs.\n"
 "    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
@@ -978,8 +1024,8 @@ int main(int argc, char **argv)
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
 
-        if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash); ret = 0; }
-        else           ret = compile_and_run(pattern, &b, sink, nmemb, jobs, matchfile, verbose, hash);
+        if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash, psec); ret = 0; }
+        else           ret = compile_and_run(pattern, &b, sink, nmemb, jobs, matchfile, verbose, hash, psec);
         mpz_clear(N);
     }
 

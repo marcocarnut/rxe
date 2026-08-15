@@ -255,6 +255,15 @@ emits_compiles '(a|bc)d'          # variable-length write
 emits_compiles -d '(ab|a)(b|)'    # variable-length dedup
 emits_compiles -m /dev/null -H md5 '[0-9]{4}'   # keycracking
 emits_compiles '([a-z]{2})\1'                   # backreference
+emits_compiles -n -p 2 '[a-z]{4}'               # progress reporter (count)
+emits_compiles -m /dev/null -H md5 -p 2 '[0-9]{4}'  # progress reporter (keycrack)
+
+# -p must not change the result (timing-only, to stderr).
+if [ "$("$RXEJIT" -n -p 1 '[a-z]{3}[0-9]')" = "$("$RXEJIT" -n '[a-z]{3}[0-9]')" ]; then
+    pass=$((pass + 1))
+else
+    printf 'FAIL  -p changed the -n result\n'; fail=$((fail + 1))
+fi
 
 # The threaded count must not depend on how many threads run it.
 one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')
