@@ -147,6 +147,15 @@ same 'pre[0-9]{1,2}'
 same '(ab){1,2}'
 same '(a|aa){1,2}'
 
+# Backreferences: a copy of the named group's bytes, no wheel of their own, via
+# g<N>_pos/len locals set as the group is laid. Byte-for-byte rxenum -e.
+same '([a-z])\1'
+same '(ab|cd)\1'
+same '(a)(b)\2\1'
+same '([a-z]{2})-\1'
+same '(a|b){2}\1'         # repeated group: the backref copies the last iteration
+same '([0-9])([a-z])\1\2'
+
 # The match sink: hits (length 3), no hits (length 2, but 'ab'/'q7' are there),
 # and a mask disjoint from the targets (empty result both ways).
 match '[a-z]{3}'
@@ -210,6 +219,7 @@ dedup '(ab|a)(ba|b)(a|)'
 dedup '(cat|hi)(cat|hi)'
 dedup 'a{1,2}a{1,2}'    # repeat aliasing: "aa" is a{2} and a{1}a{1}
 dedup '(a|aa){1,2}'
+dedup '(a|a)\1'         # the alternation's duplicate, seen through the backref
 
 # A large bounded repeat is past unrolling and must decline, not hang.
 declines '[a-z]{4,6}'
@@ -244,6 +254,7 @@ emits_compiles -n '[a-z]{3}'
 emits_compiles '(a|bc)d'          # variable-length write
 emits_compiles -d '(ab|a)(b|)'    # variable-length dedup
 emits_compiles -m /dev/null -H md5 '[0-9]{4}'   # keycracking
+emits_compiles '([a-z]{2})\1'                   # backreference
 
 # The threaded count must not depend on how many threads run it.
 one=$("$RXEJIT" -n -j 1 '[a-z]{3}[a-z]')

@@ -13,14 +13,16 @@
  *          alternation or bounded repeat baked out by the interpreter. When a
  *          wheel's branches are all one length the member sits at compile-time
  *          offsets, delta-patched as the odometer turns; when they vary
- *          ([a-z]{1,3}, (cat|hi)) the member is rebuilt each step. So masks,
- *          equal- and uneven-length alternations, subroutines, and bounded
- *          repeats all compile -- every finite pattern short of the hard cases.
- *          An unbounded repeat (which is infinite), a dictionary, a
- *          backreference, or a set too large to unroll it declines by name, so
- *          the interpreter path stays the answer there. It runs the compiled
- *          program (or prints the C with -S) under a chosen sink: write the
- *          members, count them, match against a target set, or find duplicates.
+ *          ([a-z]{1,3}, (cat|hi)) the member is rebuilt each step. A
+ *          backreference is no wheel at all -- it copies the bytes of the group
+ *          it names, tracked in local variables the generated code sets as the
+ *          group is laid. So masks, alternations even and uneven, subroutines,
+ *          bounded repeats, dictionaries, and backreferences all compile --
+ *          every finite pattern. Only an unbounded (infinite) repeat, or a set
+ *          too large to unroll, declines by name, and the interpreter stays the
+ *          answer there. It runs the compiled program (or prints the C with -S)
+ *          under a chosen sink: write the members, count them, match them
+ *          against a target set (MD5 too, for keycracking), or find duplicates.
  *
  *          (C) 2011 Marco "Kiko" Carnut <kiko at postcogito dot org>
  *
@@ -66,15 +68,67 @@ struct wheel { const char *base; int n; int L; const int *aoff; const int *alen;
 
 static const char *reason;         // why a pattern was declined, for the message
 
-// The running build: the wheels gathered so far, plus every buffer baked for an
-// alternation -- bytes and the offset/length arrays -- freed once code is out.
+// The render is a sequence of ops, in member order. Usually just LAY the wheels;
+// a backreference adds a COPY of an earlier group's bytes, bracketed by the
+// OPEN/CLOSE that record where that group landed. Only these interleave the
+// wheel-laying, so a pattern without backrefs is a plain run of LAYs.
+enum { OP_LAY, OP_OPEN, OP_CLOSE, OP_COPY };
+struct op { int kind; int arg; };   // arg = wheel index (LAY) or group id (rest)
+
+// The running build: the wheels gathered so far, the render ops, the groups a
+// backreference names (matched by their rxe pointer), and every buffer baked
+// for an alternation -- all freed once the code is out.
 struct build {
     struct wheel *w;
     int           nw;
+    struct op    *ops;
+    int           nops, cops;
+    struct rxe  **gref;           // rxe pointers a backreference targets (pass 1)
+    int           ngref;
+    struct rxe  **grxe;           // groups opened so far, and their ids by index
+    int           ngroup;
+    int           has_backref;
     void        **bake;
     int           nbake, cbake;
     struct rxe   *root;            // the whole pattern, for a node's source span
 };
+
+static int emit_op(struct build *b, int kind, int arg)
+{
+    if (b->nops == b->cops) {
+        int nc = b->cops ? b->cops * 2 : 16;
+        struct op *no = realloc(b->ops, (size_t)nc * sizeof *no);
+        if (!no) { reason = "out of memory"; return -1; }
+        b->ops = no; b->cops = nc;
+    }
+    b->ops[b->nops].kind = kind; b->ops[b->nops].arg = arg;
+    b->nops++;
+    return 0;
+}
+
+// A group's id is its slot in grxe, assigned the first time it is opened. Search
+// only; the backref uses this so a forward reference (group not yet opened)
+// returns -1 and is declined.
+static int group_of(struct build *b, struct rxe *rxe)
+{
+    for (int i = 0; i < b->ngroup; i++) if (b->grxe[i] == rxe) return i;
+    return -1;
+}
+
+// Whether a backreference names this group, and if so its id, assigning one on
+// first open. Groups nothing points at stay untracked (id -1, no OPEN/CLOSE).
+static int group_open_id(struct build *b, struct rxe *rxe)
+{
+    int referenced = 0;
+    for (int i = 0; i < b->ngref; i++) if (b->gref[i] == rxe) { referenced = 1; break; }
+    if (!referenced) return -1;
+    int g = group_of(b, rxe);
+    if (g >= 0) return g;                       // reopened (a repeated group)
+    b->grxe = realloc(b->grxe, (size_t)(b->ngroup + 1) * sizeof *b->grxe);
+    if (!b->grxe) { reason = "out of memory"; return -2; }
+    b->grxe[b->ngroup] = rxe;
+    return b->ngroup++;
+}
 
 static int keep(struct build *b, void *p)   // track an allocation for freeing
 {
@@ -94,6 +148,7 @@ static int add_wheel(struct build *b, const char *base, int n, int L,
 {
     if (n < 1)         { reason = "an empty class"; return -1; }
     if (b->nw >= MAXW) { reason = "too many positions to unroll"; return -1; }
+    if (emit_op(b, OP_LAY, b->nw)) return -1;
     b->w[b->nw] = (struct wheel){ base, n, L, aoff, alen };
     b->nw++;
     return 0;
@@ -204,6 +259,16 @@ static int add_node(struct build *b, struct rxe_node *nd)
     if (plain)
         return add_wheel(b, nd->str, nd->len, 1, NULL, NULL);
 
+    // A backreference is no wheel: it copies the bytes of the group it names,
+    // which must already be open (a backward reference). Its rxe pointer is the
+    // group's, so group_of finds the id.
+    if (nd->is_backref) {
+        b->has_backref = 1;
+        int g = group_of(b, nd->rxe);
+        if (g < 0) { reason = "a forward or unresolved backreference"; return -1; }
+        return emit_op(b, OP_COPY, g);
+    }
+
     if (nd->is_dict)
         return bake_dict(b, nd);
 
@@ -256,25 +321,61 @@ static int add_rxe(struct build *b, struct rxe *rxe)
         reason = "a non-default enumeration order"; return -1;
     }
     if (!rxe->head) { reason = "an empty expression"; return -1; }
+
+    // If a backreference names this group, bracket its bytes so a later copy can
+    // find them. A group opened more than once (a repeated group) records each
+    // time, so the copy sees the last -- which is rxe's binding.
+    int g = group_open_id(b, rxe);
+    if (g == -2) return -1;
+    if (g >= 0 && emit_op(b, OP_OPEN, g)) return -1;
+
+    int rc = 0;
     if (rxe->head->next)
-        return bake_alt(b, rxe);
-    for (struct rxe_node *nd = rxe->head->head; nd; nd = nd->next)
-        if (add_node(b, nd)) return -1;
+        rc = bake_alt(b, rxe);
+    else
+        for (struct rxe_node *nd = rxe->head->head; nd; nd = nd->next)
+            if (add_node(b, nd)) { rc = -1; break; }
+
+    if (rc == 0 && g >= 0 && emit_op(b, OP_CLOSE, g)) return -1;
+    return rc;
+}
+
+// Pass 1: collect the rxe pointers a backreference names, so pass 2 knows which
+// groups to bracket. A backref's own rxe is the target; other nodes recurse.
+static int find_refs(struct build *b, struct rxe *rxe)
+{
+    for (struct rxe_alt *a = rxe->head; a; a = a->next)
+        for (struct rxe_node *n = a->head; n; n = n->next) {
+            if (n->is_backref) {
+                int have = 0;
+                for (int i = 0; i < b->ngref; i++) if (b->gref[i] == n->rxe) { have = 1; break; }
+                if (!have) {
+                    struct rxe **ng = realloc(b->gref, (size_t)(b->ngref + 1) * sizeof *ng);
+                    if (!ng) { reason = "out of memory"; return -1; }
+                    b->gref = ng; b->gref[b->ngref++] = n->rxe;
+                }
+            } else if (n->rxe) {
+                if (find_refs(b, n->rxe)) return -1;
+            }
+        }
     return 0;
 }
 
 // Gather the wheels for the whole pattern. Returns the count, or -1 with
-// 'reason' set. On success the caller must free the bake buffers (free_build).
+// 'reason' set. On success the caller must free the buffers (free_build).
 static int collect(struct build *b, struct rxe *rxe)
 {
     b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0; b->root = rxe;
+    b->ops = NULL; b->nops = 0; b->cops = 0;
+    b->gref = NULL; b->ngref = 0; b->grxe = NULL; b->ngroup = 0; b->has_backref = 0;
+    if (find_refs(b, rxe)) return -1;
     return add_rxe(b, rxe) ? -1 : b->nw;
 }
 
 static void free_build(struct build *b)
 {
     for (int i = 0; i < b->nbake; i++) free(b->bake[i]);
-    free(b->bake);
+    free(b->bake); free(b->ops); free(b->gref); free(b->grxe);
 }
 
 // Print the pattern into a C comment, defusing any */ that would close it.
@@ -331,9 +432,11 @@ static int wheel_distinct(const struct wheel *w)
 // The write sink stays one ordered thread: several threads on one stdout would
 // interleave, and generation to a pipe is I/O-bound anyway, so there is nothing
 // to win there.
-static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
+static void emit(FILE *o, const char *pattern, const struct build *B,
                  int sink, const char *nmemb, int verbose, int hash)
 {
+    struct wheel *w = B->w;
+    int nw = B->nw;
     int count    = sink == SINK_COUNT;
     int match    = sink == SINK_MATCH;
     int dup      = sink == SINK_DUP;
@@ -345,21 +448,32 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     int threaded = (acc || dup) && nmemb;       // split [0,N) when N fits 64 bits
     int rt       = match || dup;                // needs the embedded runtime
 
-    // Sizing. A variable wheel (an uneven alternation) has L==0 and per-branch
-    // aoff/alen; it makes a member's length depend on the choice, so offsets go
-    // dynamic and the member is rebuilt each step rather than delta-patched.
-    // bufcap is the most a member can hold; multi marks memcpy (and string.h).
-    int variable = 0, bufcap = 0, multi = 0;
+    // Sizing. A member is rebuilt each step (not delta-patched) when a wheel is
+    // variable-width, or a backreference copies a group -- either makes offsets
+    // depend on the choice. bufcap is the most a member can hold; multi marks
+    // memcpy (and string.h). Backref patterns cost bufcap the copied spans too,
+    // so it is walked over the op list rather than the wheels.
+    int variable = B->has_backref, multi = B->has_backref;
+    for (int i = 0; i < nw; i++)
+        if (w[i].L == 0) { variable = 1; multi = 1; }
+        else if (w[i].L > 1) multi = 1;
+
+    int wmax[MAXW];                             // each wheel's longest branch
     for (int i = 0; i < nw; i++) {
-        if (w[i].L == 0) {
-            variable = 1; multi = 1;
-            int m = 0;
-            for (int j = 0; j < w[i].n; j++) if (w[i].alen[j] > m) m = w[i].alen[j];
-            bufcap += m;
-        } else {
-            if (w[i].L > 1) multi = 1;
-            bufcap += w[i].L;
+        if (w[i].L) wmax[i] = w[i].L;
+        else { int m = 0; for (int j = 0; j < w[i].n; j++) if (w[i].alen[j] > m) m = w[i].alen[j]; wmax[i] = m; }
+    }
+    int bufcap = 0;
+    {
+        int gpos[MAXW], glen[MAXW], p = 0;      // longest-member simulation
+        for (int k = 0; k < B->nops; k++) {
+            struct op op = B->ops[k];
+            if      (op.kind == OP_LAY)   p += wmax[op.arg];
+            else if (op.kind == OP_OPEN)  gpos[op.arg] = p;
+            else if (op.kind == OP_CLOSE) glen[op.arg] = p - gpos[op.arg];
+            else                          p += glen[op.arg];   // OP_COPY
         }
+        bufcap = p;
     }
     int off[MAXW], TL = 0;
     if (!variable) for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; }
@@ -467,8 +581,9 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
     fputs("    unsigned long long done = 0;\n", o);
     fputs("    for (;;) {\n", o);
     if (variable) {
-        // Rebuild the member: concatenate each wheel's current branch, tracking
-        // the running length p, since a variable wheel shifts everything after it.
+        // Rebuild the member: walk the op list, laying each wheel's current
+        // branch and copying any backreferenced group's bytes, tracking the
+        // running length p (a variable wheel or a copy shifts everything after).
         //
         // TODO(perf): this rebuilds the whole member every step (a memcpy per
         // wheel), ~7-10x slower than the fixed delta path. Most steps only turn
@@ -476,14 +591,28 @@ static void emit(FILE *o, const char *pattern, struct wheel *w, int nw,
         // carried -- tracking each wheel's current offset -- would collapse the
         // common case back toward fixed speed. Left out of the first correct
         // version; worth it only if a variable-length workload is throughput-bound.
+        for (int g = 0; g < B->ngroup; g++)
+            fprintf(o, "        int g%d_pos = 0, g%d_len = 0;\n", g, g);
         fputs("        int p = 0;\n", o);
-        for (int i = 0; i < nw; i++)
-            if (w[i].L)
-                fprintf(o, "        memcpy(buf + p, A%d + i%d * %d, %d); p += %d;\n",
-                        i, i, w[i].L, w[i].L, w[i].L);
-            else
-                fprintf(o, "        memcpy(buf + p, A%d + A%do[i%d], A%dl[i%d]);"
-                           " p += A%dl[i%d];\n", i, i, i, i, i, i, i);
+        for (int k = 0; k < B->nops; k++) {
+            struct op op = B->ops[k];
+            int i = op.arg;
+            if (op.kind == OP_LAY) {
+                if (w[i].L)
+                    fprintf(o, "        memcpy(buf + p, A%d + i%d * %d, %d); p += %d;\n",
+                            i, i, w[i].L, w[i].L, w[i].L);
+                else
+                    fprintf(o, "        memcpy(buf + p, A%d + A%do[i%d], A%dl[i%d]);"
+                               " p += A%dl[i%d];\n", i, i, i, i, i, i, i);
+            } else if (op.kind == OP_OPEN) {
+                fprintf(o, "        g%d_pos = p;\n", i);
+            } else if (op.kind == OP_CLOSE) {
+                fprintf(o, "        g%d_len = p - g%d_pos;\n", i, i);
+            } else {  // OP_COPY
+                fprintf(o, "        memcpy(buf + p, buf + g%d_pos, g%d_len); p += g%d_len;\n",
+                        i, i, i);
+            }
+        }
         fputs("        buf[p] = '\\n';\n", o);
     }
     if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
@@ -664,7 +793,7 @@ static int spawn(char *const argv[])
 // Emit the C to a temp file, compile it with $CC (or cc) at -O2, run it. The
 // members -- or the count -- come out on our stdout. Returns a process exit
 // code.
-static int compile_and_run(const char *pattern, struct wheel *w, int nw,
+static int compile_and_run(const char *pattern, const struct build *B,
                            int sink, const char *nmemb, const char *jobs,
                            const char *matchfile, int verbose, int hash)
 {
@@ -678,7 +807,7 @@ static int compile_and_run(const char *pattern, struct wheel *w, int nw,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    emit(f, pattern, w, nw, sink, nmemb, verbose, hash);
+    emit(f, pattern, B, sink, nmemb, verbose, hash);
     fclose(f);
 
     const char *cc = getenv("CC");
@@ -842,8 +971,8 @@ int main(int argc, char **argv)
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
 
-        if (emit_only) { emit(stdout, pattern, b.w, nw, sink, nmemb, verbose, hash); ret = 0; }
-        else           ret = compile_and_run(pattern, b.w, nw, sink, nmemb, jobs, matchfile, verbose, hash);
+        if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash); ret = 0; }
+        else           ret = compile_and_run(pattern, &b, sink, nmemb, jobs, matchfile, verbose, hash);
         mpz_clear(N);
     }
 
