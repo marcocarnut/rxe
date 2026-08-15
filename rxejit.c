@@ -1307,7 +1307,8 @@ static int gpu_maxwidth(const struct build *B)
     return p;
 }
 
-static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G, int psec)
+static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G,
+                             const char *nmemb, int psec)
 {
     int nw = B->nw;
     struct wheel *lw = B->w + (nw - G);          // the G low wheels (the tail)
@@ -1361,6 +1362,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     fputs(";\n\n", o);
     free(ksrc);
 
+    // NALL = the grand total, when it fits 64 bits, so -p can show percent/ETA.
+    // The consumer streams prefixes and cannot sum it, so rxejit bakes it in.
+    fprintf(o, "#define NALL %sULL\n", nmemb ? nmemb : "0");
     fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define LOWWIDTH %d\n#define LON %lluULL\n\n",
             maxw, lowwidth, lon);
 
@@ -1445,9 +1449,13 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "            clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof s1, &s1, NULL);\n"
           "            gpu_ns += s1 - s0; done += n; clReleaseEvent(ev);\n"
           "            double now = rt_now();\n"
-          "            if (now - tlast >= PSEC) { double el = now - t0;\n"
-          "                fprintf(stderr, \"gpu: %llu done  %.3g/s  busy %.0f%%\\n\", done, el > 0 ? done / el : 0,\n"
-          "                        el > 0 ? (gpu_ns / 1e9) / el * 100 : 0); tlast = now; }\n"
+          "            if (now - tlast >= PSEC) { double el = now - t0, rate = el > 0 ? done / el : 0;\n"
+          "                double busy = el > 0 ? (gpu_ns / 1e9) / el * 100 : 0;\n"
+          "                if (NALL) { double fr = (double)done / NALL;\n"
+          "                    fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %.3g/s  eta %.0fs  busy %.0f%%\\n\",\n"
+          "                            fr * 100, done, (unsigned long long)NALL, rate, fr > 0 ? el * (1 - fr) / fr : 0, busy);\n"
+          "                } else fprintf(stderr, \"gpu: %llu done  %.3g/s  busy %.0f%%\\n\", done, rate, busy);\n"
+          "                tlast = now; }\n"
           "#else\n"
           "            CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, NULL)); CK(clFinish(q));\n"
           "#endif\n"
@@ -1570,7 +1578,7 @@ static int write_prefix_file(struct rxe *rxe, const struct build *B, int G, cons
 // Generate the generic consumer, compile it (-lOpenCL), have rxejit write the
 // prefix file, then run the consumer over (targets, prefixes).
 static int compile_and_run_generic(const char *pattern, const struct build *B,
-                                   struct rxe *rxe, int G, const char *matchfile, int psec)
+                                   struct rxe *rxe, int G, const char *nmemb, const char *matchfile, int psec)
 {
     char dir[] = "/tmp/rxejit.XXXXXX";
     if (!mkdtemp(dir)) { perror("rxejit: mkdtemp"); return 2; }
@@ -1582,7 +1590,7 @@ static int compile_and_run_generic(const char *pattern, const struct build *B,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    emit_gpu_generic(f, pattern, B, G, psec);
+    emit_gpu_generic(f, pattern, B, G, nmemb, psec);
     fclose(f);
 
     const char *cc = getenv("CC");
@@ -1818,10 +1826,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "%s: the GPU path needs a fixed mask, a bare X{a,b}, or a "
                     "fixed-class tail -- this has %s.\n", prog, gpu_no);
             ret = 1;
-        } else if (emit_only && gpu_kind == 3) { emit_gpu_generic(stdout, pattern, &b, gpu_G, psec); ret = 0; }
+        } else if (emit_only && gpu_kind == 3) { emit_gpu_generic(stdout, pattern, &b, gpu_G, nmemb, psec); ret = 0; }
         else if (emit_only && gpu_kind == 2) { emit_gpu_hybrid(stdout, pattern, &b, psec); ret = 0; }
         else if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash, psec); ret = 0; }
-        else if (gpu_kind == 3) ret = compile_and_run_generic(pattern, &b, rxe, gpu_G, matchfile, psec);
+        else if (gpu_kind == 3) ret = compile_and_run_generic(pattern, &b, rxe, gpu_G, nmemb, matchfile, psec);
         else if (gpu)       ret = compile_and_run(pattern, &b, sink, nmemb, NULL, matchfile, verbose, hash, psec, gpu_kind);
         else                ret = compile_and_run(pattern, &b, sink, nmemb, jobs, matchfile, verbose, hash, psec, 0);
         mpz_clear(N);
