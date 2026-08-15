@@ -221,8 +221,39 @@ dedup 'a{1,2}a{1,2}'    # repeat aliasing: "aa" is a{2} and a{1}a{1}
 dedup '(a|aa){1,2}'
 dedup '(a|a)\1'         # the alternation's duplicate, seen through the backref
 
-# A large bounded repeat is past unrolling and must decline, not hang.
-declines '[a-z]{4,6}'
+# A variable-count repeat too big to unroll ([a-z]{1,7} is 8 billion) is kept as
+# a loop super-wheel instead: an odometer that grows from a to b copies. Cases
+# small enough to enumerate are checked byte-for-byte by same(); the body may be
+# a class, an equal-length alternation, or a fixed-width dictionary, and fixed
+# wheels may sit before and after it. (same() only reaches the loop path when the
+# member count clears ALT_CAP = 65536; below that the repeat still bakes.)
+same '[a-z]{1,4}'          # 475254 -- bare, the [a-z]{1,7} shape
+same '[a-z]{3,4}'          # a >= 1, two lengths
+same '[a-z]{0,4}'          # a == 0, includes the empty member
+same '[a-z0-9]{1,4}'       # radix 36
+same 'x[a-z]{1,4}'         # a leading fixed wheel
+same '[a-z]{1,4}!'         # a trailing fixed wheel
+same 'ab[a-z]{1,4}yz'      # both, several wide
+same '[p-q][a-z]{1,4}[0-9]'
+same '[b-c]{1,7}[x-y]'     # the embedded-repeat ordering: bx by cx cy bbx ...
+same '(?:[a-z][0-9]){1,3}' # a two-wheel body (m = 2)
+same '(ab|cd){1,17}'       # an equal-length alternation body (L = 2)
+
+# The threaded count of a loop repeat is exact and thread-invariant, and the
+# seed decode (only exercised when from > 0) lands each shard right.
+lr8353=$("$RXEJIT" -n -j 1 '[a-z]{1,7}')
+lr8353b=$("$RXEJIT" -n -j 13 '[a-z]{1,7}')
+if [ "$lr8353" = "8353082582" ] && [ "$lr8353b" = "8353082582" ]; then
+    pass=$((pass + 1))
+else
+    printf 'FAIL  loop-repeat count: -j1=%s -j13=%s (want 8353082582)\n' "$lr8353" "$lr8353b"
+    fail=$((fail + 1))
+fi
+
+# A variable-width body (uneven alternation/dict) or a backref across the repeat
+# is outside the loop path and must decline, not miscompile.
+declines '(a|bc){1,17}'    # uneven-length body, over the cap so it reaches the loop path
+declines '[a-z]{1,7}[0-9]{1,7}'   # two big variable-count repeats
 
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.

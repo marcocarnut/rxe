@@ -16,12 +16,16 @@
  *          ([a-z]{1,3}, (cat|hi)) the member is rebuilt each step. A
  *          backreference is no wheel at all -- it copies the bytes of the group
  *          it names, tracked in local variables the generated code sets as the
- *          group is laid. So masks, alternations even and uneven, subroutines,
- *          bounded repeats, dictionaries, and backreferences all compile --
- *          every finite pattern. Only an unbounded (infinite) repeat, or a set
- *          too large to unroll, declines by name, and the interpreter stays the
- *          answer there. It runs the compiled program (or prints the C with -S)
- *          under a chosen sink: write the members, count them, match them
+ *          group is laid. A variable-count repeat too large to bake into one
+ *          wheel ([a-z]{1,7} is 8 billion) becomes a super-wheel of the odometer
+ *          instead: a base-(the body) number whose length grows from a to b. So
+ *          masks, alternations even and uneven, subroutines, bounded repeats big
+ *          and small, dictionaries, and backreferences all compile -- every
+ *          finite pattern. Only an unbounded (infinite) repeat, or an
+ *          alternation/dictionary too large to unroll, declines by name, and the
+ *          interpreter stays the answer there. It runs the compiled program (or
+ *          prints the C with -S) under a chosen sink: write the members, count
+ *          them, match them
  *          against a target set (MD5 too, for keycracking), or find duplicates.
  *
  *          (C) 2011 Marco "Kiko" Carnut <kiko at postcogito dot org>
@@ -57,6 +61,7 @@
 enum { SINK_WRITE, SINK_COUNT, SINK_MATCH, SINK_DUP };
 
 #define ALT_CAP 65536              // most members a baked alternation may hold
+#define REP_SUBW 64                // most fixed sub-wheels a loop repeat's body may hold
 
 // One odometer wheel: n alternatives at 'base'. When every alternative is the
 // same length it is fixed -- L bytes, alternative i at base + i*L, the fast
@@ -91,6 +96,14 @@ struct build {
     void        **bake;
     int           nbake, cbake;
     struct rxe   *root;            // the whole pattern, for a node's source span
+
+    // A variable-count repeat X{a,b} too large to unroll: kept as a super-wheel
+    // rather than baked into one giant wheel. pre = w[0..lr_at), post = the
+    // wheels appended after; the body X is lr_nsw fixed sub-wheels laid lr_a..
+    // lr_b times -- an odometer whose length grows, a base-(product of the
+    // sub-wheels) number. Only one such repeat, and only fixed sub-wheels.
+    int           lr_active, lr_at, lr_a, lr_b, lr_nsw;
+    struct wheel  lr_sw[REP_SUBW];
 };
 
 static int emit_op(struct build *b, int kind, int arg)
@@ -250,6 +263,36 @@ static int bake_dict(struct build *b, struct rxe_node *nd)
     return add_wheel(b, buf, n, 0, aoff, alen);
 }
 
+// A variable-count repeat X{a,b} too large to unroll (bake would blow past
+// ALT_CAP): keep it as a super-wheel instead. Collect X's own wheels -- one copy
+// of the body, in nd->rxe -- then lift them out of the main stream into lr_sw,
+// where they are the body positions laid a..b times, not pre/post wheels. They
+// must all be fixed width (a variable-width body would alias lengths across the
+// odometer, which this path does not yet render), and hold no group a
+// backreference could name. Only one such repeat per pattern.
+static int add_looprep(struct build *b, struct rxe_node *nd)
+{
+    if (b->lr_active) { reason = "more than one large variable-count repeat"; return -1; }
+    if (b->ngref)     { reason = "a large variable-count repeat with a backreference"; return -1; }
+    int w0 = b->nw, op0 = b->nops, g0 = b->ngroup;
+    if (add_rxe(b, nd->rxe)) return -1;
+    if (b->ngroup != g0) { reason = "a group inside a large variable-count repeat"; return -1; }
+    int m = b->nw - w0;
+    if (m < 1)         { reason = "an empty large variable-count repeat"; return -1; }
+    if (m > REP_SUBW)  { reason = "too many positions in a variable-count repeat body"; return -1; }
+    for (int i = 0; i < m; i++)
+        if (b->w[w0 + i].L == 0) { reason = "a variable-width body in a large variable-count repeat"; return -1; }
+    for (int i = 0; i < m; i++) b->lr_sw[i] = b->w[w0 + i];
+    b->lr_nsw   = m;
+    b->lr_a     = nd->rep_min;
+    b->lr_b     = nd->rep_max;
+    b->lr_at    = w0;             // pre = w[0..w0); post wheels get appended here
+    b->lr_active = 1;
+    b->nw       = w0;            // drop the body wheels from the main stream,
+    b->nops     = op0;          // and the LAY ops that went with them
+    return 0;
+}
+
 // One node -> wheel(s): a plain class is one L==1 wheel; an exact {k} repeat is
 // its body's wheels laid down k times; a group recurses into its subexpression.
 static int add_node(struct build *b, struct rxe_node *nd)
@@ -280,23 +323,29 @@ static int add_node(struct build *b, struct rxe_node *nd)
     }
 
     // A bounded variable repeat X{a,b} is finite and place-value ordered (only
-    // an unbounded one is shortlex), but its members vary in width. Re-parse its
-    // own source span into a standalone expression and bake that as one variable
-    // wheel -- the same treatment an uneven alternation gets. Too many members
-    // to unroll, and bake_alt declines it, as it would a huge alternation.
+    // an unbounded one is shortlex), but its members vary in width. When few
+    // enough, re-parse its own source span and bake it as one variable wheel --
+    // the same treatment an uneven alternation gets, and the tested path for a
+    // modest repeat. When the unroll would be too big ([a-z]{1,7} is 8 billion),
+    // keep it as a loop super-wheel instead, growing an odometer from a to b.
     if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED && nd->rxe) {
         int len = nd->src_end - nd->src_start;
-        if (len <= 0 || !b->root->source) { reason = "a variable-count repeat"; return -1; }
-        char *sub = malloc((size_t)len + 1);
-        if (!sub) { reason = "out of memory"; return -1; }
-        memcpy(sub, b->root->source + nd->src_start, (size_t)len);
-        sub[len] = 0;
-        struct rxe *sr = rxe_parse(sub, 0);
-        free(sub);
-        if (rxe_error(sr) != RXE_OK) { rxe_free(sr); reason = "a variable-count repeat"; return -1; }
-        int rc = bake_alt(b, sr);
-        rxe_free(sr);
-        return rc;
+        if (len > 0 && b->root->source) {
+            char *sub = malloc((size_t)len + 1);
+            if (!sub) { reason = "out of memory"; return -1; }
+            memcpy(sub, b->root->source + nd->src_start, (size_t)len);
+            sub[len] = 0;
+            struct rxe *sr = rxe_parse(sub, 0);
+            free(sub);
+            if (rxe_error(sr) == RXE_OK && !sr->ninf && mpz_fits_ulong_p(sr->nitems)
+                && mpz_get_ui(sr->nitems) <= ALT_CAP) {
+                int rc = bake_alt(b, sr);
+                rxe_free(sr);
+                return rc;
+            }
+            rxe_free(sr);
+        }
+        return add_looprep(b, nd);
     }
 
     if (nd->rxe && !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
@@ -368,8 +417,19 @@ static int collect(struct build *b, struct rxe *rxe)
     b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0; b->root = rxe;
     b->ops = NULL; b->nops = 0; b->cops = 0;
     b->gref = NULL; b->ngref = 0; b->grxe = NULL; b->ngroup = 0; b->has_backref = 0;
+    b->lr_active = 0;
     if (find_refs(b, rxe)) return -1;
-    return add_rxe(b, rxe) ? -1 : b->nw;
+    if (add_rxe(b, rxe)) return -1;
+    // A loop super-wheel renders a variable-length tail, so every pre/post wheel
+    // around it must be fixed and no backreference may reach across it -- the
+    // things this path does not yet interleave. (A single big repeat with all
+    // else fixed, the common keyspace, is what it takes.)
+    if (b->lr_active) {
+        if (b->has_backref) { reason = "a backreference alongside a large variable-count repeat"; return -1; }
+        for (int i = 0; i < b->nw; i++)
+            if (b->w[i].L == 0) { reason = "a variable-width position alongside a large variable-count repeat"; return -1; }
+    }
+    return b->nw;
 }
 
 static void free_build(struct build *b)
@@ -436,6 +496,166 @@ static void emit_sink(FILE *o, int dup, int match, int count, int hash,
     else            fprintf(o, "        fwrite(buf, 1, %s, stdout);\n", lenp1);
 }
 
+// The run() body for a pattern with a loop repeat X{a,b}. The repeat is one
+// super-wheel of the outer odometer: pre wheels are the digits above it, post
+// wheels the digits below, exactly the order the interpreter walks an embedded
+// repeat ([b-c]{1,2}[x-y] runs bx by cx cy bbx...). Seeding decodes 'from' into
+// a segment length rk and the body's digits; the step is a base-(product of the
+// body) number that lengthens at a segment boundary. Within a segment every
+// position sits at a fixed offset, so the common step delta-patches one byte --
+// the fixed path's speed -- and only the rare carry into a longer segment (once
+// per 26x of the members, for [a-z]{1,7}) rebuilds the variable-length tail.
+static void emit_looprep_body(FILE *o, const struct build *B,
+                              int count, int match, int hash, int progress, int acc)
+{
+    int P = B->lr_at, nw = B->nw, Q = nw - P, m = B->lr_nsw;
+    const struct wheel *pre = B->w, *post = B->w + P, *sw = B->lr_sw;
+    int a = B->lr_a, b = B->lr_b;
+
+    int preoff[MAXW], PW = 0;
+    for (int i = 0; i < P; i++) { preoff[i] = PW; PW += pre[i].L; }
+    int soff[REP_SUBW], W = 0;
+    for (int j = 0; j < m; j++) { soff[j] = W; W += sw[j].L; }
+    int postoff[MAXW];
+    for (int i = 0, q = 0; i < Q; i++) { postoff[i] = q; q += post[i].L; }
+
+    // C = members of one body copy; segment k holds C^k, M the whole repeat.
+    unsigned long long C = 1;
+    for (int j = 0; j < m; j++) C *= (unsigned long long)sw[j].n;
+    unsigned long long Cp = 1, M = 0;
+    for (int k = 0; k < a; k++) Cp *= C;
+    for (int k = a; k <= b; k++) { M += Cp; Cp *= C; }
+    if (M == 0) M = 1;   // only reached with from==0 (N over 64 bits); keep %/ safe
+
+    // --- seed from 'from' (post least significant, then the repeat, then pre) ---
+    fputs("    unsigned long long f = from;\n", o);
+    for (int i = Q - 1; i >= 0; i--)
+        fprintf(o, "    int q%d = f %% %d; f /= %d;\n", i, post[i].n, post[i].n);
+    fprintf(o, "    unsigned long long r = f %% %lluULL; f /= %lluULL;\n", M, M);
+    for (int i = P - 1; i >= 0; i--)
+        fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, pre[i].n, pre[i].n);
+    fprintf(o, "    int rd[%d];\n", b * m);
+    fprintf(o, "    int rk = %d;\n", a);
+    fputs("    { unsigned long long seg = 1;\n", o);
+    fprintf(o, "      for (int e = 0; e < %d; e++) seg *= %lluULL;\n", a, C);
+    fprintf(o, "      while (rk <= %d) { if (r < seg) break; r -= seg; seg *= %lluULL; rk++; }\n", b, C);
+    fputs("      for (int c = rk - 1; c >= 0; c--) {\n", o);
+    for (int j = m - 1; j >= 0; j--)
+        fprintf(o, "        rd[c*%d + %d] = r %% %d; r /= %d;\n", m, j, sw[j].n, sw[j].n);
+    fputs("      }\n    }\n", o);
+    if (acc) fputs("    unsigned long long n = 0;\n", o);
+    fputs("    unsigned long long done = 0;\n", o);
+
+    // --- lay the whole member ---
+    for (int i = 0; i < P; i++) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fputs("    ", o); emit_lay(o, i, preoff[i], pre[i].L, e); fputc('\n', o);
+    }
+    fprintf(o, "    int p = %d;\n", PW);
+    fputs("    for (int c = 0; c < rk; c++) {\n", o);
+    for (int j = 0; j < m; j++) {
+        if (sw[j].L == 1) fprintf(o, "        buf[p] = S%d[rd[c*%d + %d]]; p += 1;\n", j, m, j);
+        else fprintf(o, "        memcpy(buf + p, S%d + rd[c*%d + %d] * %d, %d); p += %d;\n",
+                     j, m, j, sw[j].L, sw[j].L, sw[j].L);
+    }
+    fputs("    }\n", o);
+    for (int i = 0; i < Q; i++) {
+        int t = P + i;
+        if (post[i].L == 1) fprintf(o, "    buf[p] = A%d[q%d]; p += 1;\n", t, i);
+        else fprintf(o, "    memcpy(buf + p, A%d + q%d * %d, %d); p += %d;\n",
+                     t, i, post[i].L, post[i].L, post[i].L);
+    }
+    fputs("    buf[p] = '\\n';\n", o);
+
+    // --- the odometer ---
+    fputs("    for (;;) {\n", o);
+    emit_sink(o, 0, match, count, hash, "p", "p + 1");
+    fputs("        if (count && ++done == count) goto L_done;\n", o);
+    if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+
+    // post wheels (least significant): the offset rides on rk*W but rk holds here.
+    for (int i = Q - 1; i >= 0; i--) {
+        int t = P + i, K = PW + postoff[i];
+        fprintf(o, "        if (++q%d < %d) { ", i, post[i].n);
+        if (post[i].L == 1) fprintf(o, "buf[rk*%d + %d] = A%d[q%d];", W, K, t, i);
+        else fprintf(o, "memcpy(buf + (rk*%d + %d), A%d + q%d * %d, %d);", W, K, t, i, post[i].L, post[i].L);
+        fprintf(o, " goto L_next; } q%d = 0; ", i);
+        if (post[i].L == 1) fprintf(o, "buf[rk*%d + %d] = A%d[0];", W, K, t);
+        else fprintf(o, "memcpy(buf + (rk*%d + %d), A%d, %d);", W, K, t, post[i].L);
+        fputc('\n', o);
+    }
+
+    // the repeat body: a base-C odometer over rk*m digits, delta-patched. When
+    // the body is a single wheel (the common [a-z]{1,7}), the least significant
+    // copy turns nearly every step, so peel it out of the carry loop -- that
+    // hot step is then a lone indexed patch, the fixed path's speed, and the
+    // loop runs only on the rare carry.
+    if (m == 1) {
+        int R = sw[0].n, L = sw[0].L;
+        if (a == 0) fputs("        if (rk) {\n", o);   // no last copy to peel at rk==0
+        for (int pass = 0; pass < 2; pass++) {   // pass 0: the peeled last copy; 1: the loop body
+            const char *ix = pass ? "c" : "rk-1";
+            const char *ind = pass ? "            " : "        ";
+            if (pass) fputs("        for (int c = rk - 2; c >= 0; c--) {\n", o);
+            fprintf(o, "%sif (++rd[%s] < %d) { ", ind, ix, R);
+            if (L == 1) fprintf(o, "buf[(%s)*%d + %d] = S0[rd[%s]];", ix, W, PW, ix);
+            else fprintf(o, "memcpy(buf + ((%s)*%d + %d), S0 + rd[%s] * %d, %d);", ix, W, PW, ix, L, L);
+            fprintf(o, " goto L_next; } rd[%s] = 0; ", ix);
+            if (L == 1) fprintf(o, "buf[(%s)*%d + %d] = S0[0];", ix, W, PW);
+            else fprintf(o, "memcpy(buf + ((%s)*%d + %d), S0, %d);", ix, W, PW, L);
+            fputc('\n', o);
+            if (pass) fputs("        }\n", o);
+        }
+        if (a == 0) fputs("        }\n", o);
+    } else {
+        fputs("        for (int c = rk - 1; c >= 0; c--) {\n", o);
+        for (int j = m - 1; j >= 0; j--) {
+            int K = PW + soff[j];
+            fprintf(o, "            if (++rd[c*%d + %d] < %d) { ", m, j, sw[j].n);
+            if (sw[j].L == 1) fprintf(o, "buf[c*%d + %d] = S%d[rd[c*%d + %d]];", W, K, j, m, j);
+            else fprintf(o, "memcpy(buf + (c*%d + %d), S%d + rd[c*%d + %d] * %d, %d);", W, K, j, m, j, sw[j].L, sw[j].L);
+            fputs(" goto L_next; }\n", o);
+            fprintf(o, "            rd[c*%d + %d] = 0; ", m, j);
+            if (sw[j].L == 1) fprintf(o, "buf[c*%d + %d] = S%d[0];", W, K, j);
+            else fprintf(o, "memcpy(buf + (c*%d + %d), S%d, %d);", W, K, j, sw[j].L);
+            fputc('\n', o);
+        }
+        fputs("        }\n", o);
+    }
+
+    // segment exhausted: grow to the next length, or roll the repeat over and
+    // carry into the pre wheels. The tail's width changed, so relay it whole.
+    fputs("        rk++;\n", o);
+    fprintf(o, "        { int rolled = rk > %d;\n", b);
+    fprintf(o, "          if (rolled) rk = %d;\n", a);
+    fprintf(o, "          for (int t = 0; t < rk*%d; t++) rd[t] = 0;\n", m);
+    fprintf(o, "          p = %d;\n", PW);
+    fputs("          for (int c = 0; c < rk; c++) {\n", o);
+    for (int j = 0; j < m; j++) {
+        if (sw[j].L == 1) fprintf(o, "              buf[p] = S%d[rd[c*%d + %d]]; p += 1;\n", j, m, j);
+        else fprintf(o, "              memcpy(buf + p, S%d + rd[c*%d + %d] * %d, %d); p += %d;\n", j, m, j, sw[j].L, sw[j].L, sw[j].L);
+    }
+    fputs("          }\n", o);
+    for (int i = 0; i < Q; i++) {
+        int t = P + i;
+        if (post[i].L == 1) fprintf(o, "          buf[p] = A%d[q%d]; p += 1;\n", t, i);
+        else fprintf(o, "          memcpy(buf + p, A%d + q%d * %d, %d); p += %d;\n", t, i, post[i].L, post[i].L, post[i].L);
+    }
+    fputs("          buf[p] = '\\n';\n", o);
+    fputs("          if (rolled) {\n", o);
+    for (int i = P - 1; i >= 0; i--) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fprintf(o, "            if (++i%d < %d) { ", i, pre[i].n);
+        emit_lay(o, i, preoff[i], pre[i].L, e);
+        fprintf(o, " goto L_next; } i%d = 0; ", i);
+        emit_lay(o, i, preoff[i], pre[i].L, "0");
+        fputc('\n', o);
+    }
+    fputs("            goto L_done;\n          }\n        }\n", o);
+    fputs("        goto L_next;\n      L_next: ;\n    }\n  L_done:\n", o);
+    if (acc) fputs("    *acc += n;\n", o);
+}
+
 // The generated program. Its core is run(from, count): seed the odometer to
 // the member at index 'from' -- the mixed-radix digits of 'from', least
 // significant wheel first -- then step it, handing 'count' members to the sink
@@ -478,6 +698,10 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     for (int i = 0; i < nw; i++)
         if (w[i].L == 0) { variable = 1; multi = 1; }
         else if (w[i].L > 1) multi = 1;
+    if (B->lr_active) {            // a loop repeat renders a variable-length tail
+        variable = 1;
+        for (int j = 0; j < B->lr_nsw; j++) if (B->lr_sw[j].L > 1) multi = 1;
+    }
 
     int wmax[MAXW];                             // each wheel's longest branch
     for (int i = 0; i < nw; i++) {
@@ -495,6 +719,13 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
             else                          p += glen[op.arg];   // OP_COPY
         }
         bufcap = p;
+    }
+    if (B->lr_active) {           // the op walk misses the repeat's grown copies
+        int PW = 0, W = 0, QW = 0;
+        for (int i = 0; i < B->lr_at; i++) PW += w[i].L;
+        for (int i = B->lr_at; i < nw; i++) QW += w[i].L;
+        for (int j = 0; j < B->lr_nsw; j++) W += B->lr_sw[j].L;
+        bufcap = PW + B->lr_b * W + QW;
     }
     int off[MAXW], TL = 0;
     if (!variable) for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; }
@@ -580,8 +811,22 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
             fputs("};\n", o);
         }
     }
+    // The loop repeat's body sub-wheels get their own tables (all fixed width).
+    for (int j = 0; B->lr_active && j < B->lr_nsw; j++) {
+        const struct wheel *s = &B->lr_sw[j];
+        fprintf(o, "    static const unsigned char S%d[] = {", j);
+        for (int k = 0; k < s->n * s->L; k++)
+            fprintf(o, "%s%d", k ? "," : "", (unsigned char)s->base[k]);
+        fputs("};\n", o);
+    }
 
     fprintf(o, "    unsigned char buf[%d];\n", bufcap + 1);
+
+    if (B->lr_active) {
+        emit_looprep_body(o, B, count, match, hash, progress, acc);
+        fputs("}\n\n", o);
+        goto after_run;
+    }
 
     // Seed each wheel from 'from': digit = from %% radix, then from /= radix,
     // walking from the least significant wheel up, so the walk starts at 'from'.
@@ -663,6 +908,7 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     }
     fputs("}\n\n", o);
 
+after_run:
     if (dup) {
         // Each thread dedups its shard into its own set; main merges them and
         // reads the verdict off the total. Same asymmetry rxedup reports:
@@ -1013,6 +1259,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: cannot compile this pattern yet -- it has %s.\n",
                 prog, reason);
         ret = 1;
+    } else if (b.lr_active && sink == SINK_DUP) {
+        fprintf(stderr, "%s: cannot compile this pattern yet -- it has "
+                "a large variable-count repeat with the dedup sink.\n", prog);
+        ret = 1;
     } else {
         // The member total, baked in so the threaded count can split [0, N).
         // Left NULL when it overflows 64 bits, which keeps that count on one
@@ -1020,6 +1270,21 @@ int main(int argc, char **argv)
         mpz_t N;
         mpz_init_set_ui(N, 1);
         for (int i = 0; i < nw; i++) mpz_mul_ui(N, N, (unsigned long)b.w[i].n);
+        if (b.lr_active) {
+            // Fold in the repeat super-wheel's radix M = sum_{k=a}^{b} C^k, where
+            // C is the members of one body copy. (b.w is only the pre/post
+            // wheels; the body was lifted into lr_sw.)
+            mpz_t Cz, term, M;
+            mpz_init_set_ui(Cz, 1);
+            for (int j = 0; j < b.lr_nsw; j++) mpz_mul_ui(Cz, Cz, (unsigned long)b.lr_sw[j].n);
+            mpz_init(term); mpz_init_set_ui(M, 0);
+            for (int k = b.lr_a; k <= b.lr_b; k++) {
+                mpz_pow_ui(term, Cz, (unsigned long)k);
+                mpz_add(M, M, term);
+            }
+            mpz_mul(N, N, M);
+            mpz_clear(Cz); mpz_clear(term); mpz_clear(M);
+        }
         char nbuf[32];
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
