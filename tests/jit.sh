@@ -325,18 +325,24 @@ gpu_avail() {
     ! grep -q 'no OpenCL' "$tmp/gerr"
 }
 if gpu_avail; then
-    for w in cat dog fox zzz abcd cdcd; do printf '%s' "$w" | md5sum | cut -d' ' -f1; done > "$tmp/md5t"
-    for p in '[a-z]{3}' '[a-f0-9]{4}' '(ab|cd){2}[0-9]'; do
+    for w in cat dog fox zzz abcd cdcd a to ab ababab; do printf '%s' "$w" | md5sum | cut -d' ' -f1; done > "$tmp/md5t"
+    # Fixed masks (one grid) and bare loop repeats (a grid per length): the GPU's
+    # hit set must be exactly the CPU keycrack's.
+    for p in '[a-z]{3}' '[a-f0-9]{4}' '(ab|cd){2}[0-9]' \
+             '[a-z]{1,4}' '[a-z]{2,4}' '[a-z0-9]{1,4}' '(ab|cd){1,17}'; do
         "$RXEJIT" -G -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/gpu"
         "$RXEJIT"    -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/cpu"
         if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
             printf 'FAIL  -G %s\n        GPU hit set differs from the CPU keycrack\n' "$p"
             fail=$((fail + 1)); fi
     done
-    # A variable-length pattern has no fixed-width lane, so -G must decline it.
-    if "$RXEJIT" -G -m "$tmp/md5t" -H md5 '[a-z]{1,4}' >/dev/null 2>&1
-    then printf 'FAIL  -G should decline a variable-length pattern\n'; fail=$((fail + 1))
-    else pass=$((pass + 1)); fi
+    # A loop repeat with pre/post or a multi-wheel body is not yet on the GPU, so
+    # -G must decline it (and stay on the CPU) rather than miscompile.
+    for p in 'x[a-z]{1,4}' '(?:[a-z][0-9]){1,4}'; do
+        if "$RXEJIT" -G -m "$tmp/md5t" -H md5 "$p" >/dev/null 2>&1
+        then printf 'FAIL  -G should decline %s\n' "$p"; fail=$((fail + 1))
+        else pass=$((pass + 1)); fi
+    done
     printf 'jit: -G tested on the local OpenCL device\n'
 else
     printf 'jit: -G skipped (no OpenCL GPU here)\n'
