@@ -39,13 +39,20 @@ rxedup.o: rxedup.c rxe.h
 rxejit: rxejit.o librxe.a rxe.h
 	$(CC) rxejit.o -g -L. -lrxe -lgmp -lm -o rxejit
 
-rxejit.o: rxejit.c rxe.h rxejit_rt_embed.h
+rxejit.o: rxejit.c rxe.h rxejit_rt_embed.h rxejit_cl_embed.h
 
 # The runtime the generated enumerator links in line, turned into a C string so
 # rxejit can write it verbatim into each generated program. Kept as real C in
 # rxejit_rt.h (compilable, testable); this escapes it line by line.
 rxejit_rt_embed.h: rxejit_rt.h
 	@printf 'static const char RXEJIT_RT[] =\n' > $@
+	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
+	@printf ';\n' >> $@
+
+# The device-side runtime for -G, the same way: real OpenCL in rxejit_cl.cl,
+# escaped into a C string the generated host program feeds to clBuildProgram.
+rxejit_cl_embed.h: rxejit_cl.cl
+	@printf 'static const char RXEJIT_CL[] =\n' > $@
 	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
 	@printf ';\n' >> $@
 
@@ -131,7 +138,7 @@ bench: rxenum rxedup
 	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h tests/api tests/api-asan
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h rxejit_cl_embed.h tests/api tests/api-asan
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.

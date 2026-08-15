@@ -311,5 +311,36 @@ declines '[a-z]+'
 declines 'a*'
 declines '[:bip39en:]{2}'
 
+# The GPU backend (-G), only where an OpenCL device is actually present. The
+# generated host needs CL headers + libOpenCL to compile and a GPU to run; where
+# either is missing (most CI), skip rather than fail. When present, the GPU's
+# hit set must be exactly the one the CPU keycrack finds -- the CPU is the oracle
+# on the device too. (Probe with a non-empty target: an empty one returns before
+# OpenCL is ever touched, so it would not reveal a missing device.)
+gpu_avail() {
+    "$RXEJIT" -G -S -m /dev/null -H md5 '[a-z]{3}' > "$tmp/g.c" 2>/dev/null || return 1
+    "$CC" -O2 "$tmp/g.c" -lOpenCL -o "$tmp/gexe" 2>/dev/null || return 1
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$tmp/probe"
+    "$tmp/gexe" "$tmp/probe" >/dev/null 2>"$tmp/gerr"
+    ! grep -q 'no OpenCL' "$tmp/gerr"
+}
+if gpu_avail; then
+    for w in cat dog fox zzz abcd cdcd; do printf '%s' "$w" | md5sum | cut -d' ' -f1; done > "$tmp/md5t"
+    for p in '[a-z]{3}' '[a-f0-9]{4}' '(ab|cd){2}[0-9]'; do
+        "$RXEJIT" -G -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/gpu"
+        "$RXEJIT"    -m "$tmp/md5t" -H md5 "$p" 2>/dev/null | sort > "$tmp/cpu"
+        if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G %s\n        GPU hit set differs from the CPU keycrack\n' "$p"
+            fail=$((fail + 1)); fi
+    done
+    # A variable-length pattern has no fixed-width lane, so -G must decline it.
+    if "$RXEJIT" -G -m "$tmp/md5t" -H md5 '[a-z]{1,4}' >/dev/null 2>&1
+    then printf 'FAIL  -G should decline a variable-length pattern\n'; fail=$((fail + 1))
+    else pass=$((pass + 1)); fi
+    printf 'jit: -G tested on the local OpenCL device\n'
+else
+    printf 'jit: -G skipped (no OpenCL GPU here)\n'
+fi
+
 printf 'jit: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
