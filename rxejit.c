@@ -1308,8 +1308,15 @@ static int gpu_maxwidth(const struct build *B)
 }
 
 static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G,
-                             const char *nmemb, int psec)
+                             int lowvar, const char *nmemb, int psec)
 {
+    // lowvar: the low block holds a variable-width wheel (a dictionary or uneven
+    // alternation) with no fixed tail to split on, so the whole pattern is the
+    // block (G == nw, empty prefix) and the kernel lays each alternative's real
+    // bytes -- compacting as it goes, from the wheel's own offset/length tables
+    // -- then hashes the running length. One MD5 block covers any length < 56, so
+    // only the byte-copy diverges, not the compression. The fixed low block keeps
+    // the straight-line baked path.
     int nw = B->nw;
     struct wheel *lw = B->w + (nw - G);          // the G low wheels (the tail)
     int lwoff[64], lowwidth = 0;
@@ -1323,30 +1330,55 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     FILE *ms = open_memstream(&ksrc, &ksz);
     fputs(RXEJIT_CL, ms);
     for (int g = 0; g < G; g++) {
+        int bytes = lw[g].L ? lw[g].n * lw[g].L : lw[g].aoff[lw[g].n - 1] + lw[g].alen[lw[g].n - 1];
         fprintf(ms, "__constant uchar A%d[] = {", g);
-        for (int j = 0; j < lw[g].n * lw[g].L; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)lw[g].base[j]);
+        if (bytes == 0) fputs("0", ms);
+        for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)lw[g].base[j]);
         fputs("};\n", ms);
+        if (lw[g].L == 0) {                       // a variable wheel: offset/length per alternative
+            fprintf(ms, "__constant int A%do[] = {", g);
+            for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].aoff[j]);
+            fputs("};\n", ms);
+            fprintf(ms, "__constant int A%dl[] = {", g);
+            for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].alen[j]);
+            fputs("};\n", ms);
+        }
     }
-    // T (total bytes) and PLEN (prefix bytes) come in per length via -D; the low
-    // block (G wheels, their radices and offsets) is baked straight-line.
     fputs("__kernel void crackG(ulong lo_base, ulong lo_N, __global const uchar *pfx,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
           "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
-          "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n"
-          "    uchar buf[T];\n"
-          "    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n"
-          "    ulong f = j;\n", ms);
+          "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
+    if (lowvar) fprintf(ms, "    uchar buf[%d];\n", maxw + 1);
+    else        fputs("    uchar buf[T];\n", ms);
+    fputs("    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j;\n", ms);
     for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
-    for (int g = 0; g < G; g++) {
-        if (lw[g].L == 1) fprintf(ms, "    buf[PLEN + %d] = A%d[d%d];\n", lwoff[g], g, g);
-        else for (int t = 0; t < lw[g].L; t++)
-            fprintf(ms, "    buf[PLEN + %d] = A%d[d%d*%d + %d];\n", lwoff[g] + t, g, g, lw[g].L, t);
+    if (lowvar) {
+        // compacting lay: advance p by each alternative's real length
+        fputs("    int p = PLEN;\n", ms);
+        for (int g = 0; g < G; g++) {
+            if (lw[g].L == 1) fprintf(ms, "    buf[p++] = A%d[d%d];\n", g, g);
+            else if (lw[g].L > 1) for (int t = 0; t < lw[g].L; t++)
+                fprintf(ms, "    buf[p++] = A%d[d%d*%d + %d];\n", g, g, lw[g].L, t);
+            else fprintf(ms, "    { int o = A%do[d%d], l = A%dl[d%d]; for (int t = 0; t < l; t++) buf[p++] = A%d[o + t]; }\n",
+                         g, g, g, g, g);
+        }
+        fprintf(ms,
+            "    uchar dg[16]; cl_md5(buf, p, dg);\n"
+            "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
+            "        if (s < %d) { hlen[s] = p; for (int t = 0; t < p; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "}\n", 1 << 20, maxw);
+    } else {
+        for (int g = 0; g < G; g++) {
+            if (lw[g].L == 1) fprintf(ms, "    buf[PLEN + %d] = A%d[d%d];\n", lwoff[g], g, g);
+            else for (int t = 0; t < lw[g].L; t++)
+                fprintf(ms, "    buf[PLEN + %d] = A%d[d%d*%d + %d];\n", lwoff[g] + t, g, g, lw[g].L, t);
+        }
+        fprintf(ms,
+            "    uchar dg[16]; cl_md5(buf, T, dg);\n"
+            "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
+            "        if (s < %d) { hlen[s] = T; for (int t = 0; t < T; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "}\n", 1 << 20, maxw);
     }
-    fprintf(ms,
-        "    uchar dg[16]; cl_md5(buf, T, dg);\n"
-        "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
-        "        if (s < %d) { hlen[s] = T; for (int t = 0; t < T; t++) hbuf[s*%d + t] = buf[t]; } }\n"
-        "}\n", 1 << 20, maxw);
     fclose(ms);
 
     fputs("/* generated by rxejit -G (generic) from: ", o);
@@ -1365,8 +1397,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     // NALL = the grand total, when it fits 64 bits, so -p can show percent/ETA.
     // The consumer streams prefixes and cannot sum it, so rxejit bakes it in.
     fprintf(o, "#define NALL %sULL\n", nmemb ? nmemb : "0");
-    fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define LOWWIDTH %d\n#define LON %lluULL\n\n",
+    fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define LOWWIDTH %d\n#define LON %lluULL\n",
             maxw, lowwidth, lon);
+    fprintf(o, "#define KEY %s\n\n", lowvar ? "plen" : "(plen + LOWWIDTH)");
 
     fputs("static int cmp16(const void *a, const void *b) { return memcmp(a, b, 16); }\n"
           "static unsigned char *load_targets(const char *path, unsigned *ntgt)\n{\n"
@@ -1385,17 +1418,21 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     fputs("#define CK(call) do { cl_int e_ = (call); if (e_ != CL_SUCCESS) {\\\n"
           "    fprintf(stderr, \"rxejit -G: %s failed (%d)\\n\", #call, e_); return 2; } } while (0)\n\n", o);
 
-    fputs("static cl_context ctx; static cl_device_id dev;\n"
-          "static cl_kernel kern[MAXW + 1];   /* one per total member length, built on demand */\n"
-          "static cl_kernel kernel_for(int T) {\n"
-          "    if (kern[T]) return kern[T];\n"
-          "    cl_int e; char opts[96]; snprintf(opts, sizeof opts, \"-D T=%d -D PLEN=%d\", T, T - LOWWIDTH);\n"
-          "    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
+    // A kernel per key, built on demand. When the low block is fixed the key is
+    // the total member length T (its width and MD5 length baked); when it is
+    // variable the length is per-lane, so the key is just the prefix length.
+    fprintf(o, "static cl_context ctx; static cl_device_id dev;\n"
+               "static cl_kernel kern[MAXW + 1];\n"
+               "static cl_kernel kernel_for(int key) {\n"
+               "    if (kern[key]) return kern[key];\n"
+               "    cl_int e; char opts[96]; snprintf(opts, sizeof opts, %s);\n",
+            lowvar ? "\"-D PLEN=%d\", key" : "\"-D T=%d -D PLEN=%d\", key, key - LOWWIDTH");
+    fputs("    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
           "    if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
           "        size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
           "        char *log = malloc(ls + 1); clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, ls, log, NULL); log[ls] = 0;\n"
-          "        fprintf(stderr, \"rxejit -G: build (T=%d) failed:\\n%s\\n\", T, log); exit(2); }\n"
-          "    kern[T] = clCreateKernel(pr, \"crackG\", &e);\n    return kern[T];\n}\n\n", o);
+          "        fprintf(stderr, \"rxejit -G: build failed:\\n%s\\n\", log); exit(2); }\n"
+          "    kern[key] = clCreateKernel(pr, \"crackG\", &e);\n    return kern[key];\n}\n\n", o);
 
     fputs("int main(int argc, char **argv)\n{\n"
           "    if (argc < 3) { fprintf(stderr, \"usage: %s TARGETFILE PREFIXFILE\\n\", argv[0]); return 2; }\n"
@@ -1427,8 +1464,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    while (fread(rec, 1, 1, pf) == 1 && (plen = rec[0]) >= 0) {\n"
           "        if (plen > MAXW) { fprintf(stderr, \"rxejit -G: bad prefix\\n\"); return 2; }\n"
           "        if (plen && fread(rec, 1, plen, pf) != (size_t)plen) break;\n"
-          "        int T = plen + LOWWIDTH;\n"
-          "        cl_kernel k = kernel_for(T);\n"
+          "        cl_kernel k = kernel_for(KEY);\n"
           "        if (plen) CK(clEnqueueWriteBuffer(q, mpfx, CL_TRUE, 0, plen, rec, 0, NULL, NULL));\n"
           "        CK(clSetKernelArg(k, 1, sizeof loN, &loN));\n"
           "        CK(clSetKernelArg(k, 2, sizeof mpfx, &mpfx));\n"
@@ -1548,8 +1584,15 @@ done:
 // least significant, independent factor), so seeking to every P_low-th member
 // and stripping the low bytes yields each distinct prefix. Written to a file the
 // GPU consumer reads: one record of a length byte then that many prefix bytes.
-static int write_prefix_file(struct rxe *rxe, const struct build *B, int G, const char *path)
+static int write_prefix_file(struct rxe *rxe, const struct build *B, int G, int lowvar, const char *path)
 {
+    FILE *fp;
+    if (lowvar) {                                 // the whole pattern is the block:
+        if (!(fp = fopen(path, "wb"))) return -1;  // one empty prefix, GPU does it all
+        unsigned char z = 0; int ok = fwrite(&z, 1, 1, fp) == 1;
+        fclose(fp);
+        return ok ? 0 : -1;
+    }
     int nw = B->nw, lowwidth = 0;
     mpz_t Pl; mpz_init_set_ui(Pl, 1);
     for (int g = nw - G; g < nw; g++) { mpz_mul_ui(Pl, Pl, (unsigned long)B->w[g].n); lowwidth += B->w[g].L; }
@@ -1578,7 +1621,7 @@ static int write_prefix_file(struct rxe *rxe, const struct build *B, int G, cons
 // Generate the generic consumer, compile it (-lOpenCL), have rxejit write the
 // prefix file, then run the consumer over (targets, prefixes).
 static int compile_and_run_generic(const char *pattern, const struct build *B,
-                                   struct rxe *rxe, int G, const char *nmemb, const char *matchfile, int psec)
+                                   struct rxe *rxe, int G, int lowvar, const char *nmemb, const char *matchfile, int psec)
 {
     char dir[] = "/tmp/rxejit.XXXXXX";
     if (!mkdtemp(dir)) { perror("rxejit: mkdtemp"); return 2; }
@@ -1590,7 +1633,7 @@ static int compile_and_run_generic(const char *pattern, const struct build *B,
     int ret = 0;
     FILE *f = fopen(src, "w");
     if (!f) { perror("rxejit: fopen"); ret = 2; goto done; }
-    emit_gpu_generic(f, pattern, B, G, nmemb, psec);
+    emit_gpu_generic(f, pattern, B, G, lowvar, nmemb, psec);
     fclose(f);
 
     const char *cc = getenv("CC");
@@ -1598,7 +1641,7 @@ static int compile_and_run_generic(const char *pattern, const struct build *B,
     char *cargv[] = { (char *)cc, "-O2", src, "-o", exe, "-lOpenCL", NULL };
     if (spawn(cargv) != 0) { fprintf(stderr, "rxejit: the C compiler (%s) failed\n", cc); ret = 2; goto done; }
 
-    if (write_prefix_file(rxe, B, G, pfx)) { fprintf(stderr, "rxejit: could not enumerate the prefixes\n"); ret = 2; goto done; }
+    if (write_prefix_file(rxe, B, G, lowvar, pfx)) { fprintf(stderr, "rxejit: could not enumerate the prefixes\n"); ret = 2; goto done; }
 
     char *rargv[] = { exe, (char *)matchfile, pfx, NULL };
     int r = spawn(rargv);
@@ -1703,8 +1746,9 @@ int main(int argc, char **argv)
 "    -p sec   every 'sec' seconds print progress to stderr -- percent done,\n"
 "             rate, elapsed and ETA (the threaded -n and -m runs, and -G, which\n"
 "             also reports GPU occupancy: the fraction of time the device is busy).\n"
-"    -G       run on the GPU via OpenCL: one lane per candidate. Needs a\n"
-"             fixed-width mask with -m file -H md5 (keycracking).\n"
+"    -G       run on the GPU via OpenCL: one lane per candidate. Masks, uneven\n"
+"             alternations, dictionaries, and head-side backrefs, with -m file\n"
+"             -H md5 (keycracking).\n"
 "    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
@@ -1781,7 +1825,7 @@ int main(int argc, char **argv)
         // is declined here, so the CPU stays the answer for those.
         const char *gpu_no = NULL;
         int gpu_kind = 0;                       // 1 fixed mask, 2 loop repeat, 3 generic
-        int gpu_G = 0;
+        int gpu_G = 0, gpu_lowvar = 0;
         if (gpu && b.lr_active) {
             // A loop repeat runs on the GPU split by length -- but only a bare,
             // single-wheel body for now ([a-z]{1,8}); surrounding or multi-wheel
@@ -1818,7 +1862,12 @@ int main(int argc, char **argv)
                     lowwidth += lwh->L; Plow *= (unsigned long long)lwh->n; gpu_G++; expect--;
                 }
                 if (gpu_G >= 1 && gpu_G < nw && Plow >= (1u << 20)) gpu_kind = 3;
-                else gpu_no = "no fixed-class tail large enough for the GPU";
+                else if (!b.has_backref && nmemb && mpz_cmp_ui(N, 1u << 20) >= 0) {
+                    // No fixed tail worth splitting -- a variable dictionary or
+                    // uneven alternation. Lay the whole pattern compactly on the
+                    // GPU instead (each alternative's real bytes, running length).
+                    gpu_G = nw; gpu_lowvar = 1; gpu_kind = 3;
+                } else gpu_no = "no fixed-class tail or dictionary large enough for the GPU";
             }
         }
 
@@ -1826,10 +1875,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "%s: the GPU path needs a fixed mask, a bare X{a,b}, or a "
                     "fixed-class tail -- this has %s.\n", prog, gpu_no);
             ret = 1;
-        } else if (emit_only && gpu_kind == 3) { emit_gpu_generic(stdout, pattern, &b, gpu_G, nmemb, psec); ret = 0; }
+        } else if (emit_only && gpu_kind == 3) { emit_gpu_generic(stdout, pattern, &b, gpu_G, gpu_lowvar, nmemb, psec); ret = 0; }
         else if (emit_only && gpu_kind == 2) { emit_gpu_hybrid(stdout, pattern, &b, psec); ret = 0; }
         else if (emit_only) { emit(stdout, pattern, &b, sink, nmemb, verbose, hash, psec); ret = 0; }
-        else if (gpu_kind == 3) ret = compile_and_run_generic(pattern, &b, rxe, gpu_G, nmemb, matchfile, psec);
+        else if (gpu_kind == 3) ret = compile_and_run_generic(pattern, &b, rxe, gpu_G, gpu_lowvar, nmemb, matchfile, psec);
         else if (gpu)       ret = compile_and_run(pattern, &b, sink, nmemb, NULL, matchfile, verbose, hash, psec, gpu_kind);
         else                ret = compile_and_run(pattern, &b, sink, nmemb, jobs, matchfile, verbose, hash, psec, 0);
         mpz_clear(N);

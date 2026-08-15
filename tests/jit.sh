@@ -358,7 +358,18 @@ if gpu_avail; then
         if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
             printf 'FAIL  -G (generic) %s\n        GPU hit set differs from CPU\n' "$p"; fail=$((fail + 1)); fi
     done
-    # A backref that straddles into the GPU tail, or a tail too small to be worth
+    # A variable-width dictionary has no fixed tail, so it takes the compacting
+    # path: the whole pattern on the GPU, each word's real bytes laid and the
+    # running length hashed. The hit set must still be the CPU's. (130 words of
+    # length 3-5, so {3} clears the ~1M batch floor.)
+    awk 'BEGIN { for (i = 0; i < 130; i++) { n = 3 + i % 3; s = "";
+                 for (j = 0; j < n; j++) s = s sprintf("%c", 97 + (i * 7 + j) % 26); print s } }' > "$tmp/vd.dict"
+    "$RXEJIT" -G -D "$tmp" -m "$tmp/md5t" -H md5 '[:vd:]{3}' 2>/dev/null | sort > "$tmp/gpu"
+    "$RXEJIT"    -D "$tmp" -m "$tmp/md5t" -H md5 '[:vd:]{3}' 2>/dev/null | sort > "$tmp/cpu"
+    if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
+        printf 'FAIL  -G (compacting) [:vd:]{3}\n        GPU hit set differs from CPU\n'; fail=$((fail + 1)); fi
+
+    # A backref that straddles into the GPU tail, or a set too small to be worth
     # the GPU, must decline (and stay on the CPU) rather than miscompile.
     for p in '([a-z]{3})[0-9]{7}\1' '(cat|hi)[a-z]{2}'; do
         if "$RXEJIT" -G -m "$tmp/md5t" -H md5 "$p" >/dev/null 2>&1
