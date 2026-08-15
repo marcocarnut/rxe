@@ -918,8 +918,9 @@ int main(int argc, char **argv)
                 fprintf(stderr,
 "usage: %s [-S] [-n | -m file [-H md5] | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
-"  Handles masks, alternations, and bounded repeats -- any finite pattern short\n"
-"  of a dictionary or backreference, which are declined with a reason.\n"
+"  Handles any finite pattern -- masks, alternations, bounded repeats,\n"
+"  dictionaries, backreferences. Only an unbounded (infinite) repeat, or a set\n"
+"  too large to unroll, is declined, with a reason.\n"
 "    -S       print the generated C to stdout instead of compiling and running it.\n"
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
