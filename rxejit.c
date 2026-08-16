@@ -128,6 +128,7 @@ struct build {
     // is a factorial-base number whose length (the size s) varies with the
     // index. A single size {{k!}} is lo==hi==k. The pool is one baked wheel.
     int           perm_active, perm_at, perm_lo, perm_hi;
+    int           perm_chop;      // {{...?}}: bytes to quell from the last item
     struct wheel  perm_pool;
 };
 
@@ -333,10 +334,12 @@ static int add_perm(struct build *b, struct rxe_node *nd)
     int lo = nd->rep_min, hi = nd->rep_max;
     if (lo < 0 || hi < lo) { reason = "a permutation with an empty size range"; return -1; }
 
-    int w0 = b->nw, op0 = b->nops, g0 = b->ngroup;
-    if (add_rxe(b, nd->rxe)) return -1;              // bake the pool as wheel(s)
-    if (b->ngroup != g0) { reason = "a group inside a permutation"; return -1; }
-    if (b->nw - w0 != 1) { reason = "a permutation over structured members"; return -1; }
+    // The pool is the whole base enumerated as one wheel -- its members are the
+    // items, whether the base is an alternation (cat|dog), a class [a-z], or a
+    // sequence with a separator ([:dict:] ). bake_alt does exactly this, and
+    // (unlike add_rxe) does not decompose a sequence into a wheel per node.
+    int w0 = b->nw, op0 = b->nops;
+    if (bake_alt(b, nd->rxe)) return -1;
 
     struct wheel pool = b->w[w0];
     int n = pool.n;
@@ -360,6 +363,7 @@ static int add_perm(struct build *b, struct rxe_node *nd)
     b->perm_pool   = pool;
     b->perm_lo     = lo;
     b->perm_hi     = hi;
+    b->perm_chop   = nd->comb_chop;   // {{...?}}: quell the last item's separator
     b->perm_at     = w0;             // pre = w[0..w0); post wheels get appended here
     b->perm_active = 1;
     b->nw          = w0;             // drop the pool wheel from the main stream,
@@ -822,6 +826,9 @@ static void emit_perm_body(FILE *o, const struct build *B,
         fputs("            { int o = PO[idx[pp]], l = PL[idx[pp]];"
               " memcpy(buf + p, PB + o, l); p += l; }\n", o);
     fputs("        }\n", o);
+    // {{...?}}: quell the last laid item's trailing separator -- back p up over
+    // it before the post wheels (so a post odometer follows the chopped item).
+    if (B->perm_chop) fprintf(o, "        if (s) p -= %d;\n", B->perm_chop);
     for (int i = 0; i < Q; i++) {
         char dv[16]; snprintf(dv, sizeof dv, "q%d", i);
         emit_compact_lay(o, P + i, &post[i], dv);
@@ -1641,6 +1648,8 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     else
         fputs("        { int o = PO[it], l = PL[it]; for (int t = 0; t < l; t++) buf[p++] = PB[o + t]; }\n", ms);
     fputs("    }\n", ms);
+    // {{...?}}: quell the last item's trailing separator before the post wheels.
+    if (B->perm_chop) fprintf(ms, "    if (s) p -= %d;\n", B->perm_chop);
     // lay post wheels
     for (int i = P; i < nw; i++) {
         char dv[16], to[24], tl[24], tb[16];

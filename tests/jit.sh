@@ -299,6 +299,12 @@ same '(ab|c|def){{1,3!}}'     # a range over an uneven-width pool
 same 'x(a|b|c){{1,2!}}z'      # pre/post around a range
 same '(a|b|c){{1,3!}}[0-9]'   # a post odometer under a range
 same '[a-z]{{1,2!}}'          # a class pool: P(26,1) + P(26,2) = 676
+# A trailing '?' quells the last item's separator (a rendering change; the count
+# is untouched). The pool is a sequence -- word then separator -- baked whole.
+same '([a-c] ){{2!?}}'        # the diceware-with-separator shape
+same '([a-c] ){{1,3!?}}'      # a range: the size-1 item comes out bare
+same '([a-c](  )){{2!?}}'     # a 2-wide grouped separator
+same 'x([a-c] ){{2!?}}[0-9]'  # pre/post around a chopped choice
 
 # The threaded count of a permutation (single size and range) is exact and
 # thread-invariant, and the seed decode (from > 0, across size blocks) lands
@@ -518,6 +524,8 @@ EOF
     gperm md5 md5sum '(ab|c|def){{1,2!}}'        # uneven-width pool, a size range
     gperm md5 md5sum 'x(a|b|c){{2!}}[0-9]'       # pre and post around the choice
     gperm md5 md5sum '[a-z]{{2!}}'               # a class pool, P(26,2) = 650
+    gperm md5 md5sum '([a-c] ){{2!?}}'           # '?' chop: quelled trailing space
+    gperm md5 md5sum 'x([a-c](  )){{1,3!?}}[0-9]' # chop + grouped sep + pre/post/range
     [ "$have_sha1" = 1 ]   && gperm sha1   sha1sum   '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_sha256" = 1 ] && gperm sha256 sha256sum '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_ntlm" = 1 ]   && gperm ntlm   ntlm      '(cat|dog|fox|bat){{2,3!}}'
