@@ -541,9 +541,23 @@ EOF
     [ "$have_sha1" = 1 ]   && gperm sha1   sha1sum   '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_sha256" = 1 ] && gperm sha256 sha256sum '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_ntlm" = 1 ]   && gperm ntlm   ntlm      '(cat|dog|fox|bat){{2,3!}}'
-    # A permutation candidate wider than one hash block declines (ntlm doubles
-    # the width: 4 words of 7 = 28, *2 = 56 >= 56), and too large a pool declines
-    # rather than blow the per-lane rem[].
+    # A large pool (a dictionary of 300 short words -- past the old 256 cap) now
+    # runs on the GPU: the pool lives in a __global buffer, and the O(k) unrank
+    # puts nothing pool-wide in private memory. Its space-joined, chopped 2- and
+    # 3-permutations must still match the CPU keycrack.
+    awk 'BEGIN { for (i=0;i<300;i++){ s=""; n=3+i%3;
+                 for(j=0;j<n;j++) s=s sprintf("%c",97+(i*7+j)%26); print s } }' > "$tmp/big.dict"
+    bw() { sed -n "$1p" "$tmp/big.dict"; }
+    { printf '%s %s' "$(bw 1)" "$(bw 200)"; printf '\n'; printf '%s %s %s' "$(bw 300)" "$(bw 50)" "$(bw 150)"; } |
+        while IFS= read -r ph; do printf '%s' "$ph" | md5sum | cut -d' ' -f1; done > "$tmp/bigt"
+    for p in '([:big:] ){{2!?}}' '([:big:] ){{3!?}}' '([:big:] ){{2?}}'; do
+        "$RXEJIT" -G -D "$tmp" -m "$tmp/bigt" -H md5 "$p" 2>/dev/null | sort > "$tmp/bg"
+        "$RXEJIT"    -D "$tmp" -m "$tmp/bigt" -H md5 "$p" 2>/dev/null | sort > "$tmp/bc"
+        if cmp -s "$tmp/bg" "$tmp/bc"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G large-pool %s\n        GPU hit set differs from CPU\n' "$p"; fail=$((fail + 1)); fi
+    done
+    # A permutation candidate wider than one hash block declines (ntlm doubles the
+    # width: 4 words of 7 = 28, *2 = 56 >= 56) rather than emit a wrong kernel.
     if "$RXEJIT" -G -m /dev/null -H ntlm '(battery|horse|staple|correct){{1,4!}}' >/dev/null 2>&1
     then printf 'FAIL  -G ntlm perm should decline (too wide)\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 

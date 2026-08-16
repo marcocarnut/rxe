@@ -1640,43 +1640,24 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fprintf(ms, "#define MAXW %d\n#define MAXHITS %d\n#define NPERM %lluULL\n"
                 "#define NP %d\n#define LO %d\n", maxw, 1 << 20, NPERM, n, lo);
     for (int i = 0; i < nw; i++) emit_cl_wheel_tables(ms, &B->w[i], i);
-    // The pool tables (PB, and PO/PL when its members are uneven).
-    {
-        int bytes = pool->L ? pool->n * pool->L : pool->aoff[n - 1] + pool->alen[n - 1];
-        fputs("__constant uchar PB[] = {", ms);
-        if (bytes == 0) fputs("0", ms);
-        for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)pool->base[j]);
-        fputs("};\n", ms);
-        if (pool->L == 0) {
-            fputs("__constant int PO[] = {", ms);
-            for (int j = 0; j < n; j++) fprintf(ms, "%s%d", j ? "," : "", pool->aoff[j]);
-            fputs("};\n", ms);
-            fputs("__constant int PL[] = {", ms);
-            for (int j = 0; j < n; j++) fprintf(ms, "%s%d", j ? "," : "", pool->alen[j]);
-            fputs("};\n", ms);
-        }
-    }
     fputs("__constant ulong PSZ[] = {", ms);
     for (int s = 0; s <= hi; s++) fprintf(ms, "%s%lluUL", s ? "," : "", PSZ[s]);
     fputs("};\n", ms);
-    // For an unordered choice, a Pascal table BINOM[c*(HI+1)+k] = C(c,k) drives
-    // the combinatorial-number-system unrank (the kernel has no 128-bit math).
-    // Values past 64 bits saturate: they are only ever compared against a
-    // remainder that fits, so "too big" reads correctly as "greater".
-    if (!ord) {
-        fprintf(ms, "#define HI1 %d\n__constant ulong BINOM[] = {", hi + 1);
-        for (int c = 0; c <= n; c++)
-            for (int k = 0; k <= hi; k++) {
-                unsigned long long v;
-                if (choose_block(c, k, 0, &v)) v = ~0ULL;   // > 2^64 -> saturate
-                fprintf(ms, "%s%lluUL", (c || k) ? "," : "", v);
-            }
-        fputs("};\n", ms);
-    }
+    // The pool tables (PB, and PO/PL when uneven) and, for a combination, the
+    // Pascal table BINOM[c*HI1+k] = C(c,k), come in as __global kernel arguments,
+    // not __constant arrays -- a large dictionary pool overflows __constant, and
+    // these are touched only when laying a candidate, not in the hash inner loop.
+    // (BINOM saturates past 64 bits; it is only compared against a remainder that
+    // fits, so "too big" reads correctly as "greater".)
+    if (!ord) fprintf(ms, "#define HI1 %d\n", hi + 1);
 
     fputs("__kernel void crackP(ulong base, ulong NALL,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
-          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
+          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits,\n"
+          "                     __global const uchar *PB", ms);
+    if (pool->L == 0) fputs(", __global const int *PO, __global const int *PL", ms);
+    if (!ord)         fputs(", __global const ulong *BINOM", ms);
+    fputs(")\n{\n"
           "    ulong j = base + (ulong)get_global_id(0);\n    if (j >= NALL) return;\n"
           "    uchar buf[MAXW];\n    ulong f = j;\n", ms);
     // decode digits: post (nw-1..P) least significant, then r, then pre (P-1..0)
@@ -1764,6 +1745,35 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fprintf(o, "#define MAXW %d\n#define MAXHITS (1<<20)\n#define NALL %sULL\n#define DG %d\n#define HASHFN %s\n\n",
             maxw, nmemb ? nmemb : "0", HA->dglen, HA->cpu_fn);
 
+    // The pool tables, uploaded to the device as __global buffers so a large
+    // dictionary is not bounded by __constant capacity.
+    {
+        int bytes = pool->L ? pool->n * pool->L : pool->aoff[n - 1] + pool->alen[n - 1];
+        fputs("static const unsigned char PBh[] = {", o);
+        if (bytes == 0) fputs("0", o);
+        for (int j = 0; j < bytes; j++) fprintf(o, "%s%d", j ? "," : "", (unsigned char)pool->base[j]);
+        fputs("};\n", o);
+        if (pool->L == 0) {
+            fputs("static const int POh[] = {", o);
+            for (int j = 0; j < n; j++) fprintf(o, "%s%d", j ? "," : "", pool->aoff[j]);
+            fputs("};\n", o);
+            fputs("static const int PLh[] = {", o);
+            for (int j = 0; j < n; j++) fprintf(o, "%s%d", j ? "," : "", pool->alen[j]);
+            fputs("};\n", o);
+        }
+    }
+    if (!ord) {
+        fputs("static const unsigned long long BINOMh[] = {", o);
+        for (int c = 0; c <= n; c++)
+            for (int k = 0; k <= hi; k++) {
+                unsigned long long v;
+                if (choose_block(c, k, 0, &v)) v = ~0ULL;   // > 2^64 -> saturate
+                fprintf(o, "%s%lluULL", (c || k) ? "," : "", v);
+            }
+        fputs("};\n", o);
+    }
+    fputc('\n', o);
+
     fputs("static int cmpdg(const void *a, const void *b) { return memcmp(a, b, DG); }\n"
           "static unsigned char *load_targets(const char *path, unsigned *ntgt)\n{\n"
           "    FILE *fp = fopen(path, \"r\");\n    if (!fp) return NULL;\n"
@@ -1827,14 +1837,31 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
           "    cl_mem mhl = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * sizeof(cl_uint), NULL, &e); CK(e);\n"
           "    cl_mem mhb = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * MAXW, NULL, &e); CK(e);\n"
           "    cl_mem mn = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof nhits, &nhits, &e); CK(e);\n"
+          "    cl_mem mpb = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof PBh, (void *)PBh, &e); CK(e);\n"
           "    cl_ulong NA = NALL;\n"
           "    CK(clSetKernelArg(k, 1, sizeof NA, &NA));\n"
           "    CK(clSetKernelArg(k, 2, sizeof mt, &mt));\n"
           "    CK(clSetKernelArg(k, 3, sizeof ntgt, &ntgt));\n"
           "    CK(clSetKernelArg(k, 4, sizeof mhl, &mhl));\n"
           "    CK(clSetKernelArg(k, 5, sizeof mhb, &mhb));\n"
-          "    CK(clSetKernelArg(k, 6, sizeof mn, &mn));\n\n"
-          "    cl_ulong TILE = 1ULL << 24;\n"
+          "    CK(clSetKernelArg(k, 6, sizeof mn, &mn));\n"
+          "    CK(clSetKernelArg(k, 7, sizeof mpb, &mpb));\n", o);
+    {
+        int ai = 8;
+        if (pool->L == 0) {
+            fprintf(o,
+                "    cl_mem mpo = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof POh, (void *)POh, &e); CK(e);\n"
+                "    cl_mem mpl = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof PLh, (void *)PLh, &e); CK(e);\n"
+                "    CK(clSetKernelArg(k, %d, sizeof mpo, &mpo));\n"
+                "    CK(clSetKernelArg(k, %d, sizeof mpl, &mpl));\n", ai, ai + 1);
+            ai += 2;
+        }
+        if (!ord)
+            fprintf(o,
+                "    cl_mem mbn = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof BINOMh, (void *)BINOMh, &e); CK(e);\n"
+                "    CK(clSetKernelArg(k, %d, sizeof mbn, &mbn));\n", ai);
+    }
+    fputs("    cl_ulong TILE = 1ULL << 24;\n"
           "#if PSEC\n"
           "    double t0 = rt_now(), tlast = t0; unsigned long long done = 0, gpu_ns = 0;\n"
           "#endif\n"
@@ -2461,10 +2488,10 @@ int main(int argc, char **argv)
         int gpu_G = 0, gpu_lowvar = 0;
         if (gpu && b.perm_active) {
             // A choice runs whole on the GPU: each lane unranks its index. The
-            // widest candidate must fit one hash block; the pool's __constant
-            // tables (bytes + offsets) and an unordered choice's Pascal table
-            // must not be huge -- otherwise it stays on the CPU. (The unrank
-            // itself is O(k), so it puts nothing pool-wide in private memory.)
+            // widest candidate must fit one hash block. The pool itself is a
+            // __global buffer, so a big dictionary is fine; only an unordered
+            // choice's Pascal table (baked into the program source) is capped.
+            // The unrank is O(k), so nothing pool-wide sits in private memory.
             int poolmax = b.perm_pool.L;
             if (!b.perm_pool.L)
                 for (int j = 0; j < b.perm_pool.n; j++)
@@ -2475,9 +2502,8 @@ int main(int argc, char **argv)
                 if (wm == 0) for (int j = 0; j < b.w[i].n; j++) if (b.w[i].alen[j] > wm) wm = b.w[i].alen[j];
                 maxw += wm;
             }
-            if (b.perm_pool.n > 256) gpu_no = "a choice pool too large for the GPU";
-            else if (maxw * HA->mfac >= 56) gpu_no = "a candidate too wide for one hash block";
-            else if (!b.perm_ordered && (b.perm_pool.n + 1) * (b.perm_hi + 1) > 16384)
+            if (maxw * HA->mfac >= 56) gpu_no = "a candidate too wide for one hash block";
+            else if (!b.perm_ordered && (b.perm_pool.n + 1) * (b.perm_hi + 1) > (1 << 20))
                 gpu_no = "an unordered choice whose binomial table is too large for the GPU";
             else if (!nmemb) gpu_no = "more members than fit 64 bits";
             else gpu_kind = 4;
