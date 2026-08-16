@@ -1209,7 +1209,8 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
           "    cl_kernel kern[BMAX + 1] = {0};\n"
           "    for (int k = AMIN; k <= BMAX; k++) {\n"
           "        int gw = k < GT ? k : GT, plen = (k - gw) * L, t = k * L;\n"
-          "        char opts[96]; snprintf(opts, sizeof opts, \"-D T=%d -D PLEN=%d -D GW=%d\", t, plen, gw);\n"
+          "        const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
+          "        char opts[96]; snprintf(opts, sizeof opts, \"-D T=%d -D PLEN=%d -D GW=%d%s\", t, plen, gw, uo);\n"
           "        cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e); CK(e);\n"
           "        if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
           "            size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
@@ -1449,8 +1450,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
                "static cl_kernel kern[MAXW + 1];\n"
                "static cl_kernel kernel_for(int key) {\n"
                "    if (kern[key]) return kern[key];\n"
+               "    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
                "    cl_int e; char opts[96]; snprintf(opts, sizeof opts, %s);\n",
-            lowvar ? "\"-D PLEN=%d\", key" : "\"-D T=%d -D PLEN=%d\", key, key - LOWWIDTH");
+            lowvar ? "\"-D PLEN=%d%s\", key, uo" : "\"-D T=%d -D PLEN=%d%s\", key, key - LOWWIDTH, uo");
     fputs("    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
           "    if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
           "        size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"

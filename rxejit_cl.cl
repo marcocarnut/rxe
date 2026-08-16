@@ -18,6 +18,20 @@
 
 #define CL_ROTL(x, c) (((x) << (c)) | ((x) >> (32 - (c))))
 
+/* Unrolling the 64 rounds turns g / CLK[i] / CLS[i] into constants and folds a
+ * fixed-length candidate's constant message words into the round adds -- a win
+ * on Intel NEO. On a register-starved GPU the code bloat can cost more than it
+ * saves, so it is a knob: rxejit passes -D RXEJIT_UNROLL=0 when RXEJIT_NO_UNROLL
+ * is set in the environment, to A/B it per device. */
+#ifndef RXEJIT_UNROLL
+#define RXEJIT_UNROLL 1
+#endif
+#if RXEJIT_UNROLL
+#define MD5_UNROLL _Pragma("unroll")
+#else
+#define MD5_UNROLL
+#endif
+
 __constant uint  CLK[64] = {
     0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
     0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
@@ -39,7 +53,7 @@ __constant uchar CLS[64] = {
 static void cl_md5_block(uint abcd[4], const uint M[16])
 {
     uint A = abcd[0], B = abcd[1], C = abcd[2], D = abcd[3];
-#pragma unroll
+    MD5_UNROLL
     for (int i = 0; i < 64; i++) {
         uint F; int g;
         if      (i < 16) { F = (B & C) | (~B & D);  g = i;              }
