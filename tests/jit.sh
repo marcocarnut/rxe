@@ -195,6 +195,12 @@ if command -v sha1sum >/dev/null 2>&1; then
 else
     printf 'keycrack: sha1 skipped, sha1sum not found\n'
 fi
+if command -v sha256sum >/dev/null 2>&1; then
+    keycrack sha256 sha256sum '[0-9]{4}' 1234 0042 9999
+    keycrack sha256 sha256sum '[a-z]{3}' cat dog  # 32-byte digest
+else
+    printf 'keycrack: sha256 skipped, sha256sum not found\n'
+fi
 
 # NTLM = MD4(UTF-16LE): no standard CLI oracle here, so check against a
 # published Windows hash. NTLM("123456") = 32ed87bdb5fdc5e9cba88547376818d4 is a
@@ -402,6 +408,9 @@ if gpu_avail; then
     have_sha1=0
     if command -v sha1sum >/dev/null 2>&1; then have_sha1=1
         for w in $allw; do printf '%s' "$w" | sha1sum | cut -d' ' -f1; done > "$tmp/sha1t"; fi
+    have_sha256=0
+    if command -v sha256sum >/dev/null 2>&1; then have_sha256=1
+        for w in $allw; do printf '%s' "$w" | sha256sum | cut -d' ' -f1; done > "$tmp/sha256t"; fi
     have_ntlm=0
     cat > "$tmp/ntlmgen.c" <<'EOF'
 #include "rxejit_rt.h"
@@ -419,6 +428,7 @@ EOF
     }
     for p in '[a-z]{3}' '(ab|cd){2}[0-9]' '(cat|hi)[a-z]{5}' '(a|b)\1[0-9]{7}' '[:gw:][a-z]{5}' '[:vd:]{3}'; do
         [ "$have_sha1" = 1 ] && xcheck sha1 "$tmp/sha1t" "$p"
+        [ "$have_sha256" = 1 ] && xcheck sha256 "$tmp/sha256t" "$p"
         [ "$have_ntlm" = 1 ] && xcheck ntlm "$tmp/ntlmt" "$p"
     done
     # ntlm widens to UTF-16LE, so one GPU block holds only < 28 candidate bytes.

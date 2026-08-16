@@ -82,9 +82,10 @@ static const char *reason;         // why a pattern was declined, for the messag
 // 'reason' -- one pattern is compiled per run, so it need not be threaded.
 struct hashalg { const char *name; int dglen; int mfac; const char *cpu_fn, *gpu_fn; };
 static const struct hashalg HASHES[] = {
-    { "md5",  16, 1, "rt_md5",  "cl_md5"  },
-    { "ntlm", 16, 2, "rt_ntlm", "cl_ntlm" },   // MD4(UTF-16LE): message is 2x
-    { "sha1", 20, 1, "rt_sha1", "cl_sha1" },
+    { "md5",    16, 1, "rt_md5",    "cl_md5"    },
+    { "ntlm",   16, 2, "rt_ntlm",   "cl_ntlm"   },  // MD4(UTF-16LE): message is 2x
+    { "sha1",   20, 1, "rt_sha1",   "cl_sha1"   },
+    { "sha256", 32, 1, "rt_sha256", "cl_sha256" },
 };
 static const struct hashalg *HA = &HASHES[0];
 
@@ -1761,14 +1762,14 @@ int main(int argc, char **argv)
                       for (size_t i = 0; i < sizeof HASHES / sizeof *HASHES; i++)
                           if (strcmp(optarg, HASHES[i].name) == 0) { HA = &HASHES[i]; ok = 1; break; }
                       if (!ok) {
-                          fprintf(stderr, "%s: -H: unknown hash '%s' (md5, ntlm, sha1)\n", prog, optarg);
+                          fprintf(stderr, "%s: -H: unknown hash '%s' (md5, ntlm, sha1, sha256)\n", prog, optarg);
                           return 2;
                       }
                       break; }
             case 'h':
             default:
                 fprintf(stderr,
-"usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1] | -d [-v]] [-j jobs] REGEX\n"
+"usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1|sha256] | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
 "  Handles any finite pattern -- masks, alternations, bounded repeats,\n"
 "  dictionaries, backreferences. Only an unbounded (infinite) repeat, or a set\n"
@@ -1777,9 +1778,9 @@ int main(int argc, char **argv)
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
 "             the mask is a keyspace, 'file' the set to sift it against.\n"
-"    -H alg   with -m, 'file' holds hex digests of one hash (md5, ntlm, or\n"
-"             sha1): hash each candidate and print <digest>:<plaintext> for a\n"
-"             hit -- keycracking. ntlm is MD4(UTF-16LE), the Windows hash.\n"
+"    -H alg   with -m, 'file' holds hex digests of one hash (md5, ntlm, sha1,\n"
+"             or sha256): hash each candidate and print <digest>:<plaintext>\n"
+"             for a hit -- keycracking. ntlm is MD4(UTF-16LE), the Windows hash.\n"
 "    -d       report duplicate members: hash each into a per-thread set and\n"
 "             merge at the join. Exit 0 if all distinct, 1 if a duplicate.\n"
 "    -v       with -d, list the repeated members and their counts.\n"
@@ -1790,7 +1791,7 @@ int main(int argc, char **argv)
 "             also reports GPU occupancy: the fraction of time the device is busy).\n"
 "    -G       run on the GPU via OpenCL: one lane per candidate. Masks, uneven\n"
 "             alternations, dictionaries, and head-side backrefs, with -m file\n"
-"             -H md5|ntlm|sha1 (keycracking).\n"
+"             -H md5|ntlm|sha1|sha256 (keycracking).\n"
 "    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
@@ -1801,11 +1802,11 @@ int main(int argc, char **argv)
         return 2;
     }
     if (gpu && !(hash && matchfile)) {
-        fprintf(stderr, "%s: -G is keycracking -- it needs -m file -H md5|ntlm|sha1\n", prog);
+        fprintf(stderr, "%s: -G is keycracking -- it needs -m file -H md5|ntlm|sha1|sha256\n", prog);
         return 2;
     }
     if (optind != argc - 1) {
-        fprintf(stderr, "usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1] | -d [-v]] [-j jobs] REGEX\n", prog);
+        fprintf(stderr, "usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1|sha256] | -d [-v]] [-j jobs] REGEX\n", prog);
         return 2;
     }
     const char *pattern = argv[optind];
