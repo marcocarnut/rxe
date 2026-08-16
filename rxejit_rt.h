@@ -183,6 +183,141 @@ static void rt_md5(const unsigned char *msg, unsigned long len, unsigned char ou
     }
 }
 
+/* ---- MD4 / NTLM, for keycracking ------------------------------------------
+ * NTLM is the Windows password hash: MD4 (RFC 1320) of the password in
+ * UTF-16LE. MD4 shares MD5's little-endian word layout but runs three rounds of
+ * sixteen with its own functions and shifts; the block below is the classic
+ * unrolled form. rt_ntlm widens each candidate byte to a UTF-16LE code unit
+ * (ASCII in, high byte zero) on the fly and feeds it to the same block loop, so
+ * no widened copy of the message is ever materialised.
+ */
+static void rt_md4_block(unsigned int abcd[4], const unsigned char *p)
+{
+    unsigned int M[16];
+    for (int i = 0; i < 16; i++)
+        M[i] =  (unsigned int)p[i*4]
+             | ((unsigned int)p[i*4+1] << 8)
+             | ((unsigned int)p[i*4+2] << 16)
+             | ((unsigned int)p[i*4+3] << 24);
+    unsigned int a = abcd[0], b = abcd[1], c = abcd[2], d = abcd[3];
+#define MD4_F(x,y,z) (((x) & (y)) | (~(x) & (z)))
+#define MD4_G(x,y,z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
+#define MD4_H(x,y,z) ((x) ^ (y) ^ (z))
+#define MD4_FF(a,b,c,d,k,s) (a) = RT_ROTL((a) + MD4_F(b,c,d) + M[k], s)
+#define MD4_GG(a,b,c,d,k,s) (a) = RT_ROTL((a) + MD4_G(b,c,d) + M[k] + 0x5a827999u, s)
+#define MD4_HH(a,b,c,d,k,s) (a) = RT_ROTL((a) + MD4_H(b,c,d) + M[k] + 0x6ed9eba1u, s)
+    MD4_FF(a,b,c,d,0,3);  MD4_FF(d,a,b,c,1,7);  MD4_FF(c,d,a,b,2,11);  MD4_FF(b,c,d,a,3,19);
+    MD4_FF(a,b,c,d,4,3);  MD4_FF(d,a,b,c,5,7);  MD4_FF(c,d,a,b,6,11);  MD4_FF(b,c,d,a,7,19);
+    MD4_FF(a,b,c,d,8,3);  MD4_FF(d,a,b,c,9,7);  MD4_FF(c,d,a,b,10,11); MD4_FF(b,c,d,a,11,19);
+    MD4_FF(a,b,c,d,12,3); MD4_FF(d,a,b,c,13,7); MD4_FF(c,d,a,b,14,11); MD4_FF(b,c,d,a,15,19);
+    MD4_GG(a,b,c,d,0,3);  MD4_GG(d,a,b,c,4,5);  MD4_GG(c,d,a,b,8,9);   MD4_GG(b,c,d,a,12,13);
+    MD4_GG(a,b,c,d,1,3);  MD4_GG(d,a,b,c,5,5);  MD4_GG(c,d,a,b,9,9);   MD4_GG(b,c,d,a,13,13);
+    MD4_GG(a,b,c,d,2,3);  MD4_GG(d,a,b,c,6,5);  MD4_GG(c,d,a,b,10,9);  MD4_GG(b,c,d,a,14,13);
+    MD4_GG(a,b,c,d,3,3);  MD4_GG(d,a,b,c,7,5);  MD4_GG(c,d,a,b,11,9);  MD4_GG(b,c,d,a,15,13);
+    MD4_HH(a,b,c,d,0,3);  MD4_HH(d,a,b,c,8,9);  MD4_HH(c,d,a,b,4,11);  MD4_HH(b,c,d,a,12,15);
+    MD4_HH(a,b,c,d,2,3);  MD4_HH(d,a,b,c,10,9); MD4_HH(c,d,a,b,6,11);  MD4_HH(b,c,d,a,14,15);
+    MD4_HH(a,b,c,d,1,3);  MD4_HH(d,a,b,c,9,9);  MD4_HH(c,d,a,b,5,11);  MD4_HH(b,c,d,a,13,15);
+    MD4_HH(a,b,c,d,3,3);  MD4_HH(d,a,b,c,11,9); MD4_HH(c,d,a,b,7,11);  MD4_HH(b,c,d,a,15,15);
+#undef MD4_F
+#undef MD4_G
+#undef MD4_H
+#undef MD4_FF
+#undef MD4_GG
+#undef MD4_HH
+    abcd[0] += a; abcd[1] += b; abcd[2] += c; abcd[3] += d;
+}
+
+/* out[16] = MD4(UTF-16LE(msg)). The widened stream is elen = 2*len bytes: even
+ * positions carry a candidate byte, odd positions the zero high byte. Full
+ * blocks are generated straight from the source; only the tail is padded. */
+static void rt_ntlm(const unsigned char *msg, unsigned long len, unsigned char out[16])
+{
+    unsigned int abcd[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    unsigned long elen = len * 2;
+    unsigned char blk[64];
+    unsigned long i = 0;                          /* widened bytes consumed */
+    while (i + 64 <= elen) {
+        for (int k = 0; k < 64; k++) {
+            unsigned long e = i + k;
+            blk[k] = (e & 1) ? 0 : msg[e >> 1];
+        }
+        rt_md4_block(abcd, blk);
+        i += 64;
+    }
+    unsigned char tail[128];
+    memset(tail, 0, sizeof tail);
+    unsigned long r = elen - i;
+    for (unsigned long k = 0; k < r; k++) {
+        unsigned long e = i + k;
+        tail[k] = (e & 1) ? 0 : msg[e >> 1];
+    }
+    tail[r] = 0x80;
+    unsigned long padlen = r < 56 ? 64 : 128;
+    unsigned long long bits = (unsigned long long)elen * 8;
+    for (int k = 0; k < 8; k++) tail[padlen - 8 + k] = (unsigned char)((bits >> (8*k)) & 0xff);
+    rt_md4_block(abcd, tail);
+    if (padlen == 128) rt_md4_block(abcd, tail + 64);
+
+    for (int k = 0; k < 4; k++) {
+        out[k*4]   = (unsigned char)(abcd[k]        & 0xff);
+        out[k*4+1] = (unsigned char)((abcd[k] >> 8) & 0xff);
+        out[k*4+2] = (unsigned char)((abcd[k] >> 16)& 0xff);
+        out[k*4+3] = (unsigned char)((abcd[k] >> 24)& 0xff);
+    }
+}
+
+/* ---- SHA-1, for keycracking -----------------------------------------------
+ * RFC 3174, whole-message, no allocation on the hot path. Unlike MD5/MD4 the
+ * words and the digest are big-endian, and it runs eighty rounds of a single
+ * mixing function selected by the round quarter. 20-byte digest. */
+static void rt_sha1_block(unsigned int h[5], const unsigned char *p)
+{
+    unsigned int w[80];
+    for (int i = 0; i < 16; i++)
+        w[i] =  ((unsigned int)p[i*4]   << 24)
+             |  ((unsigned int)p[i*4+1] << 16)
+             |  ((unsigned int)p[i*4+2] << 8)
+             |   (unsigned int)p[i*4+3];
+    for (int i = 16; i < 80; i++)
+        w[i] = RT_ROTL(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    unsigned int a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; i++) {
+        unsigned int f, k;
+        if      (i < 20) { f = (b & c) | (~b & d);            k = 0x5a827999; }
+        else if (i < 40) { f = b ^ c ^ d;                     k = 0x6ed9eba1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d);   k = 0x8f1bbcdc; }
+        else             { f = b ^ c ^ d;                     k = 0xca62c1d6; }
+        unsigned int t = RT_ROTL(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = RT_ROTL(b, 30); b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+}
+
+static void rt_sha1(const unsigned char *msg, unsigned long len, unsigned char out[20])
+{
+    unsigned int h[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+    unsigned long i = 0;
+    for (; i + 64 <= len; i += 64) rt_sha1_block(h, msg + i);
+
+    unsigned char tail[128];
+    memset(tail, 0, sizeof tail);
+    unsigned long r = len - i;
+    memcpy(tail, msg + i, r);
+    tail[r] = 0x80;
+    unsigned long padlen = r < 56 ? 64 : 128;
+    unsigned long long bits = (unsigned long long)len * 8;
+    for (int k = 0; k < 8; k++) tail[padlen - 1 - k] = (unsigned char)((bits >> (8*k)) & 0xff);
+    rt_sha1_block(h, tail);
+    if (padlen == 128) rt_sha1_block(h, tail + 64);
+
+    for (int k = 0; k < 5; k++) {
+        out[k*4]   = (unsigned char)((h[k] >> 24) & 0xff);
+        out[k*4+1] = (unsigned char)((h[k] >> 16) & 0xff);
+        out[k*4+2] = (unsigned char)((h[k] >> 8)  & 0xff);
+        out[k*4+3] = (unsigned char)( h[k]        & 0xff);
+    }
+}
+
 /* Load a file of hex digests, one per line, into the set as raw bytes: each
  * line must be exactly 2*dglen hex characters, decoded in place (the decoded
  * bytes are shorter, so they fit over the front of the line). Malformed lines

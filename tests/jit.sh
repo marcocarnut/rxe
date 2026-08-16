@@ -164,29 +164,45 @@ match '[a-z]{2}'
 match '[0-9]{4}'
 match '(a|ab)'          # variable-length: 'a' misses (len 1 vs targets), 'ab' hits
 
-# keycrack <pattern> <plaintext...> -- -H md5 recovers the plaintexts whose MD5
-# digests are in the file, printed as digest:plaintext. md5sum builds the
-# targets; skipped where it is absent.
+# keycrack <alg> <hexcmd> <pattern> <plaintext...> -- -H <alg> recovers the
+# plaintexts whose digests are in the file, printed as digest:plaintext. hexcmd
+# (md5sum/sha1sum) builds the targets and is the independent oracle; skipped
+# where it is absent.
 keycrack() {
-    pat=$1; shift
+    alg=$1; hexcmd=$2; pat=$3; shift 3
     : > "$tmp/kh"
-    for pt in "$@"; do printf '%s' "$pt" | md5sum | cut -d' ' -f1 >> "$tmp/kh"; done
-    got=$("$RXEJIT" -m "$tmp/kh" -H md5 "$pat" 2>/dev/null | sort)
-    want=$(for pt in "$@"; do printf '%s:%s\n' "$(printf '%s' "$pt" | md5sum | cut -d' ' -f1)" "$pt"; done | sort)
+    for pt in "$@"; do printf '%s' "$pt" | $hexcmd | cut -d' ' -f1 >> "$tmp/kh"; done
+    got=$("$RXEJIT" -m "$tmp/kh" -H "$alg" "$pat" 2>/dev/null | sort)
+    want=$(for pt in "$@"; do printf '%s:%s\n' "$(printf '%s' "$pt" | $hexcmd | cut -d' ' -f1)" "$pt"; done | sort)
     if [ "$got" = "$want" ]; then
         pass=$((pass + 1))
     else
-        printf 'FAIL  keycrack %s\n        got [%s] want [%s]\n' "$pat" "$got" "$want"
+        printf 'FAIL  keycrack -H %s %s\n        got [%s] want [%s]\n' "$alg" "$pat" "$got" "$want"
         fail=$((fail + 1))
     fi
 }
 if command -v md5sum >/dev/null 2>&1; then
-    keycrack '[0-9]{4}' 1234 0042 9999
-    keycrack '[a-z]{3}' cat dog
-    keycrack '(cat|hi)[0-9]' hi7    # variable-length keyspace
+    keycrack md5 md5sum '[0-9]{4}' 1234 0042 9999
+    keycrack md5 md5sum '[a-z]{3}' cat dog
+    keycrack md5 md5sum '(cat|hi)[0-9]' hi7    # variable-length keyspace
 else
     printf 'keycrack: skipped, md5sum not found\n'
 fi
+if command -v sha1sum >/dev/null 2>&1; then
+    keycrack sha1 sha1sum '[0-9]{4}' 1234 0042 9999
+    keycrack sha1 sha1sum '[a-z]{3}' cat dog
+    keycrack sha1 sha1sum '(cat|hi)[0-9]' hi7  # 20-byte digest, variable keyspace
+else
+    printf 'keycrack: sha1 skipped, sha1sum not found\n'
+fi
+
+# NTLM = MD4(UTF-16LE): no standard CLI oracle here, so check against a
+# published Windows hash. NTLM("123456") = 32ed87bdb5fdc5e9cba88547376818d4 is a
+# well-known vector; [0-9]{6} (1M candidates) must recover it and nothing else.
+printf '32ed87bdb5fdc5e9cba88547376818d4\n' > "$tmp/kh"
+got=$("$RXEJIT" -m "$tmp/kh" -H ntlm '[0-9]{6}' 2>/dev/null)
+if [ "$got" = "32ed87bdb5fdc5e9cba88547376818d4:123456" ]; then pass=$((pass + 1)); else
+    printf 'FAIL  keycrack -H ntlm published vector\n        got [%s]\n' "$got"; fail=$((fail + 1)); fi
 
 # The dedup sink: all-distinct masks, and the duplicate-bearing alternations,
 # including ones whose repeats fall in different shards under threading.
@@ -376,6 +392,44 @@ if gpu_avail; then
         then printf 'FAIL  -G should decline %s\n' "$p"; fail=$((fail + 1))
         else pass=$((pass + 1)); fi
     done
+
+    # The same kernel paths under a 20-byte digest (sha1) and MD4/UTF-16LE
+    # (ntlm): a fixed mask, the generic head/tail split (a head backref, a dict),
+    # and the compacting variable-width dict. The CPU keycrack is the oracle on
+    # the device for these too. sha1 targets come from sha1sum; ntlm has no CLI
+    # oracle here, so a tiny generator built from the runtime header emits them.
+    allw="cat dog fox zzz abcd cdcd a to ab ababab cathello hixyzzy cataa11 foo9x8y7 x1234567 yy0000000 quuxwxyz aa1234567 bb0000000"
+    have_sha1=0
+    if command -v sha1sum >/dev/null 2>&1; then have_sha1=1
+        for w in $allw; do printf '%s' "$w" | sha1sum | cut -d' ' -f1; done > "$tmp/sha1t"; fi
+    have_ntlm=0
+    cat > "$tmp/ntlmgen.c" <<'EOF'
+#include "rxejit_rt.h"
+int main(int c, char **v) { unsigned char d[16];
+    for (int i = 1; i < c; i++) { rt_ntlm((unsigned char *)v[i], strlen(v[i]), d);
+        for (int k = 0; k < 16; k++) printf("%02x", d[k]); putchar('\n'); } return 0; }
+EOF
+    if "$CC" -O2 -I"$PWD" "$tmp/ntlmgen.c" -o "$tmp/ntlmgen" 2>/dev/null; then have_ntlm=1
+        "$tmp/ntlmgen" $allw > "$tmp/ntlmt"; fi
+    xcheck() {   # <alg> <targetfile> <pattern>
+        "$RXEJIT" -G -D "$tmp" -m "$2" -H "$1" "$3" 2>/dev/null | sort > "$tmp/gpu"
+        "$RXEJIT"    -D "$tmp" -m "$2" -H "$1" "$3" 2>/dev/null | sort > "$tmp/cpu"
+        if cmp -s "$tmp/gpu" "$tmp/cpu"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G -H %s %s\n        GPU hit set differs from CPU\n' "$1" "$3"; fail=$((fail + 1)); fi
+    }
+    for p in '[a-z]{3}' '(ab|cd){2}[0-9]' '(cat|hi)[a-z]{5}' '(a|b)\1[0-9]{7}' '[:gw:][a-z]{5}' '[:vd:]{3}'; do
+        [ "$have_sha1" = 1 ] && xcheck sha1 "$tmp/sha1t" "$p"
+        [ "$have_ntlm" = 1 ] && xcheck ntlm "$tmp/ntlmt" "$p"
+    done
+    # ntlm widens to UTF-16LE, so one GPU block holds only < 28 candidate bytes.
+    # (cat|dog){10} is 30 bytes: md5 runs it (30 < 56), ntlm must decline it
+    # (60 >= 56) rather than emit a wrong single-block kernel.
+    if [ "$have_ntlm" = 1 ]; then
+        if "$RXEJIT" -G -m "$tmp/md5t" -H md5 '(cat|dog){10}' >/dev/null 2>&1 &&
+           ! "$RXEJIT" -G -m "$tmp/ntlmt" -H ntlm '(cat|dog){10}' >/dev/null 2>&1
+        then pass=$((pass + 1))
+        else printf 'FAIL  -G width guard: md5 must run and ntlm must decline (cat|dog){10}\n'; fail=$((fail + 1)); fi
+    fi
 
     # The -p occupancy monitor is timing-only (stderr) and must not change the hits.
     "$RXEJIT" -G      -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp0"
