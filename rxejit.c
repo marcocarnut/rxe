@@ -809,25 +809,31 @@ static void emit_perm_body(FILE *o, const struct build *B,
     fprintf(o, "    static const unsigned long long PSZ[%d] = {", hi + 1);
     for (int s = 0; s <= hi; s++) fprintf(o, "%s%lluULL", s ? "," : "", PSZ[s]);
     fputs("};\n", o);
-    if (ord) fprintf(o, "    int rem[%d], idx[%d];\n", n < 1 ? 1 : n, hi < 1 ? 1 : hi);
-    else     fprintf(o, "    int idx[%d];\n", hi < 1 ? 1 : hi);
+    int K = hi < 1 ? 1 : hi;
+    fprintf(o, "    int idx[%d];\n", K);
+    if (ord) fprintf(o, "    int used[%d];\n", K);   // the picks so far -- O(k), not O(n)
 
     fputs("    for (;;) {\n", o);
     // r -> size s and within-block rank rr: subtract each block from lo up.
     fprintf(o, "        int s = %d; unsigned long long rr = r;\n", lo);
     fputs("        for (;;) { unsigned long long blk = PSZ[s]; if (rr < blk) break; rr -= blk; s++; }\n", o);
     if (ord) {
-        // Ordered: unrank rr -> idx[0..s) through the factorial number system --
-        // pick the rank-th still-unused member and remove it.
-        fprintf(o, "        for (int t = 0; t < %d; t++) rem[t] = t;\n", n);
-        fprintf(o, "        { int nrem = %d;\n", n);
-        fputs("          for (int p = 0; p < s; p++) {\n"
+        // Ordered: unrank rr -> idx[0..s) through the factorial number system.
+        // Position p takes rank rr/block among the s-p members not yet chosen;
+        // the rank becomes an actual index by stepping past the earlier picks at
+        // or below it. Only the s picks are tracked (used[], sorted), never the
+        // whole pool -- so this is O(k), independent of the pool size n.
+        fputs("        { int nused = 0;\n"
+              "          for (int p = 0; p < s; p++) {\n"
               "              unsigned long long block = 1;\n", o);
         fprintf(o, "              for (int t = 0; t < s - 1 - p; t++) block *= (unsigned long long)(%d - p - t);\n", n - 1);
         fputs("              unsigned long long rank = rr / block; rr %= block;\n"
-              "              idx[p] = rem[rank];\n"
-              "              for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
-              "              nrem--;\n"
+              "              int actual = (int)rank;\n"
+              "              for (int u = 0; u < nused; u++) if (used[u] <= actual) actual++;\n"
+              "              idx[p] = actual;\n"
+              "              int ins = nused;\n"
+              "              while (ins > 0 && used[ins-1] > actual) { used[ins] = used[ins-1]; ins--; }\n"
+              "              used[ins] = actual; nused++;\n"
               "          } }\n", o);
     } else {
         // Unordered: unrank rr -> s ascending indices through the combinatorial
@@ -1594,15 +1600,17 @@ static void emit_cl_wheel_tables(FILE *ms, const struct wheel *w, int i)
     }
 }
 
-// The -G permutation backend for (re){{lo,hi!}} (with fixed/variable pre and
-// post wheels). Producer-free like the hybrid: one grid over the whole space,
-// each lane unranking its global index into a candidate. The index decodes to
-// the pre/post wheel digits and the choice index r; r selects the size s (the
-// blocks ascending, PSZ[s] = P(n,s)) and unranks to s distinct pool members by
-// the factorial number system, exactly as the CPU body does -- so a lane's
-// candidate is the CPU's at that index and the hit sets agree. The candidate
-// must fit one hash block; its width is baked (MAXW). Hits are re-hashed on the
-// host. The private rem[] bounds the pool size, so a large pool stays on the CPU.
+// The -G combinatorial-choice backend for (re){{lo,hi!}} / {{lo,hi}} (with
+// fixed/variable pre and post wheels). Producer-free like the hybrid: one grid
+// over the whole space, each lane unranking its global index into a candidate.
+// The index decodes to the pre/post wheel digits and the choice index r; r
+// selects the size s (the blocks ascending) and unranks to s pool members --
+// factorial number system for a permutation, combinatorial for a combination,
+// exactly as the CPU body does -- so a lane's candidate is the CPU's at that
+// index and the hit sets agree. Both unranks track only the s picks (O(k),
+// independent of the pool size), so nothing pool-wide lives in a lane's private
+// memory. The candidate must fit one hash block; its width is baked (MAXW).
+// Hits are re-hashed on the host.
 static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
                           const char *nmemb, int psec)
 {
@@ -1691,15 +1699,22 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
           "    for (;;) { ulong blk = PSZ[s]; if (rr < blk) break; rr -= blk; s++; }\n", ms);
     fprintf(ms, "    int idx[%d];\n", hi < 1 ? 1 : hi);
     if (ord)
-        fputs("    { int rem[NP]; for (int t = 0; t < NP; t++) rem[t] = t; int nrem = NP;\n"
+        // Factorial number system, tracking only the s picks (used[], sorted),
+        // never the whole pool -- O(k), independent of the pool size NP, so no
+        // NP-wide private array to spill. Rank -> actual index by stepping past
+        // the earlier picks at or below it.
+        fprintf(ms, "    { int used[%d]; int nused = 0;\n"
               "      for (int pp = 0; pp < s; pp++) {\n"
               "          ulong block = 1;\n"
               "          for (int t = 0; t < s - 1 - pp; t++) block *= (ulong)(NP - 1 - pp - t);\n"
-              "          ulong rank = rr / block; rr %= block;\n"
-              "          idx[pp] = rem[rank];\n"
-              "          for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
-              "          nrem--;\n"
-              "      } }\n", ms);
+              "          ulong rank = rr / block; rr %%= block;\n"
+              "          int actual = (int)rank;\n"
+              "          for (int u = 0; u < nused; u++) if (used[u] <= actual) actual++;\n"
+              "          idx[pp] = actual;\n"
+              "          int ins = nused;\n"
+              "          while (ins > 0 && used[ins-1] > actual) { used[ins] = used[ins-1]; ins--; }\n"
+              "          used[ins] = actual; nused++;\n"
+              "      } }\n", hi < 1 ? 1 : hi);
     else
         fputs("    { ulong jj = rr; int up = NP;\n"
               "      for (int k = s; k >= 1; k--) {\n"
@@ -2446,9 +2461,10 @@ int main(int argc, char **argv)
         int gpu_G = 0, gpu_lowvar = 0;
         if (gpu && b.perm_active) {
             // A choice runs whole on the GPU: each lane unranks its index. The
-            // widest candidate must fit one hash block, the per-lane rem[]/idx[]
-            // stay small, and an unordered choice's baked Pascal table must not be
-            // huge -- otherwise it stays on the CPU.
+            // widest candidate must fit one hash block; the pool's __constant
+            // tables (bytes + offsets) and an unordered choice's Pascal table
+            // must not be huge -- otherwise it stays on the CPU. (The unrank
+            // itself is O(k), so it puts nothing pool-wide in private memory.)
             int poolmax = b.perm_pool.L;
             if (!b.perm_pool.L)
                 for (int j = 0; j < b.perm_pool.n; j++)
