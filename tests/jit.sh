@@ -289,28 +289,48 @@ same '(ab|c|def){{2!}}'       # an uneven-width pool -> variable render
 same 'x(a|b|c){{2!}}z'        # pre and post fixed wheels around the choice
 same '(a|b|c){{2!}}[0-9]'     # a post odometer, less significant than the choice
 same '[a-z]{{2!}}'            # a bare class as the pool, P(26,2) = 650
+# A size range {{lo,hi!}} unions the single-size blocks, ascending by size --
+# the member length itself varies, a super-wheel with growing-length segments.
+same '(a|b|c){{2,3!}}'        # sizes 2 then 3
+same '(a|b|c){{1,3!}}'        # a full range down to size 1
+same '(a|b|c){{0,2!}}'        # lo = 0 includes the empty member
+same '(cat|dog|fox){{1,2!}}'  # a range over multi-byte members
+same '(ab|c|def){{1,3!}}'     # a range over an uneven-width pool
+same 'x(a|b|c){{1,2!}}z'      # pre/post around a range
+same '(a|b|c){{1,3!}}[0-9]'   # a post odometer under a range
+same '[a-z]{{1,2!}}'          # a class pool: P(26,1) + P(26,2) = 676
 
-# The threaded count of a permutation is exact and thread-invariant, and the
-# seed decode (from > 0) lands each shard on the right ordering.
+# The threaded count of a permutation (single size and range) is exact and
+# thread-invariant, and the seed decode (from > 0, across size blocks) lands
+# each shard on the right ordering.
 pc=$("$RXEJIT" -n -j 1 '(a|b|c|d|e|f|g|h){{5!}}')
 pcb=$("$RXEJIT" -n -j 7 '(a|b|c|d|e|f|g|h){{5!}}')
 if [ "$pc" = "6720" ] && [ "$pcb" = "6720" ]; then pass=$((pass + 1)); else
     printf 'FAIL  permutation count: -j1=%s -j7=%s (want P(8,5)=6720)\n' "$pc" "$pcb"; fail=$((fail + 1)); fi
+rc=$("$RXEJIT" -n -j 1 '(a|b|c|d|e|f|g|h|i){{1,4!}}')
+rcb=$("$RXEJIT" -n -j 16 '(a|b|c|d|e|f|g|h|i){{1,4!}}')
+if [ "$rc" = "3609" ] && [ "$rcb" = "3609" ]; then pass=$((pass + 1)); else
+    printf 'FAIL  permutation range count: -j1=%s -j16=%s (want 3609)\n' "$rc" "$rcb"; fail=$((fail + 1)); fi
 
-# Keycracking "known words, unknown order": recover the ordering whose md5 is the
-# target. Independent oracle: md5sum of the true ordering.
+# Keycracking "known words, unknown order" -- and, with a range, unknown length
+# too. Independent oracle: md5sum of the true string.
 if command -v md5sum >/dev/null 2>&1; then
     pwant=$(printf '%s' horsebatterystaple | md5sum | cut -d' ' -f1)
     printf '%s\n' "$pwant" > "$tmp/kh"
     pgot=$("$RXEJIT" -m "$tmp/kh" -H md5 '(battery|horse|staple|correct){{3!}}' 2>/dev/null)
     if [ "$pgot" = "$pwant:horsebatterystaple" ]; then pass=$((pass + 1)); else
         printf 'FAIL  permutation keycrack\n        got [%s]\n' "$pgot"; fail=$((fail + 1)); fi
+    rwant=$(printf '%s' horsestaple | md5sum | cut -d' ' -f1)   # 2 of the 4 words
+    printf '%s\n' "$rwant" > "$tmp/kh"
+    rgot=$("$RXEJIT" -m "$tmp/kh" -H md5 '(battery|horse|staple|correct){{1,4!}}' 2>/dev/null)
+    if [ "$rgot" = "$rwant:horsestaple" ]; then pass=$((pass + 1)); else
+        printf 'FAIL  permutation range keycrack\n        got [%s]\n' "$rgot"; fail=$((fail + 1)); fi
 fi
 
-# Not yet supported: an unordered combination {{k}}, a permutation size range,
-# the dedup sink, and the GPU path -- each must decline, not miscompile.
+# Not yet supported: an unordered combination {{k}}, the dedup sink, and the GPU
+# path -- each must decline, not miscompile.
 declines '(a|b|c){{2}}'       # unordered combination
-declines '(a|b|c){{1,2!}}'    # a size range
+declines '(a|b|c){{1,2}}'     # an unordered range
 if "$RXEJIT" -d '(a|b|c){{2!}}' >/dev/null 2>&1
 then printf 'FAIL  -d should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 if "$RXEJIT" -G -m /dev/null -H md5 '(a|b|c){{2!}}' >/dev/null 2>&1
