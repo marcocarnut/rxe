@@ -333,12 +333,21 @@ if command -v md5sum >/dev/null 2>&1; then
         printf 'FAIL  permutation range keycrack\n        got [%s]\n' "$rgot"; fail=$((fail + 1)); fi
 fi
 
-# Not yet supported: an unordered combination {{k}}, the dedup sink, and the GPU
-# path -- each must decline, not miscompile.
-declines '(a|b|c){{2}}'       # unordered combination
-declines '(a|b|c){{1,2}}'     # an unordered range
+# An unordered combination (re){{lo,hi}} is the same super-wheel with a
+# combinatorial-number-system unrank (colex order), so it composes the same way.
+same '(a|b|c){{2}}'           # C(3,2) = 3, the choose-2 shape
+same '(a|b|c|d|e){{3}}'       # colex order: abc abd acd bcd abe ...
+same '(a|b|c|d){{1,3}}'       # a size range sums C(n,s)
+same '(cat|dog|fish){{2}}'    # multi-byte members
+same 'x(a|b|c){{2}}[0-9]'     # pre and post around the choice
+same '[a-e]{{3}}'             # a class pool
+same '([a-c] ){{2?}}'         # the '?' chop applies to combinations too
+same '([a-c] ){{1,3?}}'       # ...and to a range
+# The dedup sink still declines for any choice (perm or combo).
 if "$RXEJIT" -d '(a|b|c){{2!}}' >/dev/null 2>&1
 then printf 'FAIL  -d should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+if "$RXEJIT" -d '(a|b|c){{2}}' >/dev/null 2>&1
+then printf 'FAIL  -d should decline a combination\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.
@@ -526,6 +535,9 @@ EOF
     gperm md5 md5sum '[a-z]{{2!}}'               # a class pool, P(26,2) = 650
     gperm md5 md5sum '([a-c] ){{2!?}}'           # '?' chop: quelled trailing space
     gperm md5 md5sum 'x([a-c](  )){{1,3!?}}[0-9]' # chop + grouped sep + pre/post/range
+    gperm md5 md5sum '(cat|dog|fish|bird){{2}}'  # unordered combination (colex)
+    gperm md5 md5sum '(a|b|c|d|e){{1,3}}'        # a combination range
+    gperm md5 md5sum '([a-c] ){{2?}}'            # combination + '?' chop
     [ "$have_sha1" = 1 ]   && gperm sha1   sha1sum   '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_sha256" = 1 ] && gperm sha256 sha256sum '(cat|dog|fox|bat){{2,3!}}'
     [ "$have_ntlm" = 1 ]   && gperm ntlm   ntlm      '(cat|dog|fox|bat){{2,3!}}'

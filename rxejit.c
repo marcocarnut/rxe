@@ -128,6 +128,7 @@ struct build {
     // is a factorial-base number whose length (the size s) varies with the
     // index. A single size {{k!}} is lo==hi==k. The pool is one baked wheel.
     int           perm_active, perm_at, perm_lo, perm_hi;
+    int           perm_ordered;   // 1 = permutations {{k!}}, 0 = combinations {{k}}
     int           perm_chop;      // {{...?}}: bytes to quell from the last item
     struct wheel  perm_pool;
 };
@@ -319,20 +320,36 @@ static int add_looprep(struct build *b, struct rxe_node *nd)
     return 0;
 }
 
-// An ordered permutation (re){{lo,hi!}}: for each size s in [lo,hi], every
-// ordered choice of s of the pool's n members, in the interpreter's order --
-// the size blocks ascending, lexicographic within each. The pool re is baked as
-// one wheel (its members are the items); the choice is a super-wheel like a loop
-// repeat, with pre/post fixed structure around it. Only the ordered case; an
-// unordered {{k}} declines, as does a pool that is not a flat member set.
+// The size-s block's cardinality: P(n,s) = n(n-1)..(n-s+1) ordered, or C(n,s)
+// unordered. Built incrementally in __int128 (exact, since C's partial products
+// stay whole), so intermediate values never wrap. Returns -1 if it exceeds 64
+// bits (a choice that large cannot be one odometer digit), else 0 with *out set.
+static int choose_block(int n, int s, int ordered, unsigned long long *out)
+{
+    if (s < 0 || s > n) { *out = 0; return 0; }
+    unsigned __int128 r = 1;
+    for (int i = 0; i < s; i++) {
+        r *= (unsigned)(n - i);
+        if (!ordered) r /= (unsigned)(i + 1);        // C(n,i+1) at each step, exact
+        if (r > (unsigned __int128)(~0ULL)) return -1;
+    }
+    *out = (unsigned long long)r;
+    return 0;
+}
+
+// A combinatorial choice (re){{lo,hi!}} (ordered = permutations) or (re){{lo,hi}}
+// (unordered = combinations): for each size s in [lo,hi], every choice of s of
+// the pool's n members, in the interpreter's order -- the size blocks ascending,
+// lexicographic (ordered) or colexicographic (unordered) within each. The pool
+// re is baked as one wheel (its members are the items); the choice is a
+// super-wheel like a loop repeat, with pre/post fixed structure around it.
 static int add_perm(struct build *b, struct rxe_node *nd)
 {
     if (b->perm_active || b->lr_active)
-        { reason = "more than one permutation or large repeat"; return -1; }
-    if (!nd->comb_perm) { reason = "an unordered combination {{k}}"; return -1; }
-    if (b->ngref)       { reason = "a permutation with a backreference"; return -1; }
-    int lo = nd->rep_min, hi = nd->rep_max;
-    if (lo < 0 || hi < lo) { reason = "a permutation with an empty size range"; return -1; }
+        { reason = "more than one combinatorial choice or large repeat"; return -1; }
+    if (b->ngref)       { reason = "a combinatorial choice with a backreference"; return -1; }
+    int lo = nd->rep_min, hi = nd->rep_max, ordered = nd->comb_perm;
+    if (lo < 0 || hi < lo) { reason = "a combinatorial choice with an empty size range"; return -1; }
 
     // The pool is the whole base enumerated as one wheel -- its members are the
     // items, whether the base is an alternation (cat|dog), a class [a-z], or a
@@ -343,30 +360,27 @@ static int add_perm(struct build *b, struct rxe_node *nd)
 
     struct wheel pool = b->w[w0];
     int n = pool.n;
-    if (hi > n) { reason = "a permutation choosing more than its pool"; return -1; }
+    if (hi > n) { reason = "a choice of more members than its pool"; return -1; }
 
-    // The super-wheel's radix is sum_{s=lo}^{hi} P(n,s); it is one odometer
+    // The super-wheel's radix is sum_{s=lo}^{hi} of the block; it is one odometer
     // digit, decoded with ULL math, so the sum must fit 64 bits.
-    unsigned long long total = 0, pns = 1;
-    for (int s = 0; s <= hi; s++) {                  // pns = P(n,s), grown in s
-        if (s > 0) {
-            unsigned long long f = (unsigned long long)(n - (s - 1));
-            if (f && pns > (~0ULL) / f) { reason = "a permutation larger than 64 bits"; return -1; }
-            pns *= f;
+    unsigned long long total = 0;
+    for (int s = lo; s <= hi; s++) {
+        unsigned long long blk;
+        if (choose_block(n, s, ordered, &blk) || total > (~0ULL) - blk) {
+            reason = "a combinatorial choice larger than 64 bits"; return -1;
         }
-        if (s >= lo) {
-            if (total > (~0ULL) - pns) { reason = "a permutation larger than 64 bits"; return -1; }
-            total += pns;
-        }
+        total += blk;
     }
 
-    b->perm_pool   = pool;
-    b->perm_lo     = lo;
-    b->perm_hi     = hi;
-    b->perm_chop   = nd->comb_chop;   // {{...?}}: quell the last item's separator
-    b->perm_at     = w0;             // pre = w[0..w0); post wheels get appended here
-    b->perm_active = 1;
-    b->nw          = w0;             // drop the pool wheel from the main stream,
+    b->perm_pool    = pool;
+    b->perm_lo      = lo;
+    b->perm_hi      = hi;
+    b->perm_ordered = ordered;
+    b->perm_chop    = nd->comb_chop;  // {{...?}}: quell the last item's separator
+    b->perm_at      = w0;             // pre = w[0..w0); post wheels get appended here
+    b->perm_active  = 1;
+    b->nw           = w0;             // drop the pool wheel from the main stream,
     b->nops        = op0;            // and the LAY op that went with it
     return 0;
 }
@@ -768,14 +782,17 @@ static void emit_perm_body(FILE *o, const struct build *B,
                            int count, int match, int hash, int progress, int acc)
 {
     int P = B->perm_at, nw = B->nw, Q = nw - P, lo = B->perm_lo, hi = B->perm_hi;
+    int ord = B->perm_ordered;
     const struct wheel *pre = B->w, *post = B->w + P, *pool = &B->perm_pool;
     int n = pool->n;
 
-    // NPERM = sum_{s=lo}^{hi} P(n,s); PSZ[s] = P(n,s) for the size decode.
-    unsigned long long NPERM = 0, PSZ[64];
-    { unsigned long long pns = 1;
-      for (int s = 0; s <= hi; s++) { if (s) pns *= (unsigned long long)(n - (s - 1));
-          PSZ[s] = pns; if (s >= lo) NPERM += pns; } }
+    // NPERM = sum_{s=lo}^{hi} of the block; PSZ[s] = the block (P or C) for the
+    // size decode.
+    unsigned long long NPERM = 0, PSZ[64] = {0};
+    for (int s = 0; s <= hi; s++) {
+        choose_block(n, s, ord, &PSZ[s]);
+        if (s >= lo) NPERM += PSZ[s];
+    }
 
     // --- seed from 'from' (post least significant, then the choice, then pre) ---
     fputs("    unsigned long long f = from;\n", o);
@@ -787,28 +804,43 @@ static void emit_perm_body(FILE *o, const struct build *B,
     if (acc) fputs("    unsigned long long n = 0;\n", o);
     fputs("    unsigned long long done = 0;\n", o);
 
-    // PSZ[s] = P(n,s): the size of block s, subtracted off to find the size and
-    // the within-block rank; only sizes lo..hi are ever selected.
+    // PSZ[s] = the block for size s, subtracted off to find the size and the
+    // within-block rank; only sizes lo..hi are ever selected.
     fprintf(o, "    static const unsigned long long PSZ[%d] = {", hi + 1);
     for (int s = 0; s <= hi; s++) fprintf(o, "%s%lluULL", s ? "," : "", PSZ[s]);
     fputs("};\n", o);
-    fprintf(o, "    int rem[%d], idx[%d];\n", n < 1 ? 1 : n, hi < 1 ? 1 : hi);
+    if (ord) fprintf(o, "    int rem[%d], idx[%d];\n", n < 1 ? 1 : n, hi < 1 ? 1 : hi);
+    else     fprintf(o, "    int idx[%d];\n", hi < 1 ? 1 : hi);
 
     fputs("    for (;;) {\n", o);
     // r -> size s and within-block rank rr: subtract each block from lo up.
     fprintf(o, "        int s = %d; unsigned long long rr = r;\n", lo);
     fputs("        for (;;) { unsigned long long blk = PSZ[s]; if (rr < blk) break; rr -= blk; s++; }\n", o);
-    // unrank rr -> idx[0..s): pick the rank-th still-unused member and remove it.
-    fprintf(o, "        for (int t = 0; t < %d; t++) rem[t] = t;\n", n);
-    fprintf(o, "        { int nrem = %d;\n", n);
-    fputs("          for (int p = 0; p < s; p++) {\n"
-          "              unsigned long long block = 1;\n", o);
-    fprintf(o, "              for (int t = 0; t < s - 1 - p; t++) block *= (unsigned long long)(%d - p - t);\n", n - 1);
-    fputs("              unsigned long long rank = rr / block; rr %= block;\n"
-          "              idx[p] = rem[rank];\n"
-          "              for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
-          "              nrem--;\n"
-          "          } }\n", o);
+    if (ord) {
+        // Ordered: unrank rr -> idx[0..s) through the factorial number system --
+        // pick the rank-th still-unused member and remove it.
+        fprintf(o, "        for (int t = 0; t < %d; t++) rem[t] = t;\n", n);
+        fprintf(o, "        { int nrem = %d;\n", n);
+        fputs("          for (int p = 0; p < s; p++) {\n"
+              "              unsigned long long block = 1;\n", o);
+        fprintf(o, "              for (int t = 0; t < s - 1 - p; t++) block *= (unsigned long long)(%d - p - t);\n", n - 1);
+        fputs("              unsigned long long rank = rr / block; rr %= block;\n"
+              "              idx[p] = rem[rank];\n"
+              "              for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
+              "              nrem--;\n"
+              "          } }\n", o);
+    } else {
+        // Unordered: unrank rr -> s ascending indices through the combinatorial
+        // number system (colex order) -- for k = s..1 the largest c whose
+        // C(c,k) fits the remainder, then recurse below it.
+        fprintf(o, "        { unsigned long long jj = rr; int up = %d;\n", n);
+        fputs("          for (int k = s; k >= 1; k--) {\n"
+              "              int lo2 = k - 1, hi2 = up - 1;\n"
+              "              while (lo2 < hi2) { int mid = (lo2 + hi2 + 1) >> 1;\n"
+              "                  if (cchoose(mid, k) <= jj) lo2 = mid; else hi2 = mid - 1; }\n"
+              "              jj -= cchoose(lo2, k); idx[k-1] = lo2; up = lo2;\n"
+              "          } }\n", o);
+    }
 
     // --- lay the member: pre wheels, the s chosen pool members, post wheels ---
     fputs("        int p = 0;\n", o);
@@ -995,6 +1027,15 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         fputs("static struct rt_set TB;   /* the targets, read-only once loaded */\n", o);
         fputs("static pthread_mutex_t MX = PTHREAD_MUTEX_INITIALIZER;\n\n", o);
     }
+    // C(c,k) for the combinatorial-number-system unrank of an unordered choice.
+    // __int128 keeps the partial products exact and unwrapped; the result fits.
+    if (B->perm_active && !B->perm_ordered)
+        fputs("static unsigned long long cchoose(int c, int k) {\n"
+              "    if (k < 0 || k > c) return 0;\n"
+              "    if (k > c - k) k = c - k;\n"
+              "    unsigned __int128 r = 1;\n"
+              "    for (int i = 0; i < k; i++) r = r * (unsigned)(c - i) / (unsigned)(i + 1);\n"
+              "    return (unsigned long long)r;\n}\n\n", o);
 
     fputs(dup
         ? "static void run(unsigned long long from, unsigned long long count, struct rt_dup *d)\n{\n"
@@ -1565,14 +1606,15 @@ static void emit_cl_wheel_tables(FILE *ms, const struct wheel *w, int i)
 static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
                           const char *nmemb, int psec)
 {
-    int P = B->perm_at, nw = B->nw, lo = B->perm_lo, hi = B->perm_hi;
+    int P = B->perm_at, nw = B->nw, lo = B->perm_lo, hi = B->perm_hi, ord = B->perm_ordered;
     const struct wheel *pool = &B->perm_pool;
     int n = pool->n;
 
-    unsigned long long NPERM = 0, PSZ[64];
-    { unsigned long long pns = 1;
-      for (int s = 0; s <= hi; s++) { if (s) pns *= (unsigned long long)(n - (s - 1));
-          PSZ[s] = pns; if (s >= lo) NPERM += pns; } }
+    unsigned long long NPERM = 0, PSZ[64] = {0};
+    for (int s = 0; s <= hi; s++) {
+        choose_block(n, s, ord, &PSZ[s]);
+        if (s >= lo) NPERM += PSZ[s];
+    }
 
     int poolmax = pool->L ? pool->L : 0;
     if (!pool->L) for (int j = 0; j < n; j++) if (pool->alen[j] > poolmax) poolmax = pool->alen[j];
@@ -1609,6 +1651,20 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fputs("__constant ulong PSZ[] = {", ms);
     for (int s = 0; s <= hi; s++) fprintf(ms, "%s%lluUL", s ? "," : "", PSZ[s]);
     fputs("};\n", ms);
+    // For an unordered choice, a Pascal table BINOM[c*(HI+1)+k] = C(c,k) drives
+    // the combinatorial-number-system unrank (the kernel has no 128-bit math).
+    // Values past 64 bits saturate: they are only ever compared against a
+    // remainder that fits, so "too big" reads correctly as "greater".
+    if (!ord) {
+        fprintf(ms, "#define HI1 %d\n__constant ulong BINOM[] = {", hi + 1);
+        for (int c = 0; c <= n; c++)
+            for (int k = 0; k <= hi; k++) {
+                unsigned long long v;
+                if (choose_block(c, k, 0, &v)) v = ~0ULL;   // > 2^64 -> saturate
+                fprintf(ms, "%s%lluUL", (c || k) ? "," : "", v);
+            }
+        fputs("};\n", ms);
+    }
 
     fputs("__kernel void crackP(ulong base, ulong NALL,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
@@ -1630,17 +1686,29 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
         snprintf(tb, sizeof tb, "A%d", i);
         emit_cl_lay(ms, &B->w[i], tb, to, tl, dv);
     }
-    // the choice: size decode, then unrank + lay each chosen pool member
+    // the choice: size decode, unrank into idx[0..s), then lay each chosen member
     fputs("    int s = LO; ulong rr = r;\n"
-          "    for (;;) { ulong blk = PSZ[s]; if (rr < blk) break; rr -= blk; s++; }\n"
-          "    int rem[NP]; for (int t = 0; t < NP; t++) rem[t] = t; int nrem = NP;\n"
-          "    for (int pp = 0; pp < s; pp++) {\n"
-          "        ulong block = 1;\n"
-          "        for (int t = 0; t < s - 1 - pp; t++) block *= (ulong)(NP - 1 - pp - t);\n"
-          "        ulong rank = rr / block; rr %= block;\n"
-          "        int it = rem[rank];\n"
-          "        for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
-          "        nrem--;\n", ms);
+          "    for (;;) { ulong blk = PSZ[s]; if (rr < blk) break; rr -= blk; s++; }\n", ms);
+    fprintf(ms, "    int idx[%d];\n", hi < 1 ? 1 : hi);
+    if (ord)
+        fputs("    { int rem[NP]; for (int t = 0; t < NP; t++) rem[t] = t; int nrem = NP;\n"
+              "      for (int pp = 0; pp < s; pp++) {\n"
+              "          ulong block = 1;\n"
+              "          for (int t = 0; t < s - 1 - pp; t++) block *= (ulong)(NP - 1 - pp - t);\n"
+              "          ulong rank = rr / block; rr %= block;\n"
+              "          idx[pp] = rem[rank];\n"
+              "          for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
+              "          nrem--;\n"
+              "      } }\n", ms);
+    else
+        fputs("    { ulong jj = rr; int up = NP;\n"
+              "      for (int k = s; k >= 1; k--) {\n"
+              "          int lo2 = k - 1, hi2 = up - 1;\n"
+              "          while (lo2 < hi2) { int mid = (lo2 + hi2 + 1) >> 1;\n"
+              "              if (BINOM[mid*HI1 + k] <= jj) lo2 = mid; else hi2 = mid - 1; }\n"
+              "          jj -= BINOM[lo2*HI1 + k]; idx[k-1] = lo2; up = lo2;\n"
+              "      } }\n", ms);
+    fputs("    for (int pp = 0; pp < s; pp++) { int it = idx[pp];\n", ms);
     if (pool->L == 1)
         fputs("        buf[p++] = PB[it];\n", ms);
     else if (pool->L > 1)
@@ -2256,9 +2324,9 @@ int main(int argc, char **argv)
 "usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1|sha256] | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
 "  Handles any finite pattern -- masks, alternations, bounded repeats,\n"
-"  dictionaries, backreferences, ordered permutations (re){{k!}}. Only an\n"
-"  unbounded (infinite) repeat, or a set too large to unroll, is declined,\n"
-"  with a reason.\n"
+"  dictionaries, backreferences, combinations and permutations (re){{...}}.\n"
+"  Only an unbounded (infinite) repeat, or a set too large to unroll, is\n"
+"  declined, with a reason.\n"
 "    -S       print the generated C to stdout instead of compiling and running it.\n"
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
@@ -2275,8 +2343,8 @@ int main(int argc, char **argv)
 "             rate, elapsed and ETA (the threaded -n and -m runs, and -G, which\n"
 "             also reports GPU occupancy: the fraction of time the device is busy).\n"
 "    -G       run on the GPU via OpenCL: one lane per candidate. Masks, uneven\n"
-"             alternations, dictionaries, head-side backrefs, and ordered\n"
-"             permutations, with -m file -H md5|ntlm|sha1|sha256 (keycracking).\n"
+"             alternations, dictionaries, head-side backrefs, and combinations\n"
+"             / permutations, with -m file -H md5|ntlm|sha1|sha256 (keycracking).\n"
 "    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
@@ -2347,16 +2415,22 @@ int main(int argc, char **argv)
             mpz_clear(Cz); mpz_clear(term); mpz_clear(M);
         }
         if (b.perm_active) {
-            // Fold in the permutation super-wheel's radix sum_{s=lo}^{hi} P(n,s).
-            mpz_t Pns, sum;
-            mpz_init_set_ui(Pns, 1);                 // P(n,s), grown in s
+            // Fold in the choice super-wheel's radix sum_{s=lo}^{hi} of the block
+            // -- P(n,s) ordered, C(n,s) unordered.
+            mpz_t blk, sum;
+            mpz_init(blk);
             mpz_init_set_ui(sum, 0);
-            for (int s = 0; s <= b.perm_hi; s++) {
-                if (s) mpz_mul_ui(Pns, Pns, (unsigned long)(b.perm_pool.n - (s - 1)));
-                if (s >= b.perm_lo) mpz_add(sum, sum, Pns);
+            for (int s = b.perm_lo; s <= b.perm_hi; s++) {
+                if (b.perm_ordered) {
+                    mpz_set_ui(blk, 1);
+                    for (int t = 0; t < s; t++) mpz_mul_ui(blk, blk, (unsigned long)(b.perm_pool.n - t));
+                } else {
+                    mpz_bin_uiui(blk, (unsigned long)b.perm_pool.n, (unsigned long)s);
+                }
+                mpz_add(sum, sum, blk);
             }
             mpz_mul(N, N, sum);
-            mpz_clear(Pns); mpz_clear(sum);
+            mpz_clear(blk); mpz_clear(sum);
         }
         char nbuf[32];
         const char *nmemb = NULL;
@@ -2371,9 +2445,10 @@ int main(int argc, char **argv)
         int gpu_kind = 0;                       // 1 fixed mask, 2 loop repeat, 3 generic
         int gpu_G = 0, gpu_lowvar = 0;
         if (gpu && b.perm_active) {
-            // A permutation runs whole on the GPU: each lane unranks its index.
-            // The widest candidate must fit one hash block, and the per-lane rem[]
-            // that tracks unused members must stay small, or it stays on the CPU.
+            // A choice runs whole on the GPU: each lane unranks its index. The
+            // widest candidate must fit one hash block, the per-lane rem[]/idx[]
+            // stay small, and an unordered choice's baked Pascal table must not be
+            // huge -- otherwise it stays on the CPU.
             int poolmax = b.perm_pool.L;
             if (!b.perm_pool.L)
                 for (int j = 0; j < b.perm_pool.n; j++)
@@ -2384,8 +2459,10 @@ int main(int argc, char **argv)
                 if (wm == 0) for (int j = 0; j < b.w[i].n; j++) if (b.w[i].alen[j] > wm) wm = b.w[i].alen[j];
                 maxw += wm;
             }
-            if (b.perm_pool.n > 256) gpu_no = "a permutation pool too large for the GPU";
+            if (b.perm_pool.n > 256) gpu_no = "a choice pool too large for the GPU";
             else if (maxw * HA->mfac >= 56) gpu_no = "a candidate too wide for one hash block";
+            else if (!b.perm_ordered && (b.perm_pool.n + 1) * (b.perm_hi + 1) > 16384)
+                gpu_no = "an unordered choice whose binomial table is too large for the GPU";
             else if (!nmemb) gpu_no = "more members than fit 64 bits";
             else gpu_kind = 4;
         } else if (gpu && b.lr_active) {
