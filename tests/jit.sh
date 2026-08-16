@@ -333,8 +333,6 @@ declines '(a|b|c){{2}}'       # unordered combination
 declines '(a|b|c){{1,2}}'     # an unordered range
 if "$RXEJIT" -d '(a|b|c){{2!}}' >/dev/null 2>&1
 then printf 'FAIL  -d should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
-if "$RXEJIT" -G -m /dev/null -H md5 '(a|b|c){{2!}}' >/dev/null 2>&1
-then printf 'FAIL  -G should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.
@@ -499,6 +497,35 @@ EOF
         then pass=$((pass + 1))
         else printf 'FAIL  -G width guard: md5 must run and ntlm must decline (cat|dog){10}\n'; fail=$((fail + 1)); fi
     fi
+
+    # Permutations run whole on the GPU: each lane unranks its global index into
+    # a candidate. The hit set must match the CPU keycrack. Targets are a few of
+    # the pattern's own members, hashed by the independent oracle (ntlmgen for
+    # ntlm). Widths stay under one hash block.
+    gperm() {   # <alg> <hashcmd|ntlm> <pattern>
+        "$RXEJIT" "$3" 2>/dev/null | sed -n '1p;3p;6p' > "$tmp/pm"
+        : > "$tmp/pt"
+        while IFS= read -r w; do
+            if [ "$2" = ntlm ]; then "$tmp/ntlmgen" "$w" >> "$tmp/pt"
+            else printf '%s' "$w" | $2 | cut -d' ' -f1 >> "$tmp/pt"; fi
+        done < "$tmp/pm"
+        "$RXEJIT" -G -m "$tmp/pt" -H "$1" "$3" 2>/dev/null | sort > "$tmp/pg"
+        "$RXEJIT"    -m "$tmp/pt" -H "$1" "$3" 2>/dev/null | sort > "$tmp/pc"
+        if cmp -s "$tmp/pg" "$tmp/pc"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G perm -H %s %s\n        GPU hit set differs from CPU\n' "$1" "$3"; fail=$((fail + 1)); fi
+    }
+    gperm md5 md5sum '(cat|dog|fox|bat){{3!}}'   # fixed-width pool, full choice
+    gperm md5 md5sum '(ab|c|def){{1,2!}}'        # uneven-width pool, a size range
+    gperm md5 md5sum 'x(a|b|c){{2!}}[0-9]'       # pre and post around the choice
+    gperm md5 md5sum '[a-z]{{2!}}'               # a class pool, P(26,2) = 650
+    [ "$have_sha1" = 1 ]   && gperm sha1   sha1sum   '(cat|dog|fox|bat){{2,3!}}'
+    [ "$have_sha256" = 1 ] && gperm sha256 sha256sum '(cat|dog|fox|bat){{2,3!}}'
+    [ "$have_ntlm" = 1 ]   && gperm ntlm   ntlm      '(cat|dog|fox|bat){{2,3!}}'
+    # A permutation candidate wider than one hash block declines (ntlm doubles
+    # the width: 4 words of 7 = 28, *2 = 56 >= 56), and too large a pool declines
+    # rather than blow the per-lane rem[].
+    if "$RXEJIT" -G -m /dev/null -H ntlm '(battery|horse|staple|correct){{1,4!}}' >/dev/null 2>&1
+    then printf 'FAIL  -G ntlm perm should decline (too wide)\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 
     # The -p occupancy monitor is timing-only (stderr) and must not change the hits.
     "$RXEJIT" -G      -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp0"
