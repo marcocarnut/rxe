@@ -7,8 +7,13 @@
  * as real OpenCL C so it can be read and checked on its own; the Makefile turns
  * it into a C string the generated host program hands to clBuildProgram.
  *
- * Ported verbatim from rt_md5 in rxejit_rt.h (same constants, same rounds), so
- * a lane's digest is bit-identical to the CPU's -- the CPU stays the oracle.
+ * Same constants and rounds as rt_md5 in rxejit_rt.h, so a lane's digest is
+ * bit-identical to the CPU's -- the CPU stays the oracle. The one difference is
+ * for speed: the 16 message words are built straight from the candidate and the
+ * pad (not through a byte buffer) and the rounds are unrolled, so when the
+ * candidate length is a compile-time constant -- the baked fixed path -- the ~11
+ * words that are pure padding/length fold into the round constants and never
+ * occupy a register, which lifts occupancy on a register-starved GPU.
  */
 
 #define CL_ROTL(x, c) (((x) << (c)) | ((x) >> (32 - (c))))
@@ -28,12 +33,13 @@ __constant uchar CLS[64] = {
     4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
     6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
 
-static void cl_md5_block(uint abcd[4], const uchar *p)
+/* Compress one already-assembled 16-word message block. Taking the words
+ * directly (not a byte buffer) lets a caller with constant words -- the padding
+ * and length of a fixed-length candidate -- have them folded into the rounds. */
+static void cl_md5_block(uint abcd[4], const uint M[16])
 {
-    uint M[16];
-    for (int i = 0; i < 16; i++)
-        M[i] =  (uint)p[i*4] | ((uint)p[i*4+1] << 8) | ((uint)p[i*4+2] << 16) | ((uint)p[i*4+3] << 24);
     uint A = abcd[0], B = abcd[1], C = abcd[2], D = abcd[3];
+#pragma unroll
     for (int i = 0; i < 64; i++) {
         uint F; int g;
         if      (i < 16) { F = (B & C) | (~B & D);  g = i;              }
@@ -47,17 +53,28 @@ static void cl_md5_block(uint abcd[4], const uchar *p)
 }
 
 /* A candidate is a mask width -- short -- so its padded message is one block
- * (len < 56). One compression, no loop over blocks. */
+ * (len < 56). The message words are built straight from the candidate and the
+ * pad, not through a 64-byte buffer: when len is a compile-time constant (the
+ * baked fixed path) every word past the candidate is a constant the compiler
+ * folds into the round, and never lives in a register. */
 static void cl_md5(const uchar *msg, uint len, uchar out[16])
 {
     uint abcd[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
-    uchar blk[64];
-    for (int i = 0; i < 64; i++) blk[i] = 0;
-    for (uint i = 0; i < len; i++) blk[i] = msg[i];
-    blk[len] = 0x80;
-    ulong bits = (ulong)len * 8;
-    for (int k = 0; k < 8; k++) blk[56 + k] = (uchar)((bits >> (8*k)) & 0xff);
-    cl_md5_block(abcd, blk);
+    uint M[16];
+#pragma unroll
+    for (int w = 0; w < 14; w++) {
+        uint word = 0;
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+            uint pos = (uint)(w * 4 + t);
+            uint b = pos < len ? msg[pos] : (pos == len ? 0x80u : 0u);
+            word |= b << (8 * t);
+        }
+        M[w] = word;
+    }
+    M[14] = len * 8;                   /* one block: bit length fits 32 bits */
+    M[15] = 0;
+    cl_md5_block(abcd, M);
     for (int k = 0; k < 4; k++) {
         out[k*4]   = (uchar)(abcd[k]        & 0xff);
         out[k*4+1] = (uchar)((abcd[k] >> 8) & 0xff);
