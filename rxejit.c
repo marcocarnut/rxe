@@ -120,6 +120,14 @@ struct build {
     // sub-wheels) number. Only one such repeat, and only fixed sub-wheels.
     int           lr_active, lr_at, lr_a, lr_b, lr_nsw;
     struct wheel  lr_sw[REP_SUBW];
+
+    // An ordered permutation (re){{k!}}: k of the pool's n members in every
+    // ordered choice, P(n,k) of them. Like the loop repeat it is a super-wheel
+    // in the odometer -- pre = w[0..perm_at), post = the wheels after -- but
+    // fixed length k, so its digit is one factorial-base number (a lane's index
+    // unranks to k distinct pool indices). The pool is one baked wheel.
+    int           perm_active, perm_at, perm_k;
+    struct wheel  perm_pool;
 };
 
 static int emit_op(struct build *b, int kind, int arg)
@@ -309,6 +317,48 @@ static int add_looprep(struct build *b, struct rxe_node *nd)
     return 0;
 }
 
+// An ordered permutation (re){{k!}}: choose k of the pool's n members, every
+// ordering, P(n,k) of them, in the interpreter's lexicographic-sequence order.
+// The pool re is baked as one wheel (its members are the items); the choice is
+// a super-wheel like a loop repeat, with pre/post fixed structure around it.
+// Only the ordered, single-size case for now -- an unordered {{k}} or a size
+// range {{a,b!}} declines, as does a pool that is not a flat member set.
+static int add_perm(struct build *b, struct rxe_node *nd)
+{
+    if (b->perm_active || b->lr_active)
+        { reason = "more than one permutation or large repeat"; return -1; }
+    if (!nd->comb_perm)             { reason = "an unordered combination {{k}}"; return -1; }
+    if (nd->rep_min != nd->rep_max) { reason = "a permutation size range {{a,b!}}"; return -1; }
+    if (b->ngref)                   { reason = "a permutation with a backreference"; return -1; }
+    int k = nd->rep_min;
+    if (k < 1)                      { reason = "an empty permutation"; return -1; }
+
+    int w0 = b->nw, op0 = b->nops, g0 = b->ngroup;
+    if (add_rxe(b, nd->rxe)) return -1;              // bake the pool as wheel(s)
+    if (b->ngroup != g0)            { reason = "a group inside a permutation"; return -1; }
+    if (b->nw - w0 != 1)            { reason = "a permutation over structured members"; return -1; }
+
+    struct wheel pool = b->w[w0];
+    int n = pool.n;
+    if (k > n)                      { reason = "a permutation choosing more than its pool"; return -1; }
+
+    // P(n,k) must fit 64 bits: it is one odometer digit, decoded with ULL math.
+    unsigned long long pnk = 1;
+    for (int t = 0; t < k; t++) {
+        unsigned long long f = (unsigned long long)(n - t);
+        if (f && pnk > (~0ULL) / f) { reason = "a permutation larger than 64 bits"; return -1; }
+        pnk *= f;
+    }
+
+    b->perm_pool   = pool;
+    b->perm_k      = k;
+    b->perm_at     = w0;             // pre = w[0..w0); post wheels get appended here
+    b->perm_active = 1;
+    b->nw          = w0;             // drop the pool wheel from the main stream,
+    b->nops        = op0;            // and the LAY op that went with it
+    return 0;
+}
+
 // One node -> wheel(s): a plain class is one L==1 wheel; an exact {k} repeat is
 // its body's wheels laid down k times; a group recurses into its subexpression.
 static int add_node(struct build *b, struct rxe_node *nd)
@@ -330,6 +380,9 @@ static int add_node(struct build *b, struct rxe_node *nd)
 
     if (nd->is_dict)
         return bake_dict(b, nd);
+
+    if (nd->is_comb)
+        return add_perm(b, nd);
 
     if (nd->is_repeat && !nd->is_inf && nd->rep_max != RXE_REP_UNBOUNDED &&
         nd->rep_min == nd->rep_max && nd->rxe) {
@@ -433,7 +486,7 @@ static int collect(struct build *b, struct rxe *rxe)
     b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0; b->root = rxe;
     b->ops = NULL; b->nops = 0; b->cops = 0;
     b->gref = NULL; b->ngref = 0; b->grxe = NULL; b->ngroup = 0; b->has_backref = 0;
-    b->lr_active = 0;
+    b->lr_active = 0; b->perm_active = 0;
     if (find_refs(b, rxe)) return -1;
     if (add_rxe(b, rxe)) return -1;
     // A loop super-wheel renders a variable-length tail, so every pre/post wheel
@@ -673,6 +726,113 @@ static void emit_looprep_body(FILE *o, const struct build *B,
     if (acc) fputs("    *acc += n;\n", o);
 }
 
+// A compacting lay of alphabet table A<ai>'s alternative <dv> at buf[p],
+// advancing p by its real length -- fixed or variable width. Used by the
+// permutation body, where widths vary and the member is rebuilt each step.
+static void emit_compact_lay(FILE *o, int ai, const struct wheel *w, const char *dv)
+{
+    if (w->L == 1)
+        fprintf(o, "        buf[p++] = A%d[%s];\n", ai, dv);
+    else if (w->L > 1)
+        fprintf(o, "        memcpy(buf + p, A%d + %s*%d, %d); p += %d;\n",
+                ai, dv, w->L, w->L, w->L);
+    else
+        fprintf(o, "        { int o = A%do[%s], l = A%dl[%s];"
+                   " memcpy(buf + p, A%d + o, l); p += l; }\n", ai, dv, ai, dv, ai);
+}
+
+// The run() body for a pattern with an ordered permutation (re){{k!}}. The
+// choice is one super-wheel of radix P(n,k) sitting between the pre wheels
+// (more significant) and the post wheels (less significant), exactly the order
+// the interpreter walks a quantified group. A lane's rank r is unranked to k
+// distinct pool indices through the factorial number system -- position p takes
+// rank r/BLK[p] among the still-unused members, BLK[p] = P(n-1-p, k-1-p) baked
+// as a constant -- which reproduces rxenum -e's lexicographic-sequence order.
+// The member is rebuilt each step (pool widths may vary), which the hash-bound
+// keycracking sink hides; the step is a plain mixed-radix carry, post first.
+static void emit_perm_body(FILE *o, const struct build *B,
+                           int count, int match, int hash, int progress, int acc)
+{
+    int P = B->perm_at, nw = B->nw, Q = nw - P, k = B->perm_k;
+    const struct wheel *pre = B->w, *post = B->w + P, *pool = &B->perm_pool;
+    int n = pool->n;
+
+    unsigned long long PNK = 1;
+    for (int t = 0; t < k; t++) PNK *= (unsigned long long)(n - t);
+
+    // --- seed from 'from' (post least significant, then the choice, then pre) ---
+    fputs("    unsigned long long f = from;\n", o);
+    for (int i = Q - 1; i >= 0; i--)
+        fprintf(o, "    int q%d = f %% %d; f /= %d;\n", i, post[i].n, post[i].n);
+    fprintf(o, "    unsigned long long r = f %% %lluULL; f /= %lluULL;\n", PNK, PNK);
+    for (int i = P - 1; i >= 0; i--)
+        fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, pre[i].n, pre[i].n);
+    if (acc) fputs("    unsigned long long n = 0;\n", o);
+    fputs("    unsigned long long done = 0;\n", o);
+
+    // BLK[p] = P(n-1-p, k-1-p): the ways to fill the positions after p, so
+    // r/BLK[p] is p's rank among the members not yet used.
+    fprintf(o, "    static const unsigned long long BLK[%d] = {", k);
+    for (int p = 0; p < k; p++) {
+        unsigned long long blk = 1;
+        for (int t = 0; t < k - 1 - p; t++) blk *= (unsigned long long)(n - 1 - p - t);
+        fprintf(o, "%s%lluULL", p ? "," : "", blk);
+    }
+    fputs("};\n", o);
+    fprintf(o, "    int rem[%d], idx[%d];\n", n, k);
+
+    fputs("    for (;;) {\n", o);
+    // unrank r -> idx[0..k): pick the rank-th of the still-unused members, in
+    // ascending index order, and remove it -- the factorial number system.
+    fprintf(o, "        for (int t = 0; t < %d; t++) rem[t] = t;\n", n);
+    fprintf(o, "        { unsigned long long rr = r; int nrem = %d;\n", n);
+    fprintf(o, "          for (int p = 0; p < %d; p++) {\n", k);
+    fputs("              unsigned long long rank = rr / BLK[p]; rr %= BLK[p];\n"
+          "              idx[p] = rem[rank];\n"
+          "              for (int t = (int)rank; t < nrem - 1; t++) rem[t] = rem[t+1];\n"
+          "              nrem--;\n"
+          "          } }\n", o);
+
+    // --- lay the member: pre wheels, the k chosen pool members, post wheels ---
+    fputs("        int p = 0;\n", o);
+    for (int i = 0; i < P; i++) {
+        char dv[16]; snprintf(dv, sizeof dv, "i%d", i);
+        emit_compact_lay(o, i, &pre[i], dv);
+    }
+    fprintf(o, "        for (int pp = 0; pp < %d; pp++) {\n", k);
+    if (pool->L == 1)
+        fputs("            buf[p++] = PB[idx[pp]];\n", o);
+    else if (pool->L > 1)
+        fprintf(o, "            memcpy(buf + p, PB + idx[pp]*%d, %d); p += %d;\n",
+                pool->L, pool->L, pool->L);
+    else
+        fputs("            { int o = PO[idx[pp]], l = PL[idx[pp]];"
+              " memcpy(buf + p, PB + o, l); p += l; }\n", o);
+    fputs("        }\n", o);
+    for (int i = 0; i < Q; i++) {
+        char dv[16]; snprintf(dv, sizeof dv, "q%d", i);
+        emit_compact_lay(o, P + i, &post[i], dv);
+    }
+    fputs("        buf[p] = '\\n';\n", o);
+
+    emit_sink(o, 0, match, count, hash, "p", "p + 1");
+    fputs("        if (count && ++done == count) break;\n", o);
+    if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+
+    // --- step: a mixed-radix carry, post (least significant) then r then pre ---
+    fputs("        { int carry = 1;\n", o);
+    for (int i = Q - 1; i >= 0; i--)
+        fprintf(o, "          if (carry) { if (++q%d < %d) carry = 0; else q%d = 0; }\n",
+                i, post[i].n, i);
+    fprintf(o, "          if (carry) { if (++r < %lluULL) carry = 0; else r = 0; }\n", PNK);
+    for (int i = P - 1; i >= 0; i--)
+        fprintf(o, "          if (carry) { if (++i%d < %d) carry = 0; else i%d = 0; }\n",
+                i, pre[i].n, i);
+    fputs("          if (carry) break; }\n", o);
+    fputs("    }\n", o);
+    if (acc) fputs("    *acc += n;\n", o);
+}
+
 // The generated program. Its core is run(from, count): seed the odometer to
 // the member at index 'from' -- the mixed-radix digits of 'from', least
 // significant wheel first -- then step it, handing 'count' members to the sink
@@ -721,6 +881,10 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         variable = 1;
         for (int j = 0; j < B->lr_nsw; j++) if (B->lr_sw[j].L > 1) multi = 1;
     }
+    if (B->perm_active) {          // a permutation is rebuilt from indices each step
+        variable = 1;
+        if (B->perm_pool.L != 1) multi = 1;
+    }
 
     int wmax[MAXW];                             // each wheel's longest branch
     for (int i = 0; i < nw; i++) {
@@ -745,6 +909,15 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         for (int i = B->lr_at; i < nw; i++) QW += w[i].L;
         for (int j = 0; j < B->lr_nsw; j++) W += B->lr_sw[j].L;
         bufcap = PW + B->lr_b * W + QW;
+    }
+    if (B->perm_active) {         // the pool wheel is out of the op stream too
+        int PW = 0, QW = 0, poolmax = 0;
+        for (int i = 0; i < B->perm_at; i++) PW += wmax[i];
+        for (int i = B->perm_at; i < nw; i++) QW += wmax[i];
+        const struct wheel *pool = &B->perm_pool;
+        if (pool->L) poolmax = pool->L;
+        else for (int j = 0; j < pool->n; j++) if (pool->alen[j] > poolmax) poolmax = pool->alen[j];
+        bufcap = PW + B->perm_k * poolmax + QW;
     }
     int off[MAXW], TL = 0;
     if (!variable) for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; }
@@ -838,11 +1011,35 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
             fprintf(o, "%s%d", k ? "," : "", (unsigned char)s->base[k]);
         fputs("};\n", o);
     }
+    // The permutation's pool is its own table (PB), with offset/length tables
+    // (PO/PL) when its members are uneven -- an item is looked up by index.
+    if (B->perm_active) {
+        const struct wheel *pool = &B->perm_pool;
+        int bytes = pool->L ? pool->n * pool->L
+                            : pool->aoff[pool->n - 1] + pool->alen[pool->n - 1];
+        fputs("    static const unsigned char PB[] = {", o);
+        if (bytes == 0) fputs("0", o);
+        for (int j = 0; j < bytes; j++) fprintf(o, "%s%d", j ? "," : "", (unsigned char)pool->base[j]);
+        fputs("};\n", o);
+        if (pool->L == 0) {
+            fputs("    static const int PO[] = {", o);
+            for (int j = 0; j < pool->n; j++) fprintf(o, "%s%d", j ? "," : "", pool->aoff[j]);
+            fputs("};\n", o);
+            fputs("    static const int PL[] = {", o);
+            for (int j = 0; j < pool->n; j++) fprintf(o, "%s%d", j ? "," : "", pool->alen[j]);
+            fputs("};\n", o);
+        }
+    }
 
     fprintf(o, "    unsigned char buf[%d];\n", bufcap + 1);
 
     if (B->lr_active) {
         emit_looprep_body(o, B, count, match, hash, progress, acc);
+        fputs("}\n\n", o);
+        goto after_run;
+    }
+    if (B->perm_active) {
+        emit_perm_body(o, B, count, match, hash, progress, acc);
         fputs("}\n\n", o);
         goto after_run;
     }
@@ -1772,8 +1969,9 @@ int main(int argc, char **argv)
 "usage: %s [-S] [-n | -m file [-H md5|ntlm|sha1|sha256] | -d [-v]] [-j jobs] REGEX\n"
 "  Compile the set REGEX describes into C and run it, enumerating the members.\n"
 "  Handles any finite pattern -- masks, alternations, bounded repeats,\n"
-"  dictionaries, backreferences. Only an unbounded (infinite) repeat, or a set\n"
-"  too large to unroll, is declined, with a reason.\n"
+"  dictionaries, backreferences, ordered permutations (re){{k!}}. Only an\n"
+"  unbounded (infinite) repeat, or a set too large to unroll, is declined,\n"
+"  with a reason.\n"
 "    -S       print the generated C to stdout instead of compiling and running it.\n"
 "    -n       count the members rather than print them (times the walk, no I/O).\n"
 "    -m file  print only the members present in 'file' (one target per line):\n"
@@ -1835,6 +2033,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: cannot compile this pattern yet -- it has "
                 "a large variable-count repeat with the dedup sink.\n", prog);
         ret = 1;
+    } else if (b.perm_active && sink == SINK_DUP) {
+        fprintf(stderr, "%s: cannot compile this pattern yet -- it has "
+                "a permutation with the dedup sink.\n", prog);
+        ret = 1;
     } else {
         // The member total, baked in so the threaded count can split [0, N).
         // Left NULL when it overflows 64 bits, which keeps that count on one
@@ -1857,6 +2059,15 @@ int main(int argc, char **argv)
             mpz_mul(N, N, M);
             mpz_clear(Cz); mpz_clear(term); mpz_clear(M);
         }
+        if (b.perm_active) {
+            // Fold in the permutation super-wheel's radix P(n,k) = n(n-1)..(n-k+1).
+            mpz_t Pnk;
+            mpz_init_set_ui(Pnk, 1);
+            for (int t = 0; t < b.perm_k; t++)
+                mpz_mul_ui(Pnk, Pnk, (unsigned long)(b.perm_pool.n - t));
+            mpz_mul(N, N, Pnk);
+            mpz_clear(Pnk);
+        }
         char nbuf[32];
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
@@ -1869,7 +2080,11 @@ int main(int argc, char **argv)
         const char *gpu_no = NULL;
         int gpu_kind = 0;                       // 1 fixed mask, 2 loop repeat, 3 generic
         int gpu_G = 0, gpu_lowvar = 0;
-        if (gpu && b.lr_active) {
+        if (gpu && b.perm_active) {
+            // A permutation is a CPU path for now -- the factorial unrank per lane
+            // is not yet emitted for the GPU.
+            gpu_no = "a permutation (not yet on the GPU)";
+        } else if (gpu && b.lr_active) {
             // A loop repeat runs on the GPU split by length -- but only a bare,
             // single-wheel body for now ([a-z]{1,8}); surrounding or multi-wheel
             // structure is not yet handled and stays on the CPU.

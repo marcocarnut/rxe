@@ -277,6 +277,45 @@ fi
 declines '(a|bc){1,17}'    # uneven-length body, over the cap so it reaches the loop path
 declines '[a-z]{1,7}[0-9]{1,7}'   # two big variable-count repeats
 
+# An ordered permutation (re){{k!}} is a super-wheel like the loop repeat: k of
+# the pool's n members in every ordered choice, P(n,k) of them, in rxenum's
+# lexicographic-sequence order. same() checks the order and the count byte for
+# byte; pre/post fixed wheels and an uneven-width pool are exercised too.
+same '(a|b|c){{2!}}'          # P(3,2) = 6, the choose-2 shape
+same '(a|b|c){{3!}}'          # every ordering, 3! = 6
+same '(a|b|c){{*}}'           # {{*}} is the full permutation
+same '(cat|dog|fox){{2!}}'    # multi-byte equal-width members
+same '(ab|c|def){{2!}}'       # an uneven-width pool -> variable render
+same 'x(a|b|c){{2!}}z'        # pre and post fixed wheels around the choice
+same '(a|b|c){{2!}}[0-9]'     # a post odometer, less significant than the choice
+same '[a-z]{{2!}}'            # a bare class as the pool, P(26,2) = 650
+
+# The threaded count of a permutation is exact and thread-invariant, and the
+# seed decode (from > 0) lands each shard on the right ordering.
+pc=$("$RXEJIT" -n -j 1 '(a|b|c|d|e|f|g|h){{5!}}')
+pcb=$("$RXEJIT" -n -j 7 '(a|b|c|d|e|f|g|h){{5!}}')
+if [ "$pc" = "6720" ] && [ "$pcb" = "6720" ]; then pass=$((pass + 1)); else
+    printf 'FAIL  permutation count: -j1=%s -j7=%s (want P(8,5)=6720)\n' "$pc" "$pcb"; fail=$((fail + 1)); fi
+
+# Keycracking "known words, unknown order": recover the ordering whose md5 is the
+# target. Independent oracle: md5sum of the true ordering.
+if command -v md5sum >/dev/null 2>&1; then
+    pwant=$(printf '%s' horsebatterystaple | md5sum | cut -d' ' -f1)
+    printf '%s\n' "$pwant" > "$tmp/kh"
+    pgot=$("$RXEJIT" -m "$tmp/kh" -H md5 '(battery|horse|staple|correct){{3!}}' 2>/dev/null)
+    if [ "$pgot" = "$pwant:horsebatterystaple" ]; then pass=$((pass + 1)); else
+        printf 'FAIL  permutation keycrack\n        got [%s]\n' "$pgot"; fail=$((fail + 1)); fi
+fi
+
+# Not yet supported: an unordered combination {{k}}, a permutation size range,
+# the dedup sink, and the GPU path -- each must decline, not miscompile.
+declines '(a|b|c){{2}}'       # unordered combination
+declines '(a|b|c){{1,2!}}'    # a size range
+if "$RXEJIT" -d '(a|b|c){{2!}}' >/dev/null 2>&1
+then printf 'FAIL  -d should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+if "$RXEJIT" -G -m /dev/null -H md5 '(a|b|c){{2!}}' >/dev/null 2>&1
+then printf 'FAIL  -G should decline a permutation\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.
 dict_ok() {
