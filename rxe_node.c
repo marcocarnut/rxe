@@ -29,6 +29,7 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->is_repeat = 0;
     node->is_comb = 0;
     node->comb_perm = 0;
+    node->comb_chop = 0;
     mpz_init(node->comb_index);
     node->is_shuffle = 0;
     node->shuffle = NULL;

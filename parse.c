@@ -125,10 +125,10 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
 int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
                  enum rxe_parse_status *status);
 static const char *parse_choose_params(const char *str, int *lo, int *hi,
-                                       int *perm, int *star,
+                                       int *perm, int *star, int *chop,
                                        enum rxe_parse_status *status);
 static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
-                        int star, int flags, enum rxe_parse_status *status);
+                        int star, int chop, int flags, enum rxe_parse_status *status);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
@@ -418,12 +418,12 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
                       // result, for want of anywhere else to put it. There is
                       // somewhere else now.
                       if (*str == '{') {
-                          int c_lo,c_hi,c_perm,c_star;
+                          int c_lo,c_hi,c_perm,c_star,c_chop;
                           str2 = parse_choose_params(str+1,&c_lo,&c_hi,&c_perm,
-                                                     &c_star,&rxe->status);
+                                                     &c_star,&c_chop,&rxe->status);
                           if (!str2) return parse_done(x,n,p,str);
                           if (!build_choose(alt->tail,c_lo,c_hi,c_perm,c_star,
-                                            flags,&rxe->status))
+                                            c_chop,flags,&rxe->status))
                               return parse_done(x,n,p,str);
                       } else {
                           str2 = handle_repeats(alt,str,flags,&rxe->status);
@@ -859,14 +859,15 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
 // The parameters of a '{{...}}' combinatorial quantifier, 'str' pointing just
 // past the second '{'. Forms: '*' (all permutations), 'N', 'N,M' (combinations
 // of a size or a range) and the same with a trailing '!' (ordered, i.e.
-// permutations). Returns the pointer past the closing '}}', or NULL with the
-// status set.
+// permutations). A further trailing '?' quells the base's last node in the last
+// item -- the trailing-separator fix. Returns the pointer past the closing
+// '}}', or NULL with the status set.
 static const char *parse_choose_params(const char *str, int *lo, int *hi,
-                                       int *perm, int *star,
+                                       int *perm, int *star, int *chop,
                                        enum rxe_parse_status *status)
 {
     const char *p = str;
-    *perm = 0; *star = 0; *lo = 0; *hi = 0;
+    *perm = 0; *star = 0; *lo = 0; *hi = 0; *chop = 0;
     if (*p == '*') {
         *star = 1; *perm = 1; p++;
     } else {
@@ -887,16 +888,75 @@ static const char *parse_choose_params(const char *str, int *lo, int *hi,
         }
     }
     if (*p == '!') { *perm = 1; p++; }
+    if (*p == '?') { *chop = 1; p++; }
     if (p[0] != '}' || p[1] != '}') { *status = RXE_BAD_CHOOSE; return NULL; }
     if (!*star && *lo > *hi) { *status = RXE_BAD_CHOOSE; return NULL; }
     return p + 2;
+}
+
+// The fixed rendered width of a subexpression (every alternation the same fixed
+// width) or -1 if it varies. Used to size the '?' chop.
+static int node_render_width(struct rxe_node *node);
+static int rxe_fixed_width(struct rxe *rxe)
+{
+    int w = -1;
+    for (struct rxe_alt *a = rxe->head; a; a = a->next) {
+        int aw = 0;
+        for (struct rxe_node *n = a->head; n; n = n->next) {
+            int nw = node_render_width(n);
+            if (nw < 0) return -1;
+            aw += nw;
+        }
+        if (w < 0) w = aw; else if (w != aw) return -1;
+    }
+    return w;
+}
+
+// The fixed rendered width of one node, or -1 if it is not fixed-width. A
+// character class renders one byte; a dictionary is fixed only if its words are
+// all the same length; a group recurses; an exact {k} repeat is k copies. A
+// variable repeat, another choice, a backref, or an endless node is not fixed.
+static int node_render_width(struct rxe_node *node)
+{
+    if (node->is_inf || node->is_backref || node->is_comb || node->is_shuffle)
+        return -1;
+    if (node->is_repeat) {
+        if (node->rep_min != node->rep_max || !node->rxe) return -1;
+        int bw = rxe_fixed_width(node->rxe);
+        return bw < 0 ? -1 : bw * node->rep_min;
+    }
+    if (node->is_dict) {
+        int L = -1;
+        for (int i = 0; i < node->nwords; i++) {
+            int wl = (int)strlen(node->words[i]);
+            if (L < 0) L = wl; else if (L != wl) return -1;
+        }
+        return L < 0 ? 0 : L;
+    }
+    if (node->rxe) return rxe_fixed_width(node->rxe);   // a group
+    return node->len ? 1 : 0;                           // a character class
+}
+
+// The chop width of a '{{...?}}': every alternation of the base must end in a
+// node of the same fixed width -- the separator quelled from the last item.
+// Returns the width (>= 0), or -1 if it cannot be a fixed chop.
+static int choose_chop_width(struct rxe *base)
+{
+    int c = -1;
+    for (struct rxe_alt *a = base->head; a; a = a->next) {
+        if (!a->tail) return -1;                        // an empty branch
+        int w = node_render_width(a->tail);
+        if (w < 0) return -1;
+        if (c < 0) c = w; else if (c != w) return -1;   // branches disagree
+    }
+    return c;
 }
 
 // Turn the preceding node into a combination or permutation over its members.
 // Like build_repeat, it demotes whatever the node holds into a subexpression
 // first so the choice has one thing to index into. The base must be finite.
 static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
-                        int star, int flags, enum rxe_parse_status *status)
+                        int star, int chop, int flags, enum rxe_parse_status *status)
 {
     if (node->is_inf ||
         (node->rxe && !node->is_backref && rxe_is_infinite(node->rxe))) {
@@ -916,6 +976,11 @@ static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
         lo = hi = (int)mpz_get_ui(node->rxe->nitems);
     }
     rxe_comb_make(node,lo,hi,perm);
+    if (chop) {
+        int c = choose_chop_width(node->rxe);
+        if (c < 0) { *status = RXE_CHOP_VARIABLE; return 0; }
+        node->comb_chop = c;
+    }
     return 1;
 }
 

@@ -659,6 +659,18 @@ t_error '(a*){{2}}'  'combinatorial choice over an infinite set'
 t_error '{{2}}'      'nothing before quantifier'
 t_error '(a|b){{2,}}'  'bad combinatorial parameters'
 t_error '(a|b){{2,1}}' 'bad combinatorial parameters'
+# A trailing '?' quells the base's last node in the last item -- the separator
+# a joined choice would otherwise leave dangling. Rendering only: the count and
+# the order are unchanged, the last member just loses its trailing node.
+t_enum  '([a-c] ){{2!}}'    'a b /a c /b a /b c /c a /c b /'  # the dangling space
+t_enum  '([a-c] ){{2!?}}'   'a b/a c/b a/b c/c a/c b/'        # ...quelled
+t_count '([a-c] ){{2!?}}'   '6'                               # count unchanged
+t_enum  '([a-c] ){{2?}}'    'a b/a c/b c/'                    # combinations too
+t_enum  '([a-c] ){{1,2!?}}' 'a/b/c/a b/a c/b a/b c/c a/c b/'  # size 1 -> bare word
+t_enum  '([a-c](  )){{2!?}}' 'a  b/a  c/b  a/b  c/c  a/c  b/' # a 2-wide grouped sep
+t_opts  'b a/'  -z -f 2 '([a-c] ){{2!?}}'                     # seek is chop-aware
+# The '?' needs the last node to be fixed width, so a constant chop is defined.
+t_error '([a-c](x|yy)){{2!?}}' "the '?' of a combinatorial choice needs a fixed-width last node"
 
 echo "== per-subexpression shuffle, (?~key:re) =="
 # The group's members come out permuted by the key, but it is the same set: a

@@ -207,9 +207,18 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
                         ? rxe_seek_at_length(node->rxe,node->rep_len[i],
                                              node->rep_digit[i])
                         : rxe_seek(node->rxe,node->rep_digit[i])) break;
+                char *item = str;
                 new_str = rxe_current(str,maxlen,node->rxe);
                 maxlen -= new_str - str;
                 str = new_str;
+                // The '?' chop of a combinatorial choice: quell the base's last
+                // node in the last item -- the trailing separator. Only when it
+                // really is the last item and the buffer did not cut it short.
+                if (node->comb_chop && i == node->rep_count - 1
+                        && str - item >= node->comb_chop) {
+                    str    -= node->comb_chop;
+                    maxlen += node->comb_chop;
+                }
             }
         } else if (node->rxe) {
             char *new_str = rxe_current(str,maxlen,node->rxe);

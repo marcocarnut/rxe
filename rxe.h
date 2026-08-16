@@ -101,6 +101,8 @@
     X(RXE_UNKNOWN_DICT,                 "unknown dictionary")                  \
     X(RXE_BAD_CHOOSE,                   "bad combinatorial parameters")        \
     X(RXE_CHOOSE_INFINITE,              "combinatorial choice over an infinite set") \
+    X(RXE_CHOP_VARIABLE,                                                        \
+      "the '?' of a combinatorial choice needs a fixed-width last node")        \
     X(RXE_BAD_SHUFFLE,                  "unterminated shuffle key")            \
     X(RXE_SHUFFLE_INFINITE,             "shuffle key over an infinite set")    \
     X(RXE_TOO_BIG,                      "member too large to materialize")
@@ -193,6 +195,9 @@ struct rxe_node {
     int   is_repeat;              // True if this node is a repetition
     int   is_comb;                // True if this is a combination/permutation
     int   comb_perm;              // When is_comb: 1 ordered (perm), 0 unordered
+    int   comb_chop;              // When is_comb: bytes to quell from the last
+                                  //   item -- its base's last node, for {{...?}}
+                                  //   (0 = no '?'); the trailing-separator fix
     mpz_t comb_index;             // When is_comb or is_shuffle: current index
     int   is_shuffle;             // True if this group carries a shuffle key
     struct rxe_permutation *shuffle; // The keyed permutation, when is_shuffle
