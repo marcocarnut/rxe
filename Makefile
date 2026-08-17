@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 
-SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c graph.c foreach.c
-HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h rxe_graph.h
+SRC = rxenum.c rxe.c rxe_alt.c rxe_node.c parse.c bkreftbl.c permute.c repeat.c comb.c pair.c lens.c dict.c rank.c graph.c foreach.c rxe_lay.c
+HDR = rxe.h rxe_alt.h rxe_node.h parse.h bkreftbl.h repeat.h comb.h pair.h lens.h dict.h rxe_graph.h rxe_lay.h
 WARNFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 SANFLAGS = -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer
 
@@ -39,7 +39,7 @@ rxedup.o: rxedup.c rxe.h
 rxejit: rxejit.o librxe.a rxe.h
 	$(CC) rxejit.o -g -L. -lrxe -lgmp -lm -o rxejit
 
-rxejit.o: rxejit.c rxe.h rxejit_rt_embed.h rxejit_cl_embed.h
+rxejit.o: rxejit.c rxe.h rxe_lay.h rxejit_rt_embed.h rxejit_cl_embed.h
 
 # The runtime the generated enumerator links in line, turned into a C string so
 # rxejit can write it verbatim into each generated program. Kept as real C in
@@ -84,9 +84,10 @@ rank.o: rank.c rxe.h
 graph.o: graph.c rxe.h rxe_graph.h
 
 foreach.o: foreach.c rxe.h
+rxe_lay.o: rxe_lay.c rxe_lay.h rxe.h
 
-librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o
-	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o
+librxe.a: rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o rxe_lay.o
+	$(AR) rv librxe.a rxe.o rxe_alt.o rxe_node.o parse.o bkreftbl.o permute.o repeat.o comb.o pair.o lens.o dict.o rank.o graph.o foreach.o rxe_lay.o
 
 tests/api: tests/api.c librxe.a rxe.h
 	$(CC) $(WARNFLAGS) -I. tests/api.c librxe.a -lgmp -lm -o tests/api
