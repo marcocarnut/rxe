@@ -73,9 +73,9 @@ static void cl_md5_block(uint abcd[4], const uint M[16])
  * pad, not through a 64-byte buffer: when len is a compile-time constant (the
  * baked fixed path) every word past the candidate is a constant the compiler
  * folds into the round, and never lives in a register. */
-static void cl_md5(const uchar *msg, uint len, uchar out[16])
+static void cl_md5_abcd(const uchar *msg, uint len, uint abcd[4])
 {
-    uint abcd[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    abcd[0] = 0x67452301; abcd[1] = 0xefcdab89; abcd[2] = 0x98badcfe; abcd[3] = 0x10325476;
     uint M[16];
 #pragma unroll
     for (int w = 0; w < 14; w++) {
@@ -91,12 +91,27 @@ static void cl_md5(const uchar *msg, uint len, uchar out[16])
     M[14] = len * 8;                   /* one block: bit length fits 32 bits */
     M[15] = 0;
     cl_md5_block(abcd, M);
+}
+static void cl_md5(const uchar *msg, uint len, uchar out[16])
+{
+    uint abcd[4];
+    cl_md5_abcd(msg, len, abcd);
     for (int k = 0; k < 4; k++) {
         out[k*4]   = (uchar)(abcd[k]        & 0xff);
         out[k*4+1] = (uchar)((abcd[k] >> 8) & 0xff);
         out[k*4+2] = (uchar)((abcd[k] >> 16)& 0xff);
         out[k*4+3] = (uchar)((abcd[k] >> 24)& 0xff);
     }
+}
+/* The digest's first 32-bit word, big-endian (its first four bytes as a word).
+ * Only abcd[0] is read, so the compiler drops the rounds that finalise the rest
+ * -- a cheap early reject the host confirms by re-hashing. */
+static uint cl_be(uint x) { return (x << 24) | ((x & 0xff00u) << 8) | ((x >> 8) & 0xff00u) | (x >> 24); }
+static uint cl_md5_w0(const uchar *msg, uint len)
+{
+    uint abcd[4];
+    cl_md5_abcd(msg, len, abcd);
+    return cl_be(abcd[0]);
 }
 
 /* NTLM = MD4(UTF-16LE(candidate)). MD4 (RFC 1320) shares MD5's little-endian
@@ -136,9 +151,9 @@ static void cl_md4_block(uint abcd[4], const uint M[16])
  * UTF-16LE message words are built straight from the candidate: even byte
  * positions carry a candidate byte, odd positions the zero high byte, and the
  * pad/length fold into constants for a fixed length, exactly like cl_md5. */
-static void cl_ntlm(const uchar *msg, uint len, uchar out[16])
+static void cl_ntlm_abcd(const uchar *msg, uint len, uint abcd[4])
 {
-    uint abcd[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    abcd[0] = 0x67452301; abcd[1] = 0xefcdab89; abcd[2] = 0x98badcfe; abcd[3] = 0x10325476;
     uint elen = len * 2;
     uint M[16];
 #pragma unroll
@@ -156,12 +171,23 @@ static void cl_ntlm(const uchar *msg, uint len, uchar out[16])
     M[14] = elen * 8;
     M[15] = 0;
     cl_md4_block(abcd, M);
+}
+static void cl_ntlm(const uchar *msg, uint len, uchar out[16])
+{
+    uint abcd[4];
+    cl_ntlm_abcd(msg, len, abcd);
     for (int k = 0; k < 4; k++) {
         out[k*4]   = (uchar)(abcd[k]        & 0xff);
         out[k*4+1] = (uchar)((abcd[k] >> 8) & 0xff);
         out[k*4+2] = (uchar)((abcd[k] >> 16)& 0xff);
         out[k*4+3] = (uchar)((abcd[k] >> 24)& 0xff);
     }
+}
+static uint cl_ntlm_w0(const uchar *msg, uint len)
+{
+    uint abcd[4];
+    cl_ntlm_abcd(msg, len, abcd);
+    return cl_be(abcd[0]);
 }
 
 /* SHA-1 (RFC 3174), single block (len < 56). Big-endian words and digest, and
@@ -282,6 +308,23 @@ static int cl_tgt_has(__global const uchar *t, uint ntgt, const uchar dg[DGLEN])
             if (dg[i] != e[i]) { c = dg[i] < e[i] ? -1 : 1; break; }
         if (c == 0) return 1;
         if (c < 0) hi = mid - 1; else lo = mid + 1;
+    }
+    return 0;
+}
+
+/* First-word reject: is any target's first four bytes equal to w0 (big-endian)?
+ * The targets are sorted by their whole digest, so also by this leading word, so
+ * the same binary search works on one word. A match is only a candidate -- the
+ * host re-hashes to reject the ~ntgt/2^32-per-candidate false positives. */
+static int cl_tgt_has_w0(__global const uchar *t, uint ntgt, uint w0)
+{
+    int lo = 0, hi = (int)ntgt - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        __global const uchar *e = t + (uint)mid * DGLEN;
+        uint tw = ((uint)e[0] << 24) | ((uint)e[1] << 16) | ((uint)e[2] << 8) | (uint)e[3];
+        if (w0 == tw) return 1;
+        if (w0 < tw) hi = mid - 1; else lo = mid + 1;
     }
     return 0;
 }
