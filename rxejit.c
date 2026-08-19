@@ -116,12 +116,84 @@ static int wheel_distinct(const struct wheel *w)
     return d;
 }
 
+// A pure non-negative integer literal (a fixed member length), else -1 -- so the
+// baked single-block hash below fires only when the length is known at codegen.
+static int const_int(const char *s)
+{
+    if (!s || !*s) return -1;
+    for (const char *p = s; *p; p++) if (*p < '0' || *p > '9') return -1;
+    return atoi(s);
+}
+
+static const unsigned char MD5S[64] = {
+    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+static const unsigned MD5K[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+
+// A specialised MD5 for a compile-time member length (one block, len <= 55): the
+// message words are baked from buf with the 0x80 pad and the bit length folded
+// in as constants, and all 64 rounds are unrolled with K/S/g as literals -- no
+// call, no per-round branch, no M[]/K[]/S[] loads. This is the CPU twin of what
+// crack.js's JIT does; it's why a specialised kernel beats the general rt_md5.
+static void emit_md5_baked(FILE *o, int len)
+{
+    fprintf(o, "        { unsigned char dg[16]; unsigned int a,b,c,d,ff;\n");
+    for (int k = 0; k < 14; k++) {
+        char term[200]; term[0] = 0; int any = 0;
+        for (int t = 0; t < 4; t++) {
+            int pos = 4*k + t, sh = 8*t; char one[64];
+            if (pos < len) {
+                if (sh) snprintf(one, sizeof one, "((unsigned)buf[%d]<<%d)", pos, sh);
+                else    snprintf(one, sizeof one, "(unsigned)buf[%d]", pos);
+            } else if (pos == len) {
+                if (sh) snprintf(one, sizeof one, "(0x80u<<%d)", sh);
+                else    snprintf(one, sizeof one, "0x80u");
+            } else continue;
+            if (any) strcat(term, " | ");
+            strcat(term, one); any = 1;
+        }
+        fprintf(o, "          unsigned int m%d = %s;\n", k, any ? term : "0");
+    }
+    fprintf(o, "          unsigned int m14 = %du, m15 = 0u;\n", len * 8);
+    fprintf(o, "          a=0x67452301u; b=0xefcdab89u; c=0x98badcfeu; d=0x10325476u;\n");
+    for (int i = 0; i < 64; i++) {
+        int g = i < 16 ? i : i < 32 ? (5*i+1)&15 : i < 48 ? (3*i+5)&15 : (7*i)&15;
+        int s = MD5S[i];
+        const char *F = i < 16 ? "((b&c)|(~b&d))" : i < 32 ? "((d&b)|(~d&c))"
+                      : i < 48 ? "(b^c^d)" : "(c^(b|~d))";
+        fprintf(o, "          ff=(%s)+a+%uu+m%d; a=d; d=c; c=b; b=b+((ff<<%d)|(ff>>%d));\n",
+                F, MD5K[i], g, s, 32 - s);
+    }
+    fprintf(o, "          a+=0x67452301u; b+=0xefcdab89u; c+=0x98badcfeu; d+=0x10325476u;\n");
+    fprintf(o, "          dg[0]=(unsigned char)a;dg[1]=(unsigned char)(a>>8);dg[2]=(unsigned char)(a>>16);dg[3]=(unsigned char)(a>>24);\n");
+    fprintf(o, "          dg[4]=(unsigned char)b;dg[5]=(unsigned char)(b>>8);dg[6]=(unsigned char)(b>>16);dg[7]=(unsigned char)(b>>24);\n");
+    fprintf(o, "          dg[8]=(unsigned char)c;dg[9]=(unsigned char)(c>>8);dg[10]=(unsigned char)(c>>16);dg[11]=(unsigned char)(c>>24);\n");
+    fprintf(o, "          dg[12]=(unsigned char)d;dg[13]=(unsigned char)(d>>8);dg[14]=(unsigned char)(d>>16);dg[15]=(unsigned char)(d>>24);\n");
+    fprintf(o, "          if (rt_set_has(&TB, (const char *)dg, 16)) {\n"
+               "            pthread_mutex_lock(&MX);\n"
+               "            for (int h = 0; h < 16; h++) printf(\"%%02x\", dg[h]);\n"
+               "            putchar(':'); fwrite(buf, 1, %d, stdout); putchar('\\n');\n"
+               "            pthread_mutex_unlock(&MX); n++; } }\n", len);
+}
+
 // The per-member sink action, using 'len' as the member length expression (a
 // constant when fixed, "p" when variable) and 'lenp1' as length+1 for a write.
 static void emit_sink(FILE *o, int dup, int match, int count, int hash,
                       const char *len, const char *lenp1)
 {
     if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
+    else if (match && hash && const_int(len) >= 0 && const_int(len) <= 55 && !strcmp(HA->name, "md5"))
+                    emit_md5_baked(o, const_int(len));   // fixed length -> specialised inline MD5
     else if (match && hash)
                     fprintf(o, "        { unsigned char dg[%d]; %s(buf, %s, dg);\n"
                                "          if (rt_set_has(&TB, (const char *)dg, %d)) {\n"
