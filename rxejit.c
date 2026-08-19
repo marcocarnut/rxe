@@ -354,16 +354,20 @@ static void emit_fixed_scalar(FILE *o, const struct wheel *w, int nw, const int 
 // 'from'/'count' sharding and the hit output are unchanged. Fires only for md5,
 // single block (<=55B), with a width-1 low wheel; anything else stays scalar.
 static void emit_md5x8_fixed(FILE *o, const struct wheel *w, int nw, const int *off,
-                             int TL, int progress)
+                             int TL, int progress, int widen, const char *x8fn)
 {
     int last = nw - 1;
-    int vpos = TL - 1;                        // the low wheel's byte = last message byte
-    int vw = vpos / 4, vsh = 8 * (vpos % 4);  // its message word and byte shift (little-endian)
+    // The varying byte is the low wheel's candidate byte; under NTLM's UTF-16LE
+    // widening it lands at the doubled position in the block. Its message word
+    // and byte shift follow from there (little-endian, and the widened byte is
+    // even, so the shift is 0 or 16).
+    int vpos = widen ? 2 * (TL - 1) : (TL - 1);
+    int vw = vpos / 4, vsh = 8 * (vpos % 4);
     int off_last = off[last];
 
     fprintf(o, "        int low = i%d; const int R = %d;\n", last, w[last].n);
     fputs("        for (;;) {\n", o);
-    emit_msg_words(o, TL, 0, 0);              // m0..m15 baked from buf's higher bytes + pad + length
+    emit_msg_words(o, TL, 0, widen);          // m0..m15 baked from buf's higher bytes + pad + length
     fputs("          unsigned int MW[16] = { m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15 };\n", o);
     fprintf(o, "          unsigned int CVW = MW[%d] & ~(0xffu << %d);   /* the varying word, low byte cleared */\n", vw, vsh);
     fputs("          unsigned char lb[8];\n", o);
@@ -378,7 +382,7 @@ static void emit_md5x8_fixed(FILE *o, const struct wheel *w, int nw, const int *
     fprintf(o, "            for (int j = 0; j < batch; j++) lb[j] = A%d[low + j];\n", last);
     fputs("            for (int j = batch; j < 8; j++) lb[j] = lb[0];\n", o);
     fprintf(o, "            for (int j = 0; j < 8; j++) MSG[%d][j] = CVW | ((unsigned int)lb[j] << %d);\n", vw, vsh);
-    fputs("            rt_md5_x8((const unsigned int (*)[8])MSG, DG);\n", o);
+    fprintf(o, "            %s((const unsigned int (*)[8])MSG, DG);\n", x8fn);
     fputs("            for (int j = 0; j < batch; j++) {\n", o);
     fputs("              if (!rt_pre_hit(DG[0][j])) continue;   /* first-word reject: skips the extract+probe on a miss */\n", o);
     fputs("              unsigned char dg[16];\n", o);
@@ -1001,14 +1005,21 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         // AVX2 eight-way path when the CPU has AVX2, the scalar bake otherwise.
         // The scalar loop is the fallback either way, so nothing regresses where
         // the vector unit is absent.
-        int usex8 = match && hash && !strcmp(HA->name, "md5")
-                    && TL <= baked_maxlen("md5") && nw >= 1 && w[nw-1].L == 1;
+        // The AVX2 eight-way path takes md5 and ntlm (md4); both need a width-1
+        // low wheel (the lane dimension) and a single block. ntlm's block is the
+        // UTF-16LE-widened candidate, so its limit is halved (27, not 55) and its
+        // eight-way kernel and message layout carry the widening.
+        int isntlm = hash && !strcmp(HA->name, "ntlm");
+        int isx8hash = hash && (!strcmp(HA->name, "md5") || isntlm);
+        int usex8 = match && isx8hash && TL <= baked_maxlen(HA->name)
+                    && nw >= 1 && w[nw-1].L == 1;
         int is256 = hash && !strcmp(HA->name, "sha256");
         int useshani = match && hash && (is256 || !strcmp(HA->name, "sha1"))
                        && TL <= baked_maxlen(HA->name);
         if (usex8) {
             fputs("    if (rt_has_avx2()) {\n", o);
-            emit_md5x8_fixed(o, w, nw, off, TL, progress);
+            emit_md5x8_fixed(o, w, nw, off, TL, progress,
+                             isntlm, isntlm ? "rt_md4_x8" : "rt_md5_x8");
             fputs("    } else {\n", o);
             emit_fixed_scalar(o, w, nw, off, dup, match, count, hash, len, lenp1, progress);
             fputs("    }\n", o);

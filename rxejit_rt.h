@@ -248,6 +248,59 @@ static void rt_md5_x8(const unsigned int m[16][8], unsigned int out[4][8])
     _mm256_storeu_si256((__m256i *)out[3], _mm256_add_epi32(IVD, d));
 }
 
+/* ---- MD4 x8, AVX2 -- eight NTLM candidates at once ------------------------
+ * NTLM is MD4 of the UTF-16LE password; MD4 has the same eight-way parallelism
+ * as MD5 (no cross-candidate dependence, 48 rounds instead of 64). The caller
+ * bakes the sixteen message words per lane from the WIDENED block -- each
+ * candidate byte at an even position, zero high bytes between -- so m[word][lane]
+ * already carries the UTF-16LE layout; out[word][lane] is the little-endian a..d,
+ * the same the scalar bake ends with. Round order and shifts per RFC 1320, as in
+ * rt_md4_block. Rotates are by compile-time constants here, so immediate shifts.
+ */
+__attribute__((target("avx2")))
+static void rt_md4_x8(const unsigned int m[16][8], unsigned int out[4][8])
+{
+    __m256i M[16];
+    for (int i = 0; i < 16; i++) M[i] = _mm256_loadu_si256((const __m256i *)m[i]);
+    const __m256i IVA = _mm256_set1_epi32((int)0x67452301);
+    const __m256i IVB = _mm256_set1_epi32((int)0xefcdab89);
+    const __m256i IVC = _mm256_set1_epi32((int)0x98badcfe);
+    const __m256i IVD = _mm256_set1_epi32((int)0x10325476);
+    const __m256i KG  = _mm256_set1_epi32((int)0x5a827999);
+    const __m256i KH  = _mm256_set1_epi32((int)0x6ed9eba1);
+    __m256i a = IVA, b = IVB, c = IVC, d = IVD;
+#define V_ROTL(x, s) _mm256_or_si256(_mm256_slli_epi32(x, s), _mm256_srli_epi32(x, 32 - (s)))
+#define V_F(x,y,z) _mm256_or_si256(_mm256_and_si256(x, y), _mm256_andnot_si256(x, z))
+#define V_G(x,y,z) _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(x, y), _mm256_and_si256(x, z)), _mm256_and_si256(y, z))
+#define V_H(x,y,z) _mm256_xor_si256(_mm256_xor_si256(x, y), z)
+#define FF8(A,B,C,D,k,s) A = V_ROTL(_mm256_add_epi32(_mm256_add_epi32(A, V_F(B,C,D)), M[k]), s)
+#define GG8(A,B,C,D,k,s) A = V_ROTL(_mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(A, V_G(B,C,D)), M[k]), KG), s)
+#define HH8(A,B,C,D,k,s) A = V_ROTL(_mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(A, V_H(B,C,D)), M[k]), KH), s)
+    FF8(a,b,c,d,0,3);  FF8(d,a,b,c,1,7);  FF8(c,d,a,b,2,11);  FF8(b,c,d,a,3,19);
+    FF8(a,b,c,d,4,3);  FF8(d,a,b,c,5,7);  FF8(c,d,a,b,6,11);  FF8(b,c,d,a,7,19);
+    FF8(a,b,c,d,8,3);  FF8(d,a,b,c,9,7);  FF8(c,d,a,b,10,11); FF8(b,c,d,a,11,19);
+    FF8(a,b,c,d,12,3); FF8(d,a,b,c,13,7); FF8(c,d,a,b,14,11); FF8(b,c,d,a,15,19);
+    GG8(a,b,c,d,0,3);  GG8(d,a,b,c,4,5);  GG8(c,d,a,b,8,9);   GG8(b,c,d,a,12,13);
+    GG8(a,b,c,d,1,3);  GG8(d,a,b,c,5,5);  GG8(c,d,a,b,9,9);   GG8(b,c,d,a,13,13);
+    GG8(a,b,c,d,2,3);  GG8(d,a,b,c,6,5);  GG8(c,d,a,b,10,9);  GG8(b,c,d,a,14,13);
+    GG8(a,b,c,d,3,3);  GG8(d,a,b,c,7,5);  GG8(c,d,a,b,11,9);  GG8(b,c,d,a,15,13);
+    HH8(a,b,c,d,0,3);  HH8(d,a,b,c,8,9);  HH8(c,d,a,b,4,11);  HH8(b,c,d,a,12,15);
+    HH8(a,b,c,d,2,3);  HH8(d,a,b,c,10,9); HH8(c,d,a,b,6,11);  HH8(b,c,d,a,14,15);
+    HH8(a,b,c,d,1,3);  HH8(d,a,b,c,9,9);  HH8(c,d,a,b,5,11);  HH8(b,c,d,a,13,15);
+    HH8(a,b,c,d,3,3);  HH8(d,a,b,c,11,9); HH8(c,d,a,b,7,11);  HH8(b,c,d,a,15,15);
+#undef V_ROTL
+#undef V_F
+#undef V_G
+#undef V_H
+#undef FF8
+#undef GG8
+#undef HH8
+    _mm256_storeu_si256((__m256i *)out[0], _mm256_add_epi32(IVA, a));
+    _mm256_storeu_si256((__m256i *)out[1], _mm256_add_epi32(IVB, b));
+    _mm256_storeu_si256((__m256i *)out[2], _mm256_add_epi32(IVC, c));
+    _mm256_storeu_si256((__m256i *)out[3], _mm256_add_epi32(IVD, d));
+}
+
 /* ---- SHA-NI, for keycracking ----------------------------------------------
  * The Intel SHA extensions accelerate ONE stream: sha256rnds2 / sha1rnds4 each
  * fold several rounds into a single instruction, so a single candidate's hash
