@@ -139,51 +139,156 @@ static const unsigned MD5K[64] = {
     0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
     0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
     0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+static const unsigned SHA256K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
 
-// A specialised MD5 for a compile-time member length (one block, len <= 55): the
-// message words are baked from buf with the 0x80 pad and the bit length folded
-// in as constants, and all 64 rounds are unrolled with K/S/g as literals -- no
-// call, no per-round branch, no M[]/K[]/S[] loads. This is the CPU twin of what
-// crack.js's JIT does; it's why a specialised kernel beats the general rt_md5.
-static void emit_md5_baked(FILE *o, int len)
+// The specialised-hash family: for a compile-time member length (one block), the
+// 16 message words are baked from buf with the 0x80 pad and the 64-bit bit length
+// folded in as constants, and every round is unrolled with K/S/g literals -- no
+// call, no per-round branch, no M[]/K[]/S[] loads. The CPU twin of crack.js's
+// JIT; that specialisation is why it beats the general rt_* per candidate.
+
+// Emit `unsigned int m0..m15;`. be = big-endian words (sha) vs little (md5/md4).
+// widen = NTLM's UTF-16LE: each candidate byte b -> (b,0), so the block is 2*len.
+static void emit_msg_words(FILE *o, int len, int be, int widen)
 {
-    fprintf(o, "        { unsigned char dg[16]; unsigned int a,b,c,d,ff;\n");
+    int padPos = widen ? 2*len : len;
     for (int k = 0; k < 14; k++) {
-        char term[200]; term[0] = 0; int any = 0;
+        char term[256]; term[0] = 0; int any = 0;
         for (int t = 0; t < 4; t++) {
-            int pos = 4*k + t, sh = 8*t; char one[64];
-            if (pos < len) {
-                if (sh) snprintf(one, sizeof one, "((unsigned)buf[%d]<<%d)", pos, sh);
-                else    snprintf(one, sizeof one, "(unsigned)buf[%d]", pos);
-            } else if (pos == len) {
-                if (sh) snprintf(one, sizeof one, "(0x80u<<%d)", sh);
-                else    snprintf(one, sizeof one, "0x80u");
-            } else continue;
+            int pos = 4*k + t, sh = be ? 8*(3-t) : 8*t;
+            char one[96], val[48];
+            if (pos == padPos)     snprintf(val, sizeof val, "0x80u");
+            else if (pos > padPos) continue;
+            else if (widen)      { if (pos & 1) continue; snprintf(val, sizeof val, "(unsigned)buf[%d]", pos/2); }
+            else                   snprintf(val, sizeof val, "(unsigned)buf[%d]", pos);
+            if (sh) snprintf(one, sizeof one, "(%s<<%d)", val, sh);
+            else    snprintf(one, sizeof one, "%s", val);
             if (any) strcat(term, " | ");
             strcat(term, one); any = 1;
         }
         fprintf(o, "          unsigned int m%d = %s;\n", k, any ? term : "0");
     }
-    fprintf(o, "          unsigned int m14 = %du, m15 = 0u;\n", len * 8);
+    int bl = padPos * 8;
+    if (be) fprintf(o, "          unsigned int m14 = 0u, m15 = %du;\n", bl);
+    else    fprintf(o, "          unsigned int m14 = %du, m15 = 0u;\n", bl);
+}
+
+// Emit the digest bytes from the final words (big- or little-endian), then the
+// target-set lookup and the hit print -- the tail shared by every baked hash.
+static void emit_digest_match(FILE *o, const char *const *w, int nwords, int be, int dglen, int len)
+{
+    for (int i = 0; i < nwords; i++)
+        if (be) fprintf(o, "          dg[%d]=(unsigned char)(%s>>24);dg[%d]=(unsigned char)(%s>>16);dg[%d]=(unsigned char)(%s>>8);dg[%d]=(unsigned char)%s;\n",
+                        i*4, w[i], i*4+1, w[i], i*4+2, w[i], i*4+3, w[i]);
+        else    fprintf(o, "          dg[%d]=(unsigned char)%s;dg[%d]=(unsigned char)(%s>>8);dg[%d]=(unsigned char)(%s>>16);dg[%d]=(unsigned char)(%s>>24);\n",
+                        i*4, w[i], i*4+1, w[i], i*4+2, w[i], i*4+3, w[i]);
+    fprintf(o, "          if (rt_set_has(&TB, (const char *)dg, %d)) {\n"
+               "            pthread_mutex_lock(&MX);\n"
+               "            for (int h = 0; h < %d; h++) printf(\"%%02x\", dg[h]);\n"
+               "            putchar(':'); fwrite(buf, 1, %d, stdout); putchar('\\n');\n"
+               "            pthread_mutex_unlock(&MX); n++; } }\n", dglen, dglen, len);
+}
+
+static void emit_md5_baked(FILE *o, int len)
+{
+    fprintf(o, "        { unsigned char dg[16]; unsigned int a,b,c,d,ff;\n");
+    emit_msg_words(o, len, 0, 0);
     fprintf(o, "          a=0x67452301u; b=0xefcdab89u; c=0x98badcfeu; d=0x10325476u;\n");
     for (int i = 0; i < 64; i++) {
-        int g = i < 16 ? i : i < 32 ? (5*i+1)&15 : i < 48 ? (3*i+5)&15 : (7*i)&15;
-        int s = MD5S[i];
-        const char *F = i < 16 ? "((b&c)|(~b&d))" : i < 32 ? "((d&b)|(~d&c))"
-                      : i < 48 ? "(b^c^d)" : "(c^(b|~d))";
-        fprintf(o, "          ff=(%s)+a+%uu+m%d; a=d; d=c; c=b; b=b+((ff<<%d)|(ff>>%d));\n",
-                F, MD5K[i], g, s, 32 - s);
+        int g = i < 16 ? i : i < 32 ? (5*i+1)&15 : i < 48 ? (3*i+5)&15 : (7*i)&15, s = MD5S[i];
+        const char *F = i < 16 ? "((b&c)|(~b&d))" : i < 32 ? "((d&b)|(~d&c))" : i < 48 ? "(b^c^d)" : "(c^(b|~d))";
+        fprintf(o, "          ff=(%s)+a+%uu+m%d; a=d; d=c; c=b; b=b+((ff<<%d)|(ff>>%d));\n", F, MD5K[i], g, s, 32 - s);
     }
     fprintf(o, "          a+=0x67452301u; b+=0xefcdab89u; c+=0x98badcfeu; d+=0x10325476u;\n");
-    fprintf(o, "          dg[0]=(unsigned char)a;dg[1]=(unsigned char)(a>>8);dg[2]=(unsigned char)(a>>16);dg[3]=(unsigned char)(a>>24);\n");
-    fprintf(o, "          dg[4]=(unsigned char)b;dg[5]=(unsigned char)(b>>8);dg[6]=(unsigned char)(b>>16);dg[7]=(unsigned char)(b>>24);\n");
-    fprintf(o, "          dg[8]=(unsigned char)c;dg[9]=(unsigned char)(c>>8);dg[10]=(unsigned char)(c>>16);dg[11]=(unsigned char)(c>>24);\n");
-    fprintf(o, "          dg[12]=(unsigned char)d;dg[13]=(unsigned char)(d>>8);dg[14]=(unsigned char)(d>>16);dg[15]=(unsigned char)(d>>24);\n");
-    fprintf(o, "          if (rt_set_has(&TB, (const char *)dg, 16)) {\n"
-               "            pthread_mutex_lock(&MX);\n"
-               "            for (int h = 0; h < 16; h++) printf(\"%%02x\", dg[h]);\n"
-               "            putchar(':'); fwrite(buf, 1, %d, stdout); putchar('\\n');\n"
-               "            pthread_mutex_unlock(&MX); n++; } }\n", len);
+    static const char *W[4] = { "a","b","c","d" };
+    emit_digest_match(o, W, 4, 0, 16, len);
+}
+
+// NTLM: MD4 of the UTF-16LE plaintext. Three stages, destination register cycling
+// a,d,c,b; message order and shifts per RFC 1320 (as in rt_md4_block).
+static void emit_ntlm_baked(FILE *o, int len)
+{
+    fprintf(o, "        { unsigned char dg[16]; unsigned int a,b,c,d,ff;\n");
+    emit_msg_words(o, len, 0, 1);
+    fprintf(o, "          a=0x67452301u; b=0xefcdab89u; c=0x98badcfeu; d=0x10325476u;\n");
+    const char *R[4] = { "a","b","c","d" }; int dest[4] = { 0,3,2,1 };
+    int sF[4] = {3,7,11,19};
+    for (int j = 0; j < 16; j++) { int dp = dest[j%4]; const char *r = R[dp], *x = R[(dp+1)%4], *y = R[(dp+2)%4], *z = R[(dp+3)%4]; int s = sF[j%4];
+        fprintf(o, "          ff=%s+((%s&%s)|(~%s&%s))+m%d; %s=(ff<<%d)|(ff>>%d);\n", r, x,y,x,z, j, r, s, 32-s); }
+    int kG[16] = {0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15}, sG[4] = {3,5,9,13};
+    for (int j = 0; j < 16; j++) { int dp = dest[j%4]; const char *r = R[dp], *x = R[(dp+1)%4], *y = R[(dp+2)%4], *z = R[(dp+3)%4]; int s = sG[j%4];
+        fprintf(o, "          ff=%s+((%s&%s)|(%s&%s)|(%s&%s))+m%d+0x5a827999u; %s=(ff<<%d)|(ff>>%d);\n", r, x,y,x,z,y,z, kG[j], r, s, 32-s); }
+    int kH[16] = {0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15}, sH[4] = {3,9,11,15};
+    for (int j = 0; j < 16; j++) { int dp = dest[j%4]; const char *r = R[dp], *x = R[(dp+1)%4], *y = R[(dp+2)%4], *z = R[(dp+3)%4]; int s = sH[j%4];
+        fprintf(o, "          ff=%s+(%s^%s^%s)+m%d+0x6ed9eba1u; %s=(ff<<%d)|(ff>>%d);\n", r, x,y,z, kH[j], r, s, 32-s); }
+    fprintf(o, "          a+=0x67452301u; b+=0xefcdab89u; c+=0x98badcfeu; d+=0x10325476u;\n");
+    static const char *W[4] = { "a","b","c","d" };
+    emit_digest_match(o, W, 4, 0, 16, len);
+}
+
+static void emit_sha1_baked(FILE *o, int len)
+{
+    fprintf(o, "        { unsigned char dg[20]; unsigned int a,b,c,d,e,t;\n");
+    emit_msg_words(o, len, 1, 0);
+    for (int i = 0; i < 16; i++) fprintf(o, "          unsigned int w%d=m%d;\n", i, i);
+    for (int i = 16; i < 80; i++)
+        fprintf(o, "          unsigned int w%d; { unsigned int v=w%d^w%d^w%d^w%d; w%d=(v<<1)|(v>>31); }\n", i, i-3, i-8, i-14, i-16, i);
+    fprintf(o, "          a=0x67452301u;b=0xefcdab89u;c=0x98badcfeu;d=0x10325476u;e=0xc3d2e1f0u;\n");
+    for (int i = 0; i < 80; i++) {
+        const char *f; unsigned k;
+        if      (i < 20) { f = "((b&c)|(~b&d))";      k = 0x5a827999u; }
+        else if (i < 40) { f = "(b^c^d)";             k = 0x6ed9eba1u; }
+        else if (i < 60) { f = "((b&c)|(b&d)|(c&d))"; k = 0x8f1bbcdcu; }
+        else             { f = "(b^c^d)";             k = 0xca62c1d6u; }
+        fprintf(o, "          t=((a<<5)|(a>>27))+%s+e+%uu+w%d; e=d;d=c;c=(b<<30)|(b>>2);b=a;a=t;\n", f, k, i);
+    }
+    fprintf(o, "          unsigned int z0=0x67452301u+a,z1=0xefcdab89u+b,z2=0x98badcfeu+c,z3=0x10325476u+d,z4=0xc3d2e1f0u+e;\n");
+    static const char *W[5] = { "z0","z1","z2","z3","z4" };
+    emit_digest_match(o, W, 5, 1, 20, len);
+}
+
+static void emit_sha256_baked(FILE *o, int len)
+{
+    fprintf(o, "        { unsigned char dg[32]; unsigned int a,b,c,d,e,f,g,hh;\n");
+    emit_msg_words(o, len, 1, 0);
+    for (int i = 0; i < 16; i++) fprintf(o, "          unsigned int w%d=m%d;\n", i, i);
+    for (int i = 16; i < 64; i++)
+        fprintf(o, "          unsigned int w%d; { unsigned int x=w%d,y=w%d;"
+                   " unsigned int s0=((x>>7)|(x<<25))^((x>>18)|(x<<14))^(x>>3);"
+                   " unsigned int s1=((y>>17)|(y<<15))^((y>>19)|(y<<13))^(y>>10);"
+                   " w%d=w%d+s0+w%d+s1; }\n", i, i-15, i-2, i, i-16, i-7);
+    fprintf(o, "          a=0x6a09e667u;b=0xbb67ae85u;c=0x3c6ef372u;d=0xa54ff53au;"
+               "e=0x510e527fu;f=0x9b05688cu;g=0x1f83d9abu;hh=0x5be0cd19u;\n");
+    for (int i = 0; i < 64; i++)
+        fprintf(o, "          { unsigned int S1=((e>>6)|(e<<26))^((e>>11)|(e<<21))^((e>>25)|(e<<7));"
+                   " unsigned int ch=(e&f)^(~e&g); unsigned int t1=hh+S1+ch+%uu+w%d;"
+                   " unsigned int S0=((a>>2)|(a<<30))^((a>>13)|(a<<19))^((a>>22)|(a<<10));"
+                   " unsigned int maj=(a&b)^(a&c)^(b&c); unsigned int t2=S0+maj;"
+                   " hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }\n", SHA256K[i], i);
+    fprintf(o, "          unsigned int z0=0x6a09e667u+a,z1=0xbb67ae85u+b,z2=0x3c6ef372u+c,z3=0xa54ff53au+d,"
+               "z4=0x510e527fu+e,z5=0x9b05688cu+f,z6=0x1f83d9abu+g,z7=0x5be0cd19u+hh;\n");
+    static const char *W[8] = { "z0","z1","z2","z3","z4","z5","z6","z7" };
+    emit_digest_match(o, W, 8, 1, 32, len);
+}
+
+// Longest member the single-block bake handles: 55 bytes, or 27 for NTLM (its
+// UTF-16LE widening doubles the block). Beyond it, the general rt_* runs.
+static int baked_maxlen(const char *name) { return !strcmp(name, "ntlm") ? 27 : 55; }
+
+static void emit_hash_baked(FILE *o, const char *name, int len)
+{
+    if      (!strcmp(name, "md5"))  emit_md5_baked(o, len);
+    else if (!strcmp(name, "ntlm")) emit_ntlm_baked(o, len);
+    else if (!strcmp(name, "sha1")) emit_sha1_baked(o, len);
+    else                            emit_sha256_baked(o, len);
 }
 
 // The per-member sink action, using 'len' as the member length expression (a
@@ -192,8 +297,8 @@ static void emit_sink(FILE *o, int dup, int match, int count, int hash,
                       const char *len, const char *lenp1)
 {
     if (dup)        fprintf(o, "        rt_dup_add(d, (const char *)buf, %s);\n", len);
-    else if (match && hash && const_int(len) >= 0 && const_int(len) <= 55 && !strcmp(HA->name, "md5"))
-                    emit_md5_baked(o, const_int(len));   // fixed length -> specialised inline MD5
+    else if (match && hash && const_int(len) >= 0 && const_int(len) <= baked_maxlen(HA->name))
+                    emit_hash_baked(o, HA->name, const_int(len));   // fixed length -> specialised inline hash
     else if (match && hash)
                     fprintf(o, "        { unsigned char dg[%d]; %s(buf, %s, dg);\n"
                                "          if (rt_set_has(&TB, (const char *)dg, %d)) {\n"
