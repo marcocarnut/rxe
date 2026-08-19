@@ -314,6 +314,97 @@ static void emit_sink(FILE *o, int dup, int match, int count, int hash,
     else            fprintf(o, "        fwrite(buf, 1, %s, stdout);\n", lenp1);
 }
 
+// The fixed-width odometer, scalar: lay once, then a loop that sinks the member
+// and delta-patches only the byte(s) that turned. Factored out so the AVX2 path
+// can offer it as the runtime fallback. 'n' and 'done' are declared by the
+// caller; *acc += n is added once after, whichever branch ran.
+static void emit_fixed_scalar(FILE *o, const struct wheel *w, int nw, const int *off,
+                              int dup, int match, int count, int hash,
+                              const char *len, const char *lenp1, int progress)
+{
+    fputs("    for (;;) {\n", o);
+    emit_sink(o, dup, match, count, hash, len, lenp1);
+    fputs("        if (count && ++done == count) break;\n", o);
+    if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+    for (int i = nw - 1; i >= 0; i--) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
+        emit_lay(o, i, off[i], w[i].L, e);
+        fprintf(o, " continue; } i%d = 0; ", i);
+        emit_lay(o, i, off[i], w[i].L, "0");
+        fputc('\n', o);
+    }
+    fputs("        break;\n    }\n", o);
+}
+
+// The fixed-width odometer, AVX2: MD5 has no data dependence between candidates,
+// so eight run at once in the eight lanes of rt_md5_x8. The least significant
+// wheel (a width-1 class, the last member byte) is the lane dimension -- eight
+// consecutive settings of it differ only in that one byte, so fifteen of the
+// sixteen message words are shared across the lanes and only the low byte ramps.
+// The higher wheels ride the outer odometer exactly as the scalar path does, so
+// 'from'/'count' sharding and the hit output are unchanged. Fires only for md5,
+// single block (<=55B), with a width-1 low wheel; anything else stays scalar.
+static void emit_md5x8_fixed(FILE *o, const struct wheel *w, int nw, const int *off,
+                             int TL, int progress)
+{
+    int last = nw - 1;
+    int vpos = TL - 1;                        // the low wheel's byte = last message byte
+    int vw = vpos / 4, vsh = 8 * (vpos % 4);  // its message word and byte shift (little-endian)
+    int off_last = off[last];
+
+    fprintf(o, "        int low = i%d; const int R = %d;\n", last, w[last].n);
+    fputs("        for (;;) {\n", o);
+    emit_msg_words(o, TL, 0, 0);              // m0..m15 baked from buf's higher bytes + pad + length
+    fputs("          unsigned int MW[16] = { m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15 };\n", o);
+    fprintf(o, "          unsigned int CVW = MW[%d] & ~(0xffu << %d);   /* the varying word, low byte cleared */\n", vw, vsh);
+    fputs("          unsigned char lb[8];\n", o);
+    // The fifteen shared words are the same for every batch of this outer step
+    // (only the low wheel turns), so broadcast them into MSG once here; the
+    // per-batch work is then just the one varying word and the compression.
+    fputs("          unsigned int MSG[16][8], DG[4][8];\n", o);
+    fputs("          for (int wi = 0; wi < 16; wi++) { unsigned int cw = MW[wi]; for (int j = 0; j < 8; j++) MSG[wi][j] = cw; }\n", o);
+    fputs("          while (low < R) {\n", o);
+    fputs("            int batch = R - low; if (batch > 8) batch = 8;\n", o);
+    fputs("            if (count) { unsigned long long rem = count - done; if ((unsigned long long)batch > rem) batch = (int)rem; }\n", o);
+    fprintf(o, "            for (int j = 0; j < batch; j++) lb[j] = A%d[low + j];\n", last);
+    fputs("            for (int j = batch; j < 8; j++) lb[j] = lb[0];\n", o);
+    fprintf(o, "            for (int j = 0; j < 8; j++) MSG[%d][j] = CVW | ((unsigned int)lb[j] << %d);\n", vw, vsh);
+    fputs("            rt_md5_x8((const unsigned int (*)[8])MSG, DG);\n", o);
+    fputs("            for (int j = 0; j < batch; j++) {\n", o);
+    fputs("              unsigned char dg[16];\n", o);
+    fputs("              dg[0]=(unsigned char)DG[0][j];dg[1]=(unsigned char)(DG[0][j]>>8);dg[2]=(unsigned char)(DG[0][j]>>16);dg[3]=(unsigned char)(DG[0][j]>>24);\n", o);
+    fputs("              dg[4]=(unsigned char)DG[1][j];dg[5]=(unsigned char)(DG[1][j]>>8);dg[6]=(unsigned char)(DG[1][j]>>16);dg[7]=(unsigned char)(DG[1][j]>>24);\n", o);
+    fputs("              dg[8]=(unsigned char)DG[2][j];dg[9]=(unsigned char)(DG[2][j]>>8);dg[10]=(unsigned char)(DG[2][j]>>16);dg[11]=(unsigned char)(DG[2][j]>>24);\n", o);
+    fputs("              dg[12]=(unsigned char)DG[3][j];dg[13]=(unsigned char)(DG[3][j]>>8);dg[14]=(unsigned char)(DG[3][j]>>16);dg[15]=(unsigned char)(DG[3][j]>>24);\n", o);
+    fputs("              if (rt_set_has(&TB, (const char *)dg, 16)) {\n", o);
+    fputs("                pthread_mutex_lock(&MX);\n", o);
+    fputs("                for (int h = 0; h < 16; h++) printf(\"%02x\", dg[h]);\n", o);
+    fprintf(o, "                putchar(':'); buf[%d] = A%d[low + j]; fwrite(buf, 1, %d, stdout); putchar('\\n');\n", off_last, last, TL);
+    fputs("                pthread_mutex_unlock(&MX); n++; }\n", o);
+    fputs("            }\n", o);
+    fputs("            done += batch; low += batch;\n", o);
+    if (progress) fputs("            if ((done & 0xffff) < 8) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+    fputs("            if (count && done == count) goto X8DONE;\n", o);
+    fputs("          }\n", o);
+    // the low wheel is spent: reset it, then ripple the carry through the higher
+    // wheels (least significant first), stopping at the first that does not roll.
+    fprintf(o, "          low = 0; i%d = 0; buf[%d] = A%d[0];\n", last, off_last, last);
+    fputs("          int carried = 0;\n          do {\n", o);
+    for (int i = nw - 2; i >= 0; i--) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fprintf(o, "            if (++i%d < %d) { ", i, w[i].n);
+        emit_lay(o, i, off[i], w[i].L, e);
+        fprintf(o, " carried = 1; break; } i%d = 0; ", i);
+        emit_lay(o, i, off[i], w[i].L, "0");
+        fputc('\n', o);
+    }
+    fputs("          } while (0);\n", o);
+    fputs("          if (!carried) break;\n", o);
+    fputs("        }\n", o);
+    fputs("      X8DONE: ;\n", o);
+}
+
 // The run() body for a pattern with a loop repeat X{a,b}. The repeat is one
 // super-wheel of the outer odometer: pre wheels are the digits above it, post
 // wheels the digits below, exactly the order the interpreter walks an embedded
@@ -852,19 +943,21 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
             char e[16]; snprintf(e, sizeof e, "i%d", i);
             fputs("    ", o); emit_lay(o, i, off[i], w[i].L, e); fputc('\n', o);
         }
-        fputs("    for (;;) {\n", o);
-        emit_sink(o, dup, match, count, hash, len, lenp1);
-        fputs("        if (count && ++done == count) break;\n", o);
-        if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
-        for (int i = nw - 1; i >= 0; i--) {
-            char e[16]; snprintf(e, sizeof e, "i%d", i);
-            fprintf(o, "        if (++i%d < %d) { ", i, w[i].n);
-            emit_lay(o, i, off[i], w[i].L, e);
-            fprintf(o, " continue; } i%d = 0; ", i);
-            emit_lay(o, i, off[i], w[i].L, "0");
-            fputc('\n', o);
+        // MD5 keycrack over a single-block set with a width-1 low wheel gets the
+        // AVX2 eight-way path when the CPU has AVX2, the scalar bake otherwise.
+        // The scalar loop is the fallback either way, so nothing regresses where
+        // the vector unit is absent.
+        int usex8 = match && hash && !strcmp(HA->name, "md5")
+                    && TL <= baked_maxlen("md5") && nw >= 1 && w[nw-1].L == 1;
+        if (usex8) {
+            fputs("    if (rt_has_avx2()) {\n", o);
+            emit_md5x8_fixed(o, w, nw, off, TL, progress);
+            fputs("    } else {\n", o);
+            emit_fixed_scalar(o, w, nw, off, dup, match, count, hash, len, lenp1, progress);
+            fputs("    }\n", o);
+        } else {
+            emit_fixed_scalar(o, w, nw, off, dup, match, count, hash, len, lenp1, progress);
         }
-        fputs("        break;\n    }\n", o);
         if (acc) fputs("    *acc += n;\n", o);
     } else {
         // Variable width: a goto-threaded odometer. Each wheel keeps its current
