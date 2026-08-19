@@ -247,8 +247,171 @@ static void rt_md5_x8(const unsigned int m[16][8], unsigned int out[4][8])
     _mm256_storeu_si256((__m256i *)out[2], _mm256_add_epi32(IVC, c));
     _mm256_storeu_si256((__m256i *)out[3], _mm256_add_epi32(IVD, d));
 }
+
+/* ---- SHA-NI, for keycracking ----------------------------------------------
+ * The Intel SHA extensions accelerate ONE stream: sha256rnds2 / sha1rnds4 each
+ * fold several rounds into a single instruction, so a single candidate's hash
+ * costs a handful of ops instead of 64/80 unrolled rounds. Unlike md5-x8 this
+ * is not eight-wide -- it makes the per-candidate hash cheap rather than doing
+ * many at once. Single 64-byte block: the caller preloads state with the IV and
+ * hands over the padded block; the digest is the state words on return, the
+ * same big-endian a..h / a..e the scalar blocks produce. Gate every use with
+ * rt_has_sha(). Canonical public-domain sequences (Gulley/Walton).
+ */
+static int rt_has_sha(void) { return __builtin_cpu_supports("sha"); }
+
+__attribute__((target("sha,sse4.1")))
+static void rt_sha256_ni_block(unsigned int state[8], const unsigned char data[64])
+{
+    __m128i STATE0, STATE1, MSG, TMP, MSG0, MSG1, MSG2, MSG3, ABEF_SAVE, CDGH_SAVE;
+    const __m128i MASK = _mm_set_epi64x(0x0c0d0e0f08090a0bULL, 0x0405060700010203ULL);
+
+    TMP    = _mm_loadu_si128((const __m128i *)&state[0]);   /* A B C D */
+    STATE1 = _mm_loadu_si128((const __m128i *)&state[4]);   /* E F G H */
+    TMP    = _mm_shuffle_epi32(TMP, 0xB1);                  /* C D A B */
+    STATE1 = _mm_shuffle_epi32(STATE1, 0x1B);              /* H G F E */
+    STATE0 = _mm_alignr_epi8(TMP, STATE1, 8);              /* A B E F */
+    STATE1 = _mm_blend_epi16(STATE1, TMP, 0xF0);          /* C D G H */
+    ABEF_SAVE = STATE0; CDGH_SAVE = STATE1;
+
+    MSG0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+0)), MASK);
+    MSG  = _mm_add_epi32(MSG0, _mm_set_epi64x(0xE9B5DBA5B5C0FBCFULL, 0x71374491428A2F98ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+
+    MSG1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+16)), MASK);
+    MSG  = _mm_add_epi32(MSG1, _mm_set_epi64x(0xAB1C5ED5923F82A4ULL, 0x59F111F13956C25BULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+    MSG0 = _mm_sha256msg1_epu32(MSG0, MSG1);
+
+    MSG2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+32)), MASK);
+    MSG  = _mm_add_epi32(MSG2, _mm_set_epi64x(0x550C7DC3243185BEULL, 0x12835B01D807AA98ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+    MSG1 = _mm_sha256msg1_epu32(MSG1, MSG2);
+
+    MSG3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+48)), MASK);
+    MSG  = _mm_add_epi32(MSG3, _mm_set_epi64x(0xC19BF1749BDC06A7ULL, 0x80DEB1FE72BE5D74ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP  = _mm_alignr_epi8(MSG3, MSG2, 4);
+    MSG0 = _mm_sha256msg2_epu32(_mm_add_epi32(MSG0, TMP), MSG3);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+    MSG2 = _mm_sha256msg1_epu32(MSG2, MSG3);
+
+    /* Rounds 16-51: current word Ma, next Mb (gets msg2), previous Md (alignr
+     * source and msg1 target). The message words cycle MSG0->1->2->3->0. */
+#define RT_SHA256_STEP(Ma, Mb, Md, KK) \
+    MSG  = _mm_add_epi32(Ma, _mm_set_epi64x KK); \
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG); \
+    TMP  = _mm_alignr_epi8(Ma, Md, 4); \
+    Mb   = _mm_sha256msg2_epu32(_mm_add_epi32(Mb, TMP), Ma); \
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E)); \
+    Md   = _mm_sha256msg1_epu32(Md, Ma)
+    RT_SHA256_STEP(MSG0, MSG1, MSG3, (0x240CA1CC0FC19DC6ULL, 0xEFBE4786E49B69C1ULL)); /* 16-19 */
+    RT_SHA256_STEP(MSG1, MSG2, MSG0, (0x76F988DA5CB0A9DCULL, 0x4A7484AA2DE92C6FULL)); /* 20-23 */
+    RT_SHA256_STEP(MSG2, MSG3, MSG1, (0xBF597FC7B00327C8ULL, 0xA831C66D983E5152ULL)); /* 24-27 */
+    RT_SHA256_STEP(MSG3, MSG0, MSG2, (0x1429296706CA6351ULL, 0xD5A79147C6E00BF3ULL)); /* 28-31 */
+    RT_SHA256_STEP(MSG0, MSG1, MSG3, (0x53380D134D2C6DFCULL, 0x2E1B213827B70A85ULL)); /* 32-35 */
+    RT_SHA256_STEP(MSG1, MSG2, MSG0, (0x92722C8581C2C92EULL, 0x766A0ABB650A7354ULL)); /* 36-39 */
+    RT_SHA256_STEP(MSG2, MSG3, MSG1, (0xC76C51A3C24B8B70ULL, 0xA81A664BA2BFE8A1ULL)); /* 40-43 */
+    RT_SHA256_STEP(MSG3, MSG0, MSG2, (0x106AA070F40E3585ULL, 0xD6990624D192E819ULL)); /* 44-47 */
+    RT_SHA256_STEP(MSG0, MSG1, MSG3, (0x34B0BCB52748774CULL, 0x1E376C0819A4C116ULL)); /* 48-51 */
+#undef RT_SHA256_STEP
+    /* 52-55: msg1 no longer needed */
+    MSG  = _mm_add_epi32(MSG1, _mm_set_epi64x(0x682E6FF35B9CCA4FULL, 0x4ED8AA4A391C0CB3ULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP  = _mm_alignr_epi8(MSG1, MSG0, 4);
+    MSG2 = _mm_sha256msg2_epu32(_mm_add_epi32(MSG2, TMP), MSG1);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+    /* 56-59 */
+    MSG  = _mm_add_epi32(MSG2, _mm_set_epi64x(0x8CC7020884C87814ULL, 0x78A5636F748F82EEULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    TMP  = _mm_alignr_epi8(MSG2, MSG1, 4);
+    MSG3 = _mm_sha256msg2_epu32(_mm_add_epi32(MSG3, TMP), MSG2);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+    /* 60-63 */
+    MSG  = _mm_add_epi32(MSG3, _mm_set_epi64x(0xC67178F2BEF9A3F7ULL, 0xA4506CEB90BEFFFAULL));
+    STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
+    STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, _mm_shuffle_epi32(MSG, 0x0E));
+
+    STATE0 = _mm_add_epi32(STATE0, ABEF_SAVE);
+    STATE1 = _mm_add_epi32(STATE1, CDGH_SAVE);
+    TMP    = _mm_shuffle_epi32(STATE0, 0x1B);              /* F E B A */
+    STATE1 = _mm_shuffle_epi32(STATE1, 0xB1);             /* D C H G */
+    STATE0 = _mm_blend_epi16(TMP, STATE1, 0xF0);         /* D C B A */
+    STATE1 = _mm_alignr_epi8(STATE1, TMP, 8);            /* A B E F -> H G F E */
+    _mm_storeu_si128((__m128i *)&state[0], STATE0);
+    _mm_storeu_si128((__m128i *)&state[4], STATE1);
+}
+
+__attribute__((target("sha,sse4.1")))
+static void rt_sha1_ni_block(unsigned int state[5], const unsigned char data[64])
+{
+    __m128i ABCD, E0, E1, MSG0, MSG1, MSG2, MSG3, ABCD_SAVE, E0_SAVE;
+    const __m128i MASK = _mm_set_epi64x(0x0001020304050607ULL, 0x08090a0b0c0d0e0fULL);
+
+    ABCD = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)state), 0x1B);
+    E0   = _mm_set_epi32((int)state[4], 0, 0, 0);
+    ABCD_SAVE = ABCD; E0_SAVE = E0;
+
+    MSG0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+0)),  MASK);
+    MSG1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+16)), MASK);
+    MSG2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+32)), MASK);
+    MSG3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(data+48)), MASK);
+
+    E0 = _mm_add_epi32(E0, MSG0); E1 = ABCD;                              /* 0-3 */
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    E1 = _mm_sha1nexte_epu32(E1, MSG1); E0 = ABCD;                        /* 4-7 */
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0); MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    E0 = _mm_sha1nexte_epu32(E0, MSG2); E1 = ABCD;                        /* 8-11 */
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0); MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+#define RT_SHA1_STEP(Ea, Eb, Ma, Mb, Mc, Md, K) \
+    Eb = _mm_sha1nexte_epu32(Eb, Md); Ea = ABCD; \
+    Ma = _mm_sha1msg2_epu32(Ma, Md); \
+    ABCD = _mm_sha1rnds4_epu32(ABCD, Eb, K); \
+    Mc = _mm_sha1msg1_epu32(Mc, Md); Mb = _mm_xor_si128(Mb, Md)
+    RT_SHA1_STEP(E0, E1, MSG0, MSG1, MSG2, MSG3, 0); /* 12-15 */
+    RT_SHA1_STEP(E1, E0, MSG1, MSG2, MSG3, MSG0, 0); /* 16-19 */
+    RT_SHA1_STEP(E0, E1, MSG2, MSG3, MSG0, MSG1, 1); /* 20-23 */
+    RT_SHA1_STEP(E1, E0, MSG3, MSG0, MSG1, MSG2, 1); /* 24-27 */
+    RT_SHA1_STEP(E0, E1, MSG0, MSG1, MSG2, MSG3, 1); /* 28-31 */
+    RT_SHA1_STEP(E1, E0, MSG1, MSG2, MSG3, MSG0, 1); /* 32-35 */
+    RT_SHA1_STEP(E0, E1, MSG2, MSG3, MSG0, MSG1, 1); /* 36-39 */
+    RT_SHA1_STEP(E1, E0, MSG3, MSG0, MSG1, MSG2, 2); /* 40-43 */
+    RT_SHA1_STEP(E0, E1, MSG0, MSG1, MSG2, MSG3, 2); /* 44-47 */
+    RT_SHA1_STEP(E1, E0, MSG1, MSG2, MSG3, MSG0, 2); /* 48-51 */
+    RT_SHA1_STEP(E0, E1, MSG2, MSG3, MSG0, MSG1, 2); /* 52-55 */
+    RT_SHA1_STEP(E1, E0, MSG3, MSG0, MSG1, MSG2, 2); /* 56-59 */
+#undef RT_SHA1_STEP
+    E1 = _mm_sha1nexte_epu32(E1, MSG3); E0 = ABCD;                        /* 60-63 */
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3); MSG1 = _mm_xor_si128(MSG1, MSG3);
+    E0 = _mm_sha1nexte_epu32(E0, MSG0); E1 = ABCD;                        /* 64-67 */
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0); MSG2 = _mm_xor_si128(MSG2, MSG0);
+    E1 = _mm_sha1nexte_epu32(E1, MSG1); E0 = ABCD;                        /* 68-71 */
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3); MSG3 = _mm_xor_si128(MSG3, MSG1);
+    E0 = _mm_sha1nexte_epu32(E0, MSG2); E1 = ABCD;                        /* 72-75 */
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+    E1 = _mm_sha1nexte_epu32(E1, MSG3); E0 = ABCD;                        /* 76-79 */
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+
+    E0   = _mm_sha1nexte_epu32(E0, E0_SAVE);
+    ABCD = _mm_add_epi32(ABCD, ABCD_SAVE);
+    ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
+    _mm_storeu_si128((__m128i *)state, ABCD);
+    state[4] = (unsigned)_mm_extract_epi32(E0, 3);
+}
 #else
 static int rt_has_avx2(void) { return 0; }
+static int rt_has_sha(void)  { return 0; }
 #endif
 
 /* ---- MD4 / NTLM, for keycracking ------------------------------------------

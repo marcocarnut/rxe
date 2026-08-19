@@ -414,6 +414,51 @@ static void emit_md5x8_fixed(FILE *o, const struct wheel *w, int nw, const int *
     fputs("      X8DONE: ;\n", o);
 }
 
+// The fixed-width odometer for sha1/sha256 on SHA-NI hardware. Unlike md5-x8
+// this is a single stream: sha256rnds2/sha1rnds4 fold several rounds into one
+// instruction, so a candidate's hash costs a handful of ops. The odometer is
+// the scalar one; only the sink changes -- a 64-byte block (pad and big-endian
+// length preset once, the member refreshed each step), the hardware compressor
+// over the IV, then the first-word reject and the exact probe. is256 picks the
+// hash. Fires only single-block (<=55B); other lengths take the scalar bake.
+static void emit_shani_fixed(FILE *o, const struct wheel *w, int nw, const int *off,
+                             int TL, int is256, int progress)
+{
+    int dglen = is256 ? 32 : 20, nwords = is256 ? 8 : 5;
+    const char *iv = is256
+        ? "0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u"
+        : "0x67452301u,0xefcdab89u,0x98badcfeu,0x10325476u,0xc3d2e1f0u";
+    // The block is padded once; only the member bytes change each step. The
+    // 64-bit big-endian length is at blk[56..63]; TL<=55 keeps it two bytes.
+    fputs("        unsigned char blk[64]; memset(blk, 0, 64);\n", o);
+    fprintf(o, "        blk[%d] = 0x80; blk[62] = %uu; blk[63] = %uu;\n", TL, ((unsigned)TL*8)>>8, ((unsigned)TL*8)&0xff);
+    fputs("        for (;;) {\n", o);
+    fprintf(o, "          memcpy(blk, buf, %d);\n", TL);
+    fprintf(o, "          unsigned int st[%d] = { %s };\n", nwords, iv);
+    fprintf(o, "          %s(st, blk);\n", is256 ? "rt_sha256_ni_block" : "rt_sha1_ni_block");
+    fputs("          if (rt_pre_hit(__builtin_bswap32(st[0]))) {\n", o);
+    fprintf(o, "            unsigned char dg[%d];\n", dglen);
+    for (int k = 0; k < nwords; k++)
+        fprintf(o, "            dg[%d]=(unsigned char)(st[%d]>>24);dg[%d]=(unsigned char)(st[%d]>>16);dg[%d]=(unsigned char)(st[%d]>>8);dg[%d]=(unsigned char)st[%d];\n",
+                k*4, k, k*4+1, k, k*4+2, k, k*4+3, k);
+    fprintf(o, "            if (rt_set_has(&TB, (const char *)dg, %d)) {\n", dglen);
+    fputs("              pthread_mutex_lock(&MX);\n", o);
+    fprintf(o, "              for (int h = 0; h < %d; h++) printf(\"%%02x\", dg[h]);\n", dglen);
+    fprintf(o, "              putchar(':'); fwrite(buf, 1, %d, stdout); putchar('\\n');\n", TL);
+    fputs("              pthread_mutex_unlock(&MX); n++; } }\n", o);
+    fputs("          if (count && ++done == count) break;\n", o);
+    if (progress) fputs("          if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+    for (int i = nw - 1; i >= 0; i--) {
+        char e[16]; snprintf(e, sizeof e, "i%d", i);
+        fprintf(o, "          if (++i%d < %d) { ", i, w[i].n);
+        emit_lay(o, i, off[i], w[i].L, e);
+        fprintf(o, " continue; } i%d = 0; ", i);
+        emit_lay(o, i, off[i], w[i].L, "0");
+        fputc('\n', o);
+    }
+    fputs("          break;\n        }\n", o);
+}
+
 // The run() body for a pattern with a loop repeat X{a,b}. The repeat is one
 // super-wheel of the outer odometer: pre wheels are the digits above it, post
 // wheels the digits below, exactly the order the interpreter walks an embedded
@@ -958,9 +1003,18 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         // the vector unit is absent.
         int usex8 = match && hash && !strcmp(HA->name, "md5")
                     && TL <= baked_maxlen("md5") && nw >= 1 && w[nw-1].L == 1;
+        int is256 = hash && !strcmp(HA->name, "sha256");
+        int useshani = match && hash && (is256 || !strcmp(HA->name, "sha1"))
+                       && TL <= baked_maxlen(HA->name);
         if (usex8) {
             fputs("    if (rt_has_avx2()) {\n", o);
             emit_md5x8_fixed(o, w, nw, off, TL, progress);
+            fputs("    } else {\n", o);
+            emit_fixed_scalar(o, w, nw, off, dup, match, count, hash, len, lenp1, progress);
+            fputs("    }\n", o);
+        } else if (useshani) {
+            fputs("    if (rt_has_sha()) {\n", o);
+            emit_shani_fixed(o, w, nw, off, TL, is256, progress);
             fputs("    } else {\n", o);
             emit_fixed_scalar(o, w, nw, off, dup, match, count, hash, len, lenp1, progress);
             fputs("    }\n", o);
