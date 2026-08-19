@@ -464,6 +464,47 @@ static int rt_hexval(int c)
     return -1;
 }
 
+/* ---- first-word pre-filter ------------------------------------------------
+ * Once the hash is vectorized the target lookup is the hot cost: rt_set_has
+ * runs FNV over the whole digest for a candidate that almost never matches. A
+ * bitmap keyed on the digest's first four bytes rejects the misses in one load
+ * and one bit test, so the full extract-and-probe runs only on the rare
+ * survivor. It never drops a real hit -- every target sets its own bit, so a
+ * true digest always survives -- only lets a few misses through to the exact
+ * probe, which rejects them. Sized to ~32 bits per target (a few percent false
+ * positives), clamped, built once before the threads run and then read-only.
+ */
+static unsigned      *rt_pre_bits = NULL;
+static unsigned long   rt_pre_mask = 0;
+
+static void rt_pre_build(const struct rt_set *s)
+{
+    unsigned long n = 0;
+    for (unsigned long i = 0; i < s->cap; i++) if (s->key[i]) n++;
+    unsigned long nb = 1UL << 16;
+    while (nb < n * 32UL && nb < (1UL << 28)) nb <<= 1;
+    rt_pre_bits = calloc(nb / 32, sizeof *rt_pre_bits);
+    if (!rt_pre_bits) { rt_pre_mask = 0; return; }     /* no filter -> pass everything */
+    rt_pre_mask = nb - 1;
+    for (unsigned long i = 0; i < s->cap; i++)
+        if (s->key[i] && s->len[i] >= 4) {
+            const unsigned char *k = (const unsigned char *)s->key[i];
+            unsigned fw = (unsigned)k[0] | ((unsigned)k[1] << 8)
+                        | ((unsigned)k[2] << 16) | ((unsigned)k[3] << 24);
+            unsigned long b = fw & rt_pre_mask;
+            rt_pre_bits[b >> 5] |= 1u << (b & 31);
+        }
+}
+
+/* fw is the digest's first four bytes read little-endian -- for md5/md4 that is
+ * the first state word a as-is; a big-endian (sha) word is byte-swapped first. */
+static inline int rt_pre_hit(unsigned fw)
+{
+    if (!rt_pre_bits) return 1;
+    unsigned long b = fw & rt_pre_mask;
+    return (rt_pre_bits[b >> 5] >> (b & 31)) & 1u;
+}
+
 static int rt_load_hashes(struct rt_set *s, const char *path, int dglen)
 {
     FILE *f = fopen(path, "rb");
@@ -501,6 +542,7 @@ static int rt_load_hashes(struct rt_set *s, const char *path, int dglen)
             start = i + 1;
         }
     }
+    rt_pre_build(s);          /* the first-word reject filter, from the targets */
     return 0;
 }
 

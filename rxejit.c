@@ -185,6 +185,14 @@ static void emit_msg_words(FILE *o, int len, int be, int widen)
 // target-set lookup and the hit print -- the tail shared by every baked hash.
 static void emit_digest_match(FILE *o, const char *const *w, int nwords, int be, int dglen, int len)
 {
+    // First-word reject before the extract and the full probe: the digest's
+    // first four bytes, read little-endian, keyed into the target bitmap. A
+    // big-endian (sha) first word is byte-swapped to that order; a little-endian
+    // (md5/md4) one is already it. Almost every candidate misses here and skips
+    // the rest; a true target always survives to the exact rt_set_has below.
+    if (be) fprintf(o, "          unsigned int _fw = __builtin_bswap32(%s);\n", w[0]);
+    else    fprintf(o, "          unsigned int _fw = %s;\n", w[0]);
+    fputs("          if (rt_pre_hit(_fw)) {\n", o);
     for (int i = 0; i < nwords; i++)
         if (be) fprintf(o, "          dg[%d]=(unsigned char)(%s>>24);dg[%d]=(unsigned char)(%s>>16);dg[%d]=(unsigned char)(%s>>8);dg[%d]=(unsigned char)%s;\n",
                         i*4, w[i], i*4+1, w[i], i*4+2, w[i], i*4+3, w[i]);
@@ -194,7 +202,7 @@ static void emit_digest_match(FILE *o, const char *const *w, int nwords, int be,
                "            pthread_mutex_lock(&MX);\n"
                "            for (int h = 0; h < %d; h++) printf(\"%%02x\", dg[h]);\n"
                "            putchar(':'); fwrite(buf, 1, %d, stdout); putchar('\\n');\n"
-               "            pthread_mutex_unlock(&MX); n++; } }\n", dglen, dglen, len);
+               "            pthread_mutex_unlock(&MX); n++; } } }\n", dglen, dglen, len);
 }
 
 static void emit_md5_baked(FILE *o, int len)
@@ -372,6 +380,7 @@ static void emit_md5x8_fixed(FILE *o, const struct wheel *w, int nw, const int *
     fprintf(o, "            for (int j = 0; j < 8; j++) MSG[%d][j] = CVW | ((unsigned int)lb[j] << %d);\n", vw, vsh);
     fputs("            rt_md5_x8((const unsigned int (*)[8])MSG, DG);\n", o);
     fputs("            for (int j = 0; j < batch; j++) {\n", o);
+    fputs("              if (!rt_pre_hit(DG[0][j])) continue;   /* first-word reject: skips the extract+probe on a miss */\n", o);
     fputs("              unsigned char dg[16];\n", o);
     fputs("              dg[0]=(unsigned char)DG[0][j];dg[1]=(unsigned char)(DG[0][j]>>8);dg[2]=(unsigned char)(DG[0][j]>>16);dg[3]=(unsigned char)(DG[0][j]>>24);\n", o);
     fputs("              dg[4]=(unsigned char)DG[1][j];dg[5]=(unsigned char)(DG[1][j]>>8);dg[6]=(unsigned char)(DG[1][j]>>16);dg[7]=(unsigned char)(DG[1][j]>>24);\n", o);
