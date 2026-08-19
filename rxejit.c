@@ -2224,13 +2224,15 @@ int main(int argc, char **argv)
 {
     const char *prog = argc > 0 ? argv[0] : "rxejit";
     int emit_only = 0, sink = SINK_WRITE, verbose = 0, hash = 0, psec = 0, gpu = 0, opt;
+    int no_accel = 0;                     // -C: force the scalar hash path
     const char *jobs = NULL;              // thread count, forwarded to the exe
     const char *matchfile = NULL;         // target file for -m
 
-    while ((opt = getopt(argc, argv, "SGndvj:m:H:D:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "SGCndvj:m:H:D:p:h")) != -1) {
         switch (opt) {
             case 'S': emit_only = 1; break;
             case 'G': gpu = 1; break;
+            case 'C': no_accel = 1; break;
             case 'p': psec = atoi(optarg);
                       if (psec < 1) { fprintf(stderr, "%s: -p needs seconds >= 1\n", prog); return 2; }
                       break;
@@ -2276,6 +2278,9 @@ int main(int argc, char **argv)
 "    -G       run on the GPU via OpenCL: one lane per candidate. Masks, uneven\n"
 "             alternations, dictionaries, head-side backrefs, and combinations\n"
 "             / permutations, with -m file -H md5|ntlm|sha1|sha256 (keycracking).\n"
+"    -C       force the scalar hash path (no AVX2 md5/md4, no SHA-NI) for the\n"
+"             run this launches, for A/B on the same machine. It sets\n"
+"             RXEJIT_NOACCEL, which any generated binary (see -S) also honours.\n"
 "    -D dir   also look in 'dir' for a [:name:] dictionary's name.dict file.\n",
                     prog);
                 return opt == 'h' ? 0 : 2;
@@ -2294,6 +2299,11 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *pattern = argv[optind];
+
+    // -C forces the scalar hash: the run this launches inherits the variable the
+    // generated rt_has_avx2()/rt_has_sha() read. (No effect on -S, which does not
+    // launch anything -- set RXEJIT_NOACCEL yourself when running that C.)
+    if (no_accel) setenv("RXEJIT_NOACCEL", "1", 1);
 
     rxe_init();
     rxe_set_dict_resolver(dict_resolver);

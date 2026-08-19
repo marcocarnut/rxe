@@ -201,7 +201,13 @@ static void rt_md5(const unsigned char *msg, unsigned long len, unsigned char ou
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 
-static int rt_has_avx2(void) { return __builtin_cpu_supports("avx2"); }
+/* A forced-scalar switch for A/B measurement: with RXEJIT_NOACCEL set in the
+ * environment every accelerated path (AVX2, SHA-NI) falls back to the scalar
+ * bake, so one binary runs both ways -- no recompile needed to compare. rxejit's
+ * -C flag sets it for the run it launches. Read once per run(), off the hot loop. */
+static int rt_accel_off(void) { const char *e = getenv("RXEJIT_NOACCEL"); return e && *e; }
+
+static int rt_has_avx2(void) { return !rt_accel_off() && __builtin_cpu_supports("avx2"); }
 
 __attribute__((target("avx2")))
 static void rt_md5_x8(const unsigned int m[16][8], unsigned int out[4][8])
@@ -311,7 +317,7 @@ static void rt_md4_x8(const unsigned int m[16][8], unsigned int out[4][8])
  * same big-endian a..h / a..e the scalar blocks produce. Gate every use with
  * rt_has_sha(). Canonical public-domain sequences (Gulley/Walton).
  */
-static int rt_has_sha(void) { return __builtin_cpu_supports("sha"); }
+static int rt_has_sha(void) { return !rt_accel_off() && __builtin_cpu_supports("sha"); }
 
 __attribute__((target("sha,sse4.1")))
 static void rt_sha256_ni_block(unsigned int state[8], const unsigned char data[64])
