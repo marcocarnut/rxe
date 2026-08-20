@@ -672,6 +672,30 @@ t_opts  'b a/'  -z -f 2 '([a-c] ){{2!?}}'                     # seek is chop-awa
 # The '?' needs the last node to be fixed width, so a constant chop is defined.
 t_error '([a-c](x|yy)){{2!?}}' "the '?' of a combinatorial choice needs a fixed-width last node"
 
+echo "== policy composition, the {{n,m!floors}} quantifier =="
+# Length n..m over the disjoint union of the branches, with branch i appearing
+# at least floors[i] times -- the shape of a password composition policy. One
+# branch may be '+' (the soaker: an ordering hint that means one-or-more).
+# Counts are checked against a standalone brute-forced oracle (policy.py).
+t_count '([01]|[ab]){{3!1,0}}'          '56'      # >=1 digit in 3 chars
+t_count '([01]|[AB]|[ab]){{4!1,1,0}}'   '800'     # >=1 digit and >=1 upper
+t_count '([01]|[ab]){{2,3!1,0}}'        '68'      # a length range sums
+t_count '([01]|[AB]|[abc]){{4!1,1,2}}'  '432'     # floors summing to the length
+t_count '([01]|[ab]){{4!2,0}}'          '176'     # a floor above one
+t_count '([01]|[AB]|[xy]){{3!1,1,1}}'   '48'      # one of each of three
+t_count '([0-9]|[a-z]){{4!1,0}}'        '1,222,640'      # = 36^4 - 26^4
+# The soaker '+' is an ordering hint of floor one; it never changes the count.
+t_count '([a-z]|[0-9]){{8!+,1}}'        '2,612,182,842,880'
+t_count '([a-z]|[0-9]){{8!1,1}}'        '2,612,182,842,880'
+# Over-constrained -- the floors cannot fit the length -- is the empty set.
+t_count '(a|b|c){{2!1,1,1}}'            '0'
+# Validation: one floor per branch, single-character branches, one soaker, and a
+# length bound small enough to count.
+t_error '(a|b|c){{3!1,1}}'   'policy floors do not match the number of alternatives'
+t_error '(ab|c){{3!1,1}}'    'policy composition needs single-character alternatives'
+t_error '(a|b){{3!+,+}}'     "at most one policy soaker ('+')"
+t_error '(a|b){{5000!1,1}}'  'bad combinatorial parameters'
+
 echo "== per-subexpression shuffle, (?~key:re) =="
 # The group's members come out permuted by the key, but it is the same set: a
 # bijection, so the count, the membership and seek-equals-iteration are all

@@ -60,6 +60,14 @@
 // above: this one bounds the count, not the rendered size.
 #define RXE_MAX_REPEAT               (100*1000*1000)
 
+// A policy composition '(A|B|...){{n,m!...}}' counts by a dynamic program that
+// is quadratic in the length bound, so the bound is capped well above any real
+// password length (its members are short by nature) to keep counting instant.
+// The floor list is capped too -- a policy over hundreds of classes is not a
+// thing -- so the caller can size it on the stack.
+#define RXE_POLICY_MAX_LEN           4096
+#define RXE_POLICY_MAXCLASS          256
+
 #define RXE_FLAG_CLOSED_BRACKET      0x0100
 #define RXE_FLAG_HAS_BKRTABLE        0x0200
 #define RXE_FLAG_VARIABLE_REPEAT     0x0400
@@ -105,6 +113,11 @@
       "the '?' of a combinatorial choice needs a fixed-width last node")        \
     X(RXE_BAD_SHUFFLE,                  "unterminated shuffle key")            \
     X(RXE_SHUFFLE_INFINITE,             "shuffle key over an infinite set")    \
+    X(RXE_POLICY_ARITY,                                                        \
+      "policy floors do not match the number of alternatives")                 \
+    X(RXE_POLICY_WIDTH,                                                        \
+      "policy composition needs single-character alternatives")                \
+    X(RXE_POLICY_SOAKER,                "at most one policy soaker ('+')")     \
     X(RXE_TOO_BIG,                      "member too large to materialize")
 
 enum rxe_parse_status {
@@ -199,6 +212,12 @@ struct rxe_node {
                                   //   item -- its base's last node, for {{...?}}
                                   //   (0 = no '?'); the trailing-separator fix
     mpz_t comb_index;             // When is_comb or is_shuffle: current index
+    int   is_policy;              // True if this is a policy composition
+    int  *policy_floor;           // When is_policy: min count per branch, one
+                                  //   per top-level alternation of the base
+    int   policy_nfloor;          // When is_policy: number of floors (= branches)
+    int   policy_soaker;          // When is_policy: branch that absorbs the
+                                  //   surplus for the minimal-first order, or -1
     int   is_shuffle;             // True if this group carries a shuffle key
     struct rxe_permutation *shuffle; // The keyed permutation, when is_shuffle
     int   is_dict;                // True if this node draws from a dictionary

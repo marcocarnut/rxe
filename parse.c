@@ -18,6 +18,7 @@
 #include "rxe_alt.h"
 #include "repeat.h"
 #include "comb.h"
+#include "policy.h"
 #include "lens.h"
 #include "dict.h"
 #include "rxe_node.h"
@@ -126,9 +127,11 @@ int build_repeat(struct rxe_node *node, int r0, int r1, int flags,
                  enum rxe_parse_status *status);
 static const char *parse_choose_params(const char *str, int *lo, int *hi,
                                        int *perm, int *star, int *chop,
+                                       int *floors, int *nfloors, int *soaker,
                                        enum rxe_parse_status *status);
 static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
-                        int star, int chop, int flags, enum rxe_parse_status *status);
+                        int star, int chop, const int *floors, int nfloors,
+                        int soaker, int flags, enum rxe_parse_status *status);
 const char *handle_character_class(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_dictionary(struct rxe *rxe, struct rxe_alt *alt, mpz_t ret, const char *str, int flags);
 const char *handle_flags(const char *str, int *flags);
@@ -418,12 +421,15 @@ const char *parse(struct rxe *rxe, mpz_t ret, const char *str, int flags,
                       // result, for want of anywhere else to put it. There is
                       // somewhere else now.
                       if (*str == '{') {
-                          int c_lo,c_hi,c_perm,c_star,c_chop;
+                          int c_lo,c_hi,c_perm,c_star,c_chop,c_nfloors,c_soaker;
+                          int c_floors[RXE_POLICY_MAXCLASS];
                           str2 = parse_choose_params(str+1,&c_lo,&c_hi,&c_perm,
-                                                     &c_star,&c_chop,&rxe->status);
+                                                     &c_star,&c_chop,c_floors,
+                                                     &c_nfloors,&c_soaker,&rxe->status);
                           if (!str2) return parse_done(x,n,p,str);
                           if (!build_choose(alt->tail,c_lo,c_hi,c_perm,c_star,
-                                            c_chop,flags,&rxe->status))
+                                            c_chop,c_floors,c_nfloors,c_soaker,
+                                            flags,&rxe->status))
                               return parse_done(x,n,p,str);
                       } else {
                           str2 = handle_repeats(alt,str,flags,&rxe->status);
@@ -864,10 +870,12 @@ const char *handle_repeats(struct rxe_alt *alt, const char *str,
 // '}}', or NULL with the status set.
 static const char *parse_choose_params(const char *str, int *lo, int *hi,
                                        int *perm, int *star, int *chop,
+                                       int *floors, int *nfloors, int *soaker,
                                        enum rxe_parse_status *status)
 {
     const char *p = str;
     *perm = 0; *star = 0; *lo = 0; *hi = 0; *chop = 0;
+    *nfloors = 0; *soaker = -1;
     if (*p == '*') {
         *star = 1; *perm = 1; p++;
     } else {
@@ -887,7 +895,38 @@ static const char *parse_choose_params(const char *str, int *lo, int *hi,
             *hi = (int)w;
         }
     }
-    if (*p == '!') { *perm = 1; p++; }
+    if (*p == '!') {
+        p++;
+        if ((*p >= '0' && *p <= '9') || *p == '+') {
+            // '{{n,m!x1,x2,...,xk}}' -- policy composition: a floor per branch,
+            // one of them optionally '+' (the surplus soaker; means one-or-more).
+            // Only a digit or '+' after the '!' marks a policy; a bare '{{n!}}'
+            // or a chop '{{n!?}}' is an ordinary permutation.
+            int nf = 0;
+            for (;;) {
+                if (nf >= RXE_POLICY_MAXCLASS) { *status = RXE_BAD_CHOOSE; return NULL; }
+                if (*p == '+') {
+                    if (*soaker >= 0) { *status = RXE_POLICY_SOAKER; return NULL; }
+                    *soaker = nf;
+                    floors[nf++] = 1;  // '+' is one-or-more, and absorbs the rest
+                    p++;
+                } else if (*p >= '0' && *p <= '9') {
+                    long v = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        v = v*10 + (*p-'0'); if (v > 1000000000L) v = 1000000000L; p++;
+                    }
+                    floors[nf++] = (int)v;
+                } else {
+                    *status = RXE_BAD_CHOOSE; return NULL;
+                }
+                if (*p == ',') { p++; continue; }
+                break;
+            }
+            *nfloors = nf;
+        } else {
+            *perm = 1;                 // '{{n!}}' or '{{n!?}}' -- permutation
+        }
+    }
     if (*p == '?') { *chop = 1; p++; }
     if (p[0] != '}' || p[1] != '}') { *status = RXE_BAD_CHOOSE; return NULL; }
     if (!*star && *lo > *hi) { *status = RXE_BAD_CHOOSE; return NULL; }
@@ -918,7 +957,8 @@ static int rxe_fixed_width(struct rxe *rxe)
 // variable repeat, another choice, a backref, or an endless node is not fixed.
 static int node_render_width(struct rxe_node *node)
 {
-    if (node->is_inf || node->is_backref || node->is_comb || node->is_shuffle)
+    if (node->is_inf || node->is_backref || node->is_comb || node->is_shuffle
+        || node->is_policy)
         return -1;
     if (node->is_repeat) {
         if (node->rep_min != node->rep_max || !node->rxe) return -1;
@@ -956,7 +996,8 @@ static int choose_chop_width(struct rxe *base)
 // Like build_repeat, it demotes whatever the node holds into a subexpression
 // first so the choice has one thing to index into. The base must be finite.
 static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
-                        int star, int chop, int flags, enum rxe_parse_status *status)
+                        int star, int chop, const int *floors, int nfloors,
+                        int soaker, int flags, enum rxe_parse_status *status)
 {
     if (node->is_inf ||
         (node->rxe && !node->is_backref && rxe_is_infinite(node->rxe))) {
@@ -965,6 +1006,15 @@ static int build_choose(struct rxe_node *node, int lo, int hi, int perm,
     }
     if (!node->rxe || node->str || node->is_backref)
         node->rxe = demote_node(node,flags);
+    if (nfloors > 0) {
+        // A policy composition: one floor per top-level branch, every branch a
+        // single-character class (v1), the length range small enough to count.
+        if (nfloors != node->rxe->nalts) { *status = RXE_POLICY_ARITY; return 0; }
+        if (rxe_fixed_width(node->rxe) != 1) { *status = RXE_POLICY_WIDTH; return 0; }
+        if (hi > RXE_POLICY_MAX_LEN) { *status = RXE_BAD_CHOOSE; return 0; }
+        rxe_policy_make(node,lo,hi,floors,nfloors,soaker);
+        return 1;
+    }
     if (star) {
         // The full permutation: the size is the base's own cardinality, which
         // has to be a number small enough to name a run of that many members.

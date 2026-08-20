@@ -335,13 +335,14 @@ static int add_node(struct build *b, struct rxe_node *nd)
     }
 
     if (nd->rxe && !nd->is_repeat && !nd->is_comb && !nd->is_shuffle &&
-        !nd->is_dict && !nd->is_backref && !nd->is_inf)
+        !nd->is_dict && !nd->is_backref && !nd->is_inf && !nd->is_policy)
         return add_rxe(b, nd->rxe);
 
     reason = nd->is_inf     ? "an unbounded repeat"
            : nd->is_dict    ? "a dictionary"
            : nd->is_backref ? "a backreference"
            : nd->is_comb    ? "a combination"
+           : nd->is_policy  ? "a policy composition"
            : nd->is_shuffle ? "a shuffle"
            : nd->is_repeat  ? "a variable-count repeat"
            :                  "an unsupported element";

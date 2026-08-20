@@ -24,6 +24,7 @@
 #include "bkreftbl.h"
 #include "repeat.h"
 #include "comb.h"
+#include "policy.h"
 #include "pair.h"
 #include "lens.h"
 #include "parse.h"
@@ -142,6 +143,10 @@ static int tree_has_backref(struct rxe *rxe)
             // its own, not a length-countable concatenation, so it keeps the
             // diagonal order too rather than being enumerated shortest first.
             if (node->is_comb) return 1;
+            // A policy composition is likewise a finite set with its own
+            // (minimal-compliance-first) order, not a length-countable
+            // concatenation, so it keeps the diagonal order too.
+            if (node->is_policy) return 1;
             // A shuffled group scrambles which member sits at which index, so
             // its lengths can no longer be counted in enumeration order either.
             if (node->is_shuffle) return 1;
@@ -266,6 +271,8 @@ int rxe_iterate(struct rxe *rxe)
                 carry = rxe_repeat_iterate(node,l2r);
             } else if (node->is_comb) {
                 carry = rxe_comb_iterate(node);
+            } else if (node->is_policy) {
+                carry = rxe_policy_iterate(node);
             } else if (node->is_shuffle) {
                 carry = rxe_shuffle_iterate(node);
             } else if (node->rxe && !node->is_backref) {
@@ -346,6 +353,7 @@ static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
         // subexpression's: the geometric sum for one, the binomial sum for the
         // other. Both carry their own count in node->nitems.
         mpz_set(n, node->rxe && !node->is_repeat && !node->is_comb
+                       && !node->is_policy
                        ? node->rxe->nitems : node->nitems);
         // An impossible node cannot be indexed into. Alternations holding one
         // are skipped by the caller, so reaching this means the caller seeked
@@ -358,6 +366,8 @@ static int rxe_alt_seek(struct rxe_alt *alt, const mpz_t pos, int l2r)
             if (rxe_repeat_seek(node,r,l2r)) { rc = 1; break; }
         } else if (node->is_comb) {
             if (rxe_comb_seek(node,r)) { rc = 1; break; }
+        } else if (node->is_policy) {
+            if (rxe_policy_seek(node,r)) { rc = 1; break; }
         } else if (node->is_shuffle) {
             if (rxe_shuffle_seek(node,r)) { rc = 1; break; }
         } else if (node->rxe) {
@@ -515,6 +525,12 @@ void rxe_node_deep_clone(struct rxe_alt *alt, struct rxe_node *src_node)
         // range, starting at its first choice.
         rxe_comb_make(dst_node,src_node->rep_min,src_node->rep_max,
                       src_node->comb_perm);
+    } else if (src_node->is_policy) {
+        // A policy composition is rebuilt from its subexpression's branches,
+        // its length range, and its floors.
+        rxe_policy_make(dst_node,src_node->rep_min,src_node->rep_max,
+                        src_node->policy_floor,src_node->policy_nfloor,
+                        src_node->policy_soaker);
     } else if (src_node->is_shuffle) {
         // A shuffled group carries the same key; clone the permutation and
         // start it at its first member.

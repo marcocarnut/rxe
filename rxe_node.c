@@ -31,6 +31,10 @@ struct rxe_node *rxe_new_node(struct rxe_alt *alt)
     node->comb_perm = 0;
     node->comb_chop = 0;
     mpz_init(node->comb_index);
+    node->is_policy = 0;
+    node->policy_floor = NULL;
+    node->policy_nfloor = 0;
+    node->policy_soaker = -1;
     node->is_shuffle = 0;
     node->shuffle = NULL;
     node->is_inf = 0;
@@ -75,6 +79,14 @@ void rxe_free_node_data(struct rxe_node *node)
     node->is_repeat = 0;
     node->is_comb = 0;
     node->comb_perm = 0;
+    // A policy composition owns its per-branch floor array.
+    if (node->policy_floor) {
+        rxe_mem_free(node->policy_floor);
+        node->policy_floor = NULL;
+    }
+    node->is_policy = 0;
+    node->policy_nfloor = 0;
+    node->policy_soaker = -1;
     rxe_shuffle_free(node);
     node->is_inf = 0;
     node->rep_min = node->rep_max = node->rep_count = 0;
