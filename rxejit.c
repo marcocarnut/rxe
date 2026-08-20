@@ -1665,38 +1665,56 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
 // buf[p], p advanced by its real length. The pool and every pre/post wheel of a
 // permutation kernel lay this way, since widths vary and the member is built
 // left to right.
-static void emit_cl_lay(FILE *ms, const struct wheel *w, const char *tb,
-                        const char *to, const char *tl, const char *dv)
+static void emit_cl_lay(FILE *ms, const struct wheel *w, int bb, int mb, const char *dv)
 {
     if (w->L == 1)
-        fprintf(ms, "    buf[p++] = %s[%s];\n", tb, dv);
+        fprintf(ms, "    buf[p++] = AW[%d + %s];\n", bb, dv);
     else if (w->L > 1)
-        fprintf(ms, "    for (int t = 0; t < %d; t++) buf[p++] = %s[%s*%d + t];\n", w->L, tb, dv, w->L);
+        fprintf(ms, "    for (int t = 0; t < %d; t++) buf[p++] = AW[%d + %s*%d + t];\n", w->L, bb, dv, w->L);
     else
-        fprintf(ms, "    { int o = %s[%s], l = %s[%s]; for (int t = 0; t < l; t++) buf[p++] = %s[o + t]; }\n",
-                to, dv, tl, dv, tb);
+        fprintf(ms, "    { int o = AWO[%d + %s], l = AWL[%d + %s]; for (int t = 0; t < l; t++) buf[p++] = AW[%d + o + t]; }\n",
+                mb, dv, mb, dv, bb);
 }
 
-// Emit one wheel's __constant tables into the kernel: the bytes A<i>, and for a
-// variable wheel the per-alternative offset/length A<i>o / A<i>l. Declared
-// 'static' (internal linkage): a plain program-scope __constant has external
-// linkage, and NVIDIA's OpenCL (NVVM->PTX) then merges identical arrays -- eight
-// [a-z] wheels are byte-for-byte equal -- into an unresolved '.extern' that ptxas
-// rejects ("'.extern' variable 'A7' cannot be resolved by a '.static'"). 'static'
-// keeps each its own local symbol; harmless on the Intel/AMD/Mesa stacks.
-static void emit_cl_wheel_tables(FILE *ms, const struct wheel *w, int i)
+// Emit ALL nw wheels' bytes into ONE __constant array AW[] (and AWO[]/AWL[] for
+// the variable ones), filling byte_base[i] / meta_base[i] with wheel i's start
+// in each. NVIDIA's OpenCL caps the number of program-scope __constant arrays
+// (~7 including the runtime's own), so a wide mask's per-wheel A0..A7 overflow it
+// -- ptxas then rejects the eighth ("'.extern' variable 'A7' cannot be resolved
+// by a '.static'") whether or not the arrays are identical. One merged array
+// keeps the count at a handful for any width; the base offsets index into it.
+// (The wheels' bytes lie back to back, so wheel i's alternative d starts at
+// AW[byte_base[i] + d*L]; a variable wheel's (offset,length) sit at
+// AWO/AWL[meta_base[i] + d] and its bytes at AW[byte_base[i] + offset].)
+static void emit_cl_merged(FILE *ms, const struct wheel *w, int nw,
+                           int *byte_base, int *meta_base)
 {
-    int bytes = w->L ? w->n * w->L : w->aoff[w->n - 1] + w->alen[w->n - 1];
-    fprintf(ms, "static __constant uchar A%d[] = {", i);
-    if (bytes == 0) fputs("0", ms);
-    for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)w->base[j]);
+    int nb = 0, nm = 0;
+    for (int i = 0; i < nw; i++) {
+        byte_base[i] = nb; meta_base[i] = nm;
+        nb += w[i].L ? w[i].n * w[i].L
+                     : (w[i].n ? w[i].aoff[w[i].n - 1] + w[i].alen[w[i].n - 1] : 0);
+        if (w[i].L == 0) nm += w[i].n;
+    }
+    fputs("static __constant uchar AW[] = {", ms);
+    if (nb == 0) fputs("0", ms);
+    { int first = 1;
+      for (int i = 0; i < nw; i++) {
+          int bytes = w[i].L ? w[i].n * w[i].L
+                             : (w[i].n ? w[i].aoff[w[i].n - 1] + w[i].alen[w[i].n - 1] : 0);
+          for (int j = 0; j < bytes; j++) { fprintf(ms, "%s%d", first ? "" : ",", (unsigned char)w[i].base[j]); first = 0; }
+      } }
     fputs("};\n", ms);
-    if (w->L == 0) {
-        fprintf(ms, "static __constant int A%do[] = {", i);
-        for (int j = 0; j < w->n; j++) fprintf(ms, "%s%d", j ? "," : "", w->aoff[j]);
+    if (nm > 0) {
+        int first = 1;
+        fputs("static __constant int AWO[] = {", ms);
+        for (int i = 0; i < nw; i++) if (w[i].L == 0)
+            for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].aoff[j]); first = 0; }
         fputs("};\n", ms);
-        fprintf(ms, "static __constant int A%dl[] = {", i);
-        for (int j = 0; j < w->n; j++) fprintf(ms, "%s%d", j ? "," : "", w->alen[j]);
+        first = 1;
+        fputs("static __constant int AWL[] = {", ms);
+        for (int i = 0; i < nw; i++) if (w[i].L == 0)
+            for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].alen[j]); first = 0; }
         fputs("};\n", ms);
     }
 }
@@ -1740,7 +1758,8 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fputs(RXEJIT_CL, ms);
     fprintf(ms, "#define MAXW %d\n#define MAXHITS %d\n#define NPERM %lluULL\n"
                 "#define NP %d\n#define LO %d\n", maxw, 1 << 20, NPERM, n, lo);
-    for (int i = 0; i < nw; i++) emit_cl_wheel_tables(ms, &B->w[i], i);
+    int bb[MAXW], mb[MAXW];
+    emit_cl_merged(ms, B->w, nw, bb, mb);
     fputs("static __constant ulong PSZ[] = {", ms);
     for (int s = 0; s <= hi; s++) fprintf(ms, "%s%lluUL", s ? "," : "", PSZ[s]);
     fputs("};\n", ms);
@@ -1770,11 +1789,8 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fputs("    int p = 0;\n", ms);
     // lay pre wheels
     for (int i = 0; i < P; i++) {
-        char dv[16], to[24], tl[24], tb[16];
-        snprintf(dv, sizeof dv, "d%d", i);
-        snprintf(to, sizeof to, "A%do", i); snprintf(tl, sizeof tl, "A%dl", i);
-        snprintf(tb, sizeof tb, "A%d", i);
-        emit_cl_lay(ms, &B->w[i], tb, to, tl, dv);
+        char dv[16]; snprintf(dv, sizeof dv, "d%d", i);
+        emit_cl_lay(ms, &B->w[i], bb[i], mb[i], dv);
     }
     // the choice: size decode, unrank into idx[0..s), then lay each chosen member
     fputs("    int s = LO; ulong rr = r;\n"
@@ -1817,11 +1833,8 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     if (B->perm_chop) fprintf(ms, "    if (s) p -= %d;\n", B->perm_chop);
     // lay post wheels
     for (int i = P; i < nw; i++) {
-        char dv[16], to[24], tl[24], tb[16];
-        snprintf(dv, sizeof dv, "d%d", i);
-        snprintf(to, sizeof to, "A%do", i); snprintf(tl, sizeof tl, "A%dl", i);
-        snprintf(tb, sizeof tb, "A%d", i);
-        emit_cl_lay(ms, &B->w[i], tb, to, tl, dv);
+        char dv[16]; snprintf(dv, sizeof dv, "d%d", i);
+        emit_cl_lay(ms, &B->w[i], bb[i], mb[i], dv);
     }
     fprintf(ms,
         "    uchar dg[%d]; %s(buf, p, dg);\n"
@@ -2041,8 +2054,9 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
     fputs(RXEJIT_CL, ms);
     fprintf(ms, "#define MAXW %d\n#define MAXHITS %d\n#define NPOL %lluUL\n",
             maxw, 1 << 20, NPOL);
-    for (int i = 0; i < nw; i++) emit_cl_wheel_tables(ms, &B->w[i], i);
-    emit_policy_tables(ms, B, "static __constant", "ulong", &NPOL, &why);   // 'static': see emit_cl_wheel_tables
+    int bb[MAXW], mb[MAXW];
+    emit_cl_merged(ms, B->w, nw, bb, mb);
+    emit_policy_tables(ms, B, "static __constant", "ulong", &NPOL, &why);
 
     fputs("__kernel void crackP(ulong base, ulong NALL,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
@@ -2057,19 +2071,13 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
         fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", i, B->w[i].n, B->w[i].n);
     fputs("    int p = 0;\n", ms);
     for (int i = 0; i < P; i++) {           // lay pre wheels
-        char dv[16], to[24], tl[24], tb[16];
-        snprintf(dv, sizeof dv, "d%d", i);
-        snprintf(to, sizeof to, "A%do", i); snprintf(tl, sizeof tl, "A%dl", i);
-        snprintf(tb, sizeof tb, "A%d", i);
-        emit_cl_lay(ms, &B->w[i], tb, to, tl, dv);
+        char dv[16]; snprintf(dv, sizeof dv, "d%d", i);
+        emit_cl_lay(ms, &B->w[i], bb[i], mb[i], dv);
     }
     emit_policy_core(ms, B, nseg, "    ", 1);   // unrank r -> lay L bytes
     for (int i = P; i < nw; i++) {          // lay post wheels
-        char dv[16], to[24], tl[24], tb[16];
-        snprintf(dv, sizeof dv, "d%d", i);
-        snprintf(to, sizeof to, "A%do", i); snprintf(tl, sizeof tl, "A%dl", i);
-        snprintf(tb, sizeof tb, "A%d", i);
-        emit_cl_lay(ms, &B->w[i], tb, to, tl, dv);
+        char dv[16]; snprintf(dv, sizeof dv, "d%d", i);
+        emit_cl_lay(ms, &B->w[i], bb[i], mb[i], dv);
     }
     fprintf(ms,
         "    uchar dg[%d]; %s(buf, p, dg);\n"
@@ -2247,21 +2255,8 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     char *ksrc = NULL; size_t ksz = 0;
     FILE *ms = open_memstream(&ksrc, &ksz);
     fputs(RXEJIT_CL, ms);
-    for (int g = 0; g < G; g++) {
-        int bytes = lw[g].L ? lw[g].n * lw[g].L : lw[g].aoff[lw[g].n - 1] + lw[g].alen[lw[g].n - 1];
-        fprintf(ms, "static __constant uchar A%d[] = {", g);   // 'static': see emit_cl_wheel_tables
-        if (bytes == 0) fputs("0", ms);
-        for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)lw[g].base[j]);
-        fputs("};\n", ms);
-        if (lw[g].L == 0) {                       // a variable wheel: offset/length per alternative
-            fprintf(ms, "static __constant int A%do[] = {", g);
-            for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].aoff[j]);
-            fputs("};\n", ms);
-            fprintf(ms, "static __constant int A%dl[] = {", g);
-            for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].alen[j]);
-            fputs("};\n", ms);
-        }
-    }
+    int bb[MAXW], mb[MAXW];
+    emit_cl_merged(ms, lw, G, bb, mb);        // one __constant AW[] (see emit_cl_merged)
     fputs("__kernel void crackG(ulong lo_base, ulong lo_N, __global const uchar *pfx,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
           "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
@@ -2274,11 +2269,8 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
         // compacting lay: advance p by each alternative's real length
         fputs("    int p = PLEN;\n", ms);
         for (int g = 0; g < G; g++) {
-            if (lw[g].L == 1) fprintf(ms, "    buf[p++] = A%d[d%d];\n", g, g);
-            else if (lw[g].L > 1) for (int t = 0; t < lw[g].L; t++)
-                fprintf(ms, "    buf[p++] = A%d[d%d*%d + %d];\n", g, g, lw[g].L, t);
-            else fprintf(ms, "    { int o = A%do[d%d], l = A%dl[d%d]; for (int t = 0; t < l; t++) buf[p++] = A%d[o + t]; }\n",
-                         g, g, g, g, g);
+            char dv[16]; snprintf(dv, sizeof dv, "d%d", g);
+            emit_cl_lay(ms, &lw[g], bb[g], mb[g], dv);       // AW[bb + d], p++
         }
         fprintf(ms,
             "    uchar dg[%d]; %s(buf, p, dg);\n"
@@ -2287,9 +2279,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
             "}\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
     } else {
         for (int g = 0; g < G; g++) {
-            if (lw[g].L == 1) fprintf(ms, "    buf[PLEN + %d] = A%d[d%d];\n", lwoff[g], g, g);
+            if (lw[g].L == 1) fprintf(ms, "    buf[PLEN + %d] = AW[%d + d%d];\n", lwoff[g], bb[g], g);
             else for (int t = 0; t < lw[g].L; t++)
-                fprintf(ms, "    buf[PLEN + %d] = A%d[d%d*%d + %d];\n", lwoff[g] + t, g, g, lw[g].L, t);
+                fprintf(ms, "    buf[PLEN + %d] = AW[%d + d%d*%d + %d];\n", lwoff[g] + t, bb[g], g, lw[g].L, t);
         }
         fprintf(ms,
             "    uchar dg[%d]; %s(buf, T, dg);\n"
