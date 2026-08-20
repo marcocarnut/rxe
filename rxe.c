@@ -183,7 +183,7 @@ char *rxe_current(char *str, int maxlen, struct rxe *rxe)
     struct rxe_node *node;
     if (!alt) return str;
     for ( node = alt->head ; node ; node = node->next ) {
-        if (node->is_repeat || node->is_comb) {
+        if (node->is_repeat || node->is_comb || node->is_policy) {
             // One copy of the subexpression stands in for every position, so
             // it has to be seeked to each position's index in turn. Rendering
             // in string order also means the subexpression is left holding the

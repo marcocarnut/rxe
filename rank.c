@@ -716,9 +716,26 @@ static void comb_count(mpz_t out, struct rxe_node *node,
 // infinite set to the length-indexed ranker in lens.c; a non-shortlex infinite
 // set -- a backreference that keeps an infinite set in diagonal order -- is
 // refused, as is a shortlex set the ranker does not cover yet.
+// A policy composition {{n,m!floors}} enumerates and seeks, but its inverse --
+// ranking a member back to its index -- is not implemented yet, so a tree that
+// holds one is refused rather than mis-ranked through the base alternation.
+static int tree_has_policy(struct rxe *rxe)
+{
+    for (struct rxe_alt *a = rxe->head; a; a = a->next)
+        for (struct rxe_node *n = a->head; n; n = n->next) {
+            if (n->is_policy) return 1;
+            if (n->rxe && !n->is_backref && tree_has_policy(n->rxe)) return 1;
+        }
+    return 0;
+}
+
 static int rank_walk(struct rxe *rxe, const char *s, rank_sink sink, void *ctx)
 {
     if (!rxe) { g_reason = "null expression"; return -1; }
+    if (tree_has_policy(rxe)) {
+        g_reason = "a policy composition, which rank does not handle yet";
+        return -1;
+    }
     if (rxe_is_infinite(rxe)) {
         if (!rxe_is_shortlex(rxe)) {
             g_reason = "infinite set kept in diagonal order by a backreference";

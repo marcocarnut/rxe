@@ -695,6 +695,14 @@ t_error '(a|b|c){{3!1,1}}'   'policy floors do not match the number of alternati
 t_error '(ab|c){{3!1,1}}'    'policy composition needs single-character alternatives'
 t_error '(a|b){{3!+,+}}'     "at most one policy soaker ('+')"
 t_error '(a|b){{5000!1,1}}'  'bad combinatorial parameters'
+# Enumeration comes out minimal-compliance-first: the count-vector nearest the
+# floors leads (its surplus pooled in the soaker, the last branch by default),
+# then outward. The order and the whole set are checked against policy.py.
+t_enum  '([01]|[a]){{2!1,+}}'  '0a/1a/a0/a1/'
+t_enum  '(a|b|c){{3!1,1,1}}'   'abc/acb/bac/bca/cab/cba/'    # one-of-each == permutation
+t_enum  '([01]|[ab]){{2,3!1,0}}' '0a/0b/1a/1b/a0/a1/b0/b1/00/01/10/11/0aa/0ab/0ba/0bb/1aa/1ab/1ba/1bb/a0a/a0b/a1a/a1b/b0a/b0b/b1a/b1b/aa0/aa1/ab0/ab1/ba0/ba1/bb0/bb1/00a/00b/01a/01b/10a/10b/11a/11b/0a0/0a1/0b0/0b1/1a0/1a1/1b0/1b1/a00/a01/a10/a11/b00/b01/b10/b11/000/001/010/011/100/101/110/111/'
+# Random access: seek reaches any index directly (here the millionth member).
+t_opts  'k2e0/' -z -f 1000000 -c 1 -e '([0-9]|[a-z]){{4!1,0}}'
 
 echo "== per-subexpression shuffle, (?~key:re) =="
 # The group's members come out permuted by the key, but it is the same set: a
