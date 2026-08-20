@@ -54,6 +54,8 @@
 #include "policy.h"        // rxe_policy_segments: the policy segment table
 
 #define POLICY_MAXSEG 8192         // most (length, count-vector) blocks bakeable
+#define AW_CONST_MAX (48 * 1024)   // wheel tables past this go __global (NVIDIA's
+                                   // __constant bank is 64 KB; a big dict overflows)
 
 
 // What the generated loop does with each member. write is the default -- the
@@ -1709,42 +1711,65 @@ static int cl_wheels_equal(const struct wheel *a, const struct wheel *b)
     return 1;
 }
 
-static void emit_cl_merged(FILE *ms, const struct wheel *w, int nw,
-                           int *byte_base, int *meta_base)
+// The merge plan: fill byte_base[i]/meta_base[i] (wheel i's start in AW / in
+// AWO,AWL) and novel[i] (whether i is the first copy of its table, or reuses an
+// earlier equal wheel's slot). *nb / *nm get the deduped byte / (off,len)-entry
+// counts. No emit -- shared by the __constant and __global lowerings.
+static void cl_merged_plan(const struct wheel *w, int nw, int *byte_base,
+                           int *meta_base, int *novel, int *nb_out, int *nm_out)
 {
-    int nb = 0, nm = 0, novel[MAXW];    // novel[i]: does wheel i add a fresh copy?
+    int nb = 0, nm = 0;
     for (int i = 0; i < nw; i++) {
         int dup = -1;
         for (int j = 0; j < i; j++) if (cl_wheels_equal(&w[i], &w[j])) { dup = j; break; }
-        if (dup >= 0) {                 // reuse the earlier identical wheel's slot
-            byte_base[i] = byte_base[dup]; meta_base[i] = meta_base[dup]; novel[i] = 0;
-            continue;
-        }
+        if (dup >= 0) { byte_base[i] = byte_base[dup]; meta_base[i] = meta_base[dup]; novel[i] = 0; continue; }
         novel[i] = 1;
         byte_base[i] = nb; meta_base[i] = nm;
         nb += cl_wheel_bytes(&w[i]);
         if (w[i].L == 0) nm += w[i].n;
     }
-    fputs("static __constant uchar AW[] = {", ms);
-    if (nb == 0) fputs("0", ms);
-    { int first = 1;
-      for (int i = 0; i < nw; i++) if (novel[i]) {
-          int bytes = cl_wheel_bytes(&w[i]);
-          for (int j = 0; j < bytes; j++) { fprintf(ms, "%s%d", first ? "" : ",", (unsigned char)w[i].base[j]); first = 0; }
-      } }
-    fputs("};\n", ms);
-    if (nm > 0) {
-        int first = 1;
-        fputs("static __constant int AWO[] = {", ms);
-        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
-            for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].aoff[j]); first = 0; }
-        fputs("};\n", ms);
-        first = 1;
-        fputs("static __constant int AWL[] = {", ms);
-        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
-            for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].alen[j]); first = 0; }
-        fputs("};\n", ms);
+    *nb_out = nb; *nm_out = nm;
+}
+
+// Emit the merged tables as one declaration set with the given qualifier and
+// element base name -- "static __constant"/"AW" for a kernel-scope constant, or
+// "static const"/"AWh" for a host-side array to upload to a __global buffer. Only
+// novel wheels contribute (identical ones share the slot).
+static void emit_cl_merged_decl(FILE *o, const struct wheel *w, int nw,
+                                const int *novel, int nm, const char *qual,
+                                const char *nm_base)
+{
+    int any = 0;
+    fprintf(o, "%s unsigned char %s[] = {", qual, nm_base);
+    for (int i = 0; i < nw; i++) if (novel[i]) {
+        int bytes = cl_wheel_bytes(&w[i]);
+        for (int j = 0; j < bytes; j++) { fprintf(o, "%s%d", any ? "," : "", (unsigned char)w[i].base[j]); any = 1; }
     }
+    if (!any) fputs("0", o);
+    fputs("};\n", o);
+    if (nm > 0) {
+        int a = 0;
+        fprintf(o, "%s int %sO[] = {", qual, nm_base);
+        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
+            for (int j = 0; j < w[i].n; j++) { fprintf(o, "%s%d", a ? "," : "", w[i].aoff[j]); a = 1; }
+        fputs("};\n", o);
+        a = 0;
+        fprintf(o, "%s int %sL[] = {", qual, nm_base);
+        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
+            for (int j = 0; j < w[i].n; j++) { fprintf(o, "%s%d", a ? "," : "", w[i].alen[j]); a = 1; }
+        fputs("};\n", o);
+    }
+}
+
+// The common (perm/policy) lowering: the merged tables as kernel-scope
+// __constant. Their wheels are the small pre/post classes -- the big dictionary
+// pool rides in its own __global buffer -- so they always fit the constant bank.
+static void emit_cl_merged(FILE *ms, const struct wheel *w, int nw,
+                           int *byte_base, int *meta_base)
+{
+    int novel[MAXW], nb, nm;
+    cl_merged_plan(w, nw, byte_base, meta_base, novel, &nb, &nm);
+    emit_cl_merged_decl(ms, w, nw, novel, nm, "static __constant", "AW");
 }
 
 // The -G combinatorial-choice backend for (re){{lo,hi!}} / {{lo,hi}} (with
@@ -2291,11 +2316,23 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     char *ksrc = NULL; size_t ksz = 0;
     FILE *ms = open_memstream(&ksrc, &ksz);
     fputs(RXEJIT_CL, ms);
-    int bb[MAXW], mb[MAXW];
-    emit_cl_merged(ms, lw, G, bb, mb);        // one __constant AW[] (see emit_cl_merged)
+    int bb[MAXW], mb[MAXW], novel[MAXW], nb, nm;
+    cl_merged_plan(lw, G, bb, mb, novel, &nb, &nm);
+    // A big dictionary's merged tables can overflow NVIDIA's 64 KB __constant
+    // bank (efflarge is ~54 KB of words + ~62 KB of offset/length ints), so past
+    // AW_CONST_MAX they ride in __global buffers instead; small class tables stay
+    // __constant (cached, no cost to a fixed mask). The lay references AW/AWO/AWL
+    // either way -- only the storage class changes.
+    int aw_global = (long)nb + (long)nm * 8 > AW_CONST_MAX;
+    if (!aw_global) emit_cl_merged_decl(ms, lw, G, novel, nm, "static __constant", "AW");
     fputs("__kernel void crackG(ulong lo_base, ulong lo_N, __global const uchar *pfx,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
-          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
+          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits", ms);
+    if (aw_global) {
+        fputs(",\n                     __global const uchar *AW", ms);
+        if (nm > 0) fputs(", __global const int *AWO, __global const int *AWL", ms);
+    }
+    fputs(")\n{\n"
           "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
     if (lowvar) fprintf(ms, "    uchar buf[%d];\n", maxw + 1);
     else        fputs("    uchar buf[T];\n", ms);
@@ -2339,6 +2376,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     emit_c_string(o, ksrc);
     fputs(";\n\n", o);
     free(ksrc);
+
+    // The wheel tables, uploaded to __global buffers when too big for __constant.
+    if (aw_global) emit_cl_merged_decl(o, lw, G, novel, nm, "static const", "AWh");
 
     // NALL = the grand total, when it fits 64 bits, so -p can show percent/ETA.
     // The consumer streams prefixes and cannot sum it, so rxejit bakes it in.
@@ -2427,8 +2467,14 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    cl_mem mhl = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * sizeof(cl_uint), NULL, &e); CK(e);\n"
           "    cl_mem mhb = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, (size_t)MAXHITS * MAXW, NULL, &e); CK(e);\n"
           "    cl_mem mn = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof nhits, &nhits, &e); CK(e);\n"
-          "    cl_mem mpfx = clCreateBuffer(ctx, CL_MEM_READ_ONLY, MAXW, NULL, &e); CK(e);\n\n"
-          "    cl_ulong TILE = 1ULL << 24, loN = LON;\n"
+          "    cl_mem mpfx = clCreateBuffer(ctx, CL_MEM_READ_ONLY, MAXW, NULL, &e); CK(e);\n\n", o);
+    if (aw_global) {
+        fputs("    cl_mem mAW = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof AWh, (void *)AWh, &e); CK(e);\n", o);
+        if (nm > 0)
+            fputs("    cl_mem mAWO = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof AWhO, (void *)AWhO, &e); CK(e);\n"
+                  "    cl_mem mAWL = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof AWhL, (void *)AWhL, &e); CK(e);\n", o);
+    }
+    fputs("    cl_ulong TILE = 1ULL << 24, loN = LON;\n"
           "#if PSEC\n    double t0 = rt_now(), tlast = t0; unsigned long long gpu_ns = 0, done = 0;\n#endif\n"
           "    unsigned char rec[MAXW + 1]; int plen, allfound = 0;\n"
           "    while (fread(rec, 1, 1, pf) == 1 && (plen = rec[0]) >= 0) {\n"
@@ -2442,8 +2488,13 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "        CK(clSetKernelArg(k, 4, sizeof ntgt, &ntgt));\n"
           "        CK(clSetKernelArg(k, 5, sizeof mhl, &mhl));\n"
           "        CK(clSetKernelArg(k, 6, sizeof mhb, &mhb));\n"
-          "        CK(clSetKernelArg(k, 7, sizeof mn, &mn));\n"
-          "        /* Double-buffered: enqueue the next tile before waiting on the\n"
+          "        CK(clSetKernelArg(k, 7, sizeof mn, &mn));\n", o);
+    if (aw_global) {
+        fputs("        CK(clSetKernelArg(k, 8, sizeof mAW, &mAW));\n", o);
+        if (nm > 0) fputs("        CK(clSetKernelArg(k, 9, sizeof mAWO, &mAWO));\n"
+                          "        CK(clSetKernelArg(k, 10, sizeof mAWL, &mAWL));\n", o);
+    }
+    fputs("        /* Double-buffered: enqueue the next tile before waiting on the\n"
           "           current, so the GPU never idles on the host between launches.\n"
           "           At most two tiles in flight; drained before the next prefix\n"
           "           overwrites the shared pfx buffer. */\n"
