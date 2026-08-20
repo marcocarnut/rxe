@@ -1492,7 +1492,7 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
     char *ksrc = NULL; size_t ksz = 0;
     FILE *ms = open_memstream(&ksrc, &ksz);
     fputs(RXEJIT_CL, ms);
-    fprintf(ms, "__constant uchar A0[] = {");
+    fprintf(ms, "static __constant uchar A0[] = {");   // 'static': see emit_cl_wheel_tables
     for (int j = 0; j < R * L; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)sw->base[j]);
     fputs("};\n", ms);
     // T (total bytes), PLEN (prefix bytes), GW (low wheels) come in per length
@@ -1678,19 +1678,24 @@ static void emit_cl_lay(FILE *ms, const struct wheel *w, const char *tb,
 }
 
 // Emit one wheel's __constant tables into the kernel: the bytes A<i>, and for a
-// variable wheel the per-alternative offset/length A<i>o / A<i>l.
+// variable wheel the per-alternative offset/length A<i>o / A<i>l. Declared
+// 'static' (internal linkage): a plain program-scope __constant has external
+// linkage, and NVIDIA's OpenCL (NVVM->PTX) then merges identical arrays -- eight
+// [a-z] wheels are byte-for-byte equal -- into an unresolved '.extern' that ptxas
+// rejects ("'.extern' variable 'A7' cannot be resolved by a '.static'"). 'static'
+// keeps each its own local symbol; harmless on the Intel/AMD/Mesa stacks.
 static void emit_cl_wheel_tables(FILE *ms, const struct wheel *w, int i)
 {
     int bytes = w->L ? w->n * w->L : w->aoff[w->n - 1] + w->alen[w->n - 1];
-    fprintf(ms, "__constant uchar A%d[] = {", i);
+    fprintf(ms, "static __constant uchar A%d[] = {", i);
     if (bytes == 0) fputs("0", ms);
     for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)w->base[j]);
     fputs("};\n", ms);
     if (w->L == 0) {
-        fprintf(ms, "__constant int A%do[] = {", i);
+        fprintf(ms, "static __constant int A%do[] = {", i);
         for (int j = 0; j < w->n; j++) fprintf(ms, "%s%d", j ? "," : "", w->aoff[j]);
         fputs("};\n", ms);
-        fprintf(ms, "__constant int A%dl[] = {", i);
+        fprintf(ms, "static __constant int A%dl[] = {", i);
         for (int j = 0; j < w->n; j++) fprintf(ms, "%s%d", j ? "," : "", w->alen[j]);
         fputs("};\n", ms);
     }
@@ -1736,7 +1741,7 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
     fprintf(ms, "#define MAXW %d\n#define MAXHITS %d\n#define NPERM %lluULL\n"
                 "#define NP %d\n#define LO %d\n", maxw, 1 << 20, NPERM, n, lo);
     for (int i = 0; i < nw; i++) emit_cl_wheel_tables(ms, &B->w[i], i);
-    fputs("__constant ulong PSZ[] = {", ms);
+    fputs("static __constant ulong PSZ[] = {", ms);
     for (int s = 0; s <= hi; s++) fprintf(ms, "%s%lluUL", s ? "," : "", PSZ[s]);
     fputs("};\n", ms);
     // The pool tables (PB, and PO/PL when uneven) and, for a combination, the
@@ -2037,7 +2042,7 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
     fprintf(ms, "#define MAXW %d\n#define MAXHITS %d\n#define NPOL %lluUL\n",
             maxw, 1 << 20, NPOL);
     for (int i = 0; i < nw; i++) emit_cl_wheel_tables(ms, &B->w[i], i);
-    emit_policy_tables(ms, B, "__constant", "ulong", &NPOL, &why);   // re-bakes; same order
+    emit_policy_tables(ms, B, "static __constant", "ulong", &NPOL, &why);   // 'static': see emit_cl_wheel_tables
 
     fputs("__kernel void crackP(ulong base, ulong NALL,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
@@ -2244,15 +2249,15 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     fputs(RXEJIT_CL, ms);
     for (int g = 0; g < G; g++) {
         int bytes = lw[g].L ? lw[g].n * lw[g].L : lw[g].aoff[lw[g].n - 1] + lw[g].alen[lw[g].n - 1];
-        fprintf(ms, "__constant uchar A%d[] = {", g);
+        fprintf(ms, "static __constant uchar A%d[] = {", g);   // 'static': see emit_cl_wheel_tables
         if (bytes == 0) fputs("0", ms);
         for (int j = 0; j < bytes; j++) fprintf(ms, "%s%d", j ? "," : "", (unsigned char)lw[g].base[j]);
         fputs("};\n", ms);
         if (lw[g].L == 0) {                       // a variable wheel: offset/length per alternative
-            fprintf(ms, "__constant int A%do[] = {", g);
+            fprintf(ms, "static __constant int A%do[] = {", g);
             for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].aoff[j]);
             fputs("};\n", ms);
-            fprintf(ms, "__constant int A%dl[] = {", g);
+            fprintf(ms, "static __constant int A%dl[] = {", g);
             for (int j = 0; j < lw[g].n; j++) fprintf(ms, "%s%d", j ? "," : "", lw[g].alen[j]);
             fputs("};\n", ms);
         }
