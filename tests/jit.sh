@@ -387,9 +387,10 @@ then printf 'FAIL  -d should decline a policy\n'; fail=$((fail + 1)); else pass=
 emits_compiles '([01]|[ab]){{3!1,0}}'
 emits_compiles -n '([01]|[ab]){{2,3!1,0}}'
 emits_compiles -m /dev/null -H md5 '([a-z]|[0-9]){{3!2,1}}'
-# A policy is not yet on the GPU, so -G must decline it (and stay on the CPU).
-if "$RXEJIT" -G -m /dev/null -H md5 '([a-z]|[0-9]){{3!2,1}}' >/dev/null 2>&1
-then printf 'FAIL  -G should decline a policy\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+# A policy whose widest candidate overflows one hash block cannot run on the GPU,
+# so -G must decline it (a length-60 member is past MD5's 55-byte single block).
+if "$RXEJIT" -G -m /dev/null -H md5 '([a-z]|[0-9]){{60!1,1}}' >/dev/null 2>&1
+then printf 'FAIL  -G should decline a too-wide policy\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.
@@ -602,6 +603,32 @@ EOF
     # width: 4 words of 7 = 28, *2 = 56 >= 56) rather than emit a wrong kernel.
     if "$RXEJIT" -G -m /dev/null -H ntlm '(battery|horse|staple|correct){{1,4!}}' >/dev/null 2>&1
     then printf 'FAIL  -G ntlm perm should decline (too wide)\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+
+    # Policy compositions run whole on the GPU too: each lane binary-searches its
+    # index into a (length, count-vector) segment and unranks the arrangement and
+    # characters. The hit set must match the CPU keycrack, so the minimal-first
+    # order and the whole decode agree on the device. Targets are a few of the
+    # pattern's own members, by the independent oracle.
+    gpol() {   # <alg> <hashcmd|ntlm> <pattern>
+        "$RXEJIT" "$3" 2>/dev/null | sed -n '1p;4p;9p' > "$tmp/pm"
+        : > "$tmp/pt"
+        while IFS= read -r w; do
+            if [ "$2" = ntlm ]; then "$tmp/ntlmgen" "$w" >> "$tmp/pt"
+            else printf '%s' "$w" | $2 | cut -d' ' -f1 >> "$tmp/pt"; fi
+        done < "$tmp/pm"
+        "$RXEJIT" -G -m "$tmp/pt" -H "$1" "$3" 2>/dev/null | sort > "$tmp/pg"
+        "$RXEJIT"    -m "$tmp/pt" -H "$1" "$3" 2>/dev/null | sort > "$tmp/pc"
+        if cmp -s "$tmp/pg" "$tmp/pc"; then pass=$((pass + 1)); else
+            printf 'FAIL  -G policy -H %s %s\n        GPU hit set differs from CPU\n' "$1" "$3"; fail=$((fail + 1)); fi
+    }
+    gpol md5 md5sum '([a-z]|[0-9]){{3!2,1}}'       # 2 lower + 1 digit, length 3
+    gpol md5 md5sum '([a-z]|[0-9]){{2,3!1,1}}'     # a length range, minimal-first
+    gpol md5 md5sum '([01]|[AB]|[abc]){{4!1,1,2}}' # three classes, uneven floors
+    gpol md5 md5sum 'x([01]|[ab]){{2!1,0}}y'       # pre and post around the policy
+    gpol md5 md5sum '([a-z]|[0-9]){{3!1,+}}'       # '+' soaker
+    [ "$have_sha1" = 1 ]   && gpol sha1   sha1sum   '([a-z]|[0-9]){{3!2,1}}'
+    [ "$have_sha256" = 1 ] && gpol sha256 sha256sum '([a-z]|[0-9]){{3!2,1}}'
+    [ "$have_ntlm" = 1 ]   && gpol ntlm   ntlm      '([a-z]|[0-9]){{3!2,1}}'
 
     # The -p occupancy monitor is timing-only (stderr) and must not change the hits.
     "$RXEJIT" -G      -m "$tmp/md5t" -H md5 '[a-z]{1,4}' 2>/dev/null | sort > "$tmp/gp0"
