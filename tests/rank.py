@@ -72,6 +72,15 @@ FINITE = [
     r"([ab])\1|([ab]){2}\2", r"(([ab])(c)){2}\2", r"(a|a)\1", r"(\d{2})-\1",
     # roman numerals, finite
     r"M{0,2}(C{0,2}|CD|DC{0,2}|CM)",
+    # policy composition {{n,m!floors}}: a length range over the union of the
+    # branches with a floor per branch (a password policy). A '+' soaker (order
+    # only), a policy inside a concatenation (place value), one-of-each, and
+    # overlapping branches so a character reaches more than one branch -- a
+    # duplicate, so rank must return every index the string sits at.
+    r"([01]|[ab]){{3!1,0}}", r"([01]|[AB]|[abc]){{4!1,1,2}}",
+    r"([01]|[ab]){{2,3!1,0}}", r"([01]|[ab]){{3!1,+}}",
+    r"(a|b|c){{3!1,1,1}}", r"x([01]|[ab]){{2!1,0}}y",
+    r"([ab]|[bc]){{2!1,0}}",
 ]
 
 # Sets rank is not meant to answer yet: it must refuse them by name, never

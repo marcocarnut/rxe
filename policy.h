@@ -35,9 +35,13 @@ void rxe_policy_nitems(mpz_t out, struct rxe *base, int lo, int hi,
 void rxe_policy_make(struct rxe_node *node, int lo, int hi,
                      const int *floors, int nfloors, int soaker);
 
-// Select / step. Slice 1 ships the count only; these report past-end so
-// enumeration is a clean no-op until slice 2 lands the unrank.
 int rxe_policy_seek(struct rxe_node *node, const mpz_t pos);
 int rxe_policy_iterate(struct rxe_node *node);
+
+// The local index of a member from its decomposition: cls[p] is the branch that
+// position p belongs to, cidx[p] the character chosen within that branch. The
+// exact inverse of the seek, used by rank to turn a member back into its index.
+void rxe_policy_local(struct rxe_node *node, const int *cls, const int *cidx,
+                      int L, mpz_t out);
 
 #endif

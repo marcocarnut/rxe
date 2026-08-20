@@ -43,6 +43,7 @@
 #include <string.h>
 #include "rxe.h"
 #include "lens.h"
+#include "policy.h"
 
 static const char *g_reason;
 
@@ -50,11 +51,14 @@ static const char *g_reason;
 // its own, a repeat or comb the geometric or binomial sum in nitems.
 static void node_card(mpz_t out, struct rxe_node *node)
 {
-    if (node->rxe && !node->is_repeat && !node->is_comb)
+    if (node->rxe && !node->is_repeat && !node->is_comb && !node->is_policy)
         mpz_set(out, node->rxe->nitems);
     else
         mpz_set(out, node->nitems);
 }
+
+static void policy_count(mpz_t out, struct rxe_node *node,
+                         const char *s, int off, int q);
 
 // Place value of a node: the product of the cardinalities of every node less
 // significant than it. The last node is least significant, so a node's weight
@@ -148,6 +152,7 @@ static void count_node(mpz_t out, struct rxe_node *node,
     mpz_set_ui(out, 0);
 
     if (node->is_comb) { comb_count(out, node, s, off, q); return; }
+    if (node->is_policy) { policy_count(out, node, s, off, q); return; }
     if (node->is_repeat) {
         // A run of k copies of the body, k in [rep_min, rep_max]. R[j][pos] is
         // the number of ways the tail from position off+pos is matched by
@@ -264,6 +269,9 @@ static int enum_rxe(struct rxe *rxe, const char *s, int len,
 // d being the node's own index for that match. It threads the string only,
 // never the whole assembled index.
 typedef int (*emit_fn)(void *ectx, mpz_srcptr d, int q);
+
+static int policy_walk(struct rxe_node *node, const char *s, int off, int len,
+                       emit_fn emit, void *ectx);
 
 // A combinatorial choice reports each of its members through this, the local
 // index and the position the member ends at. Defined with the {{k}} code below.
@@ -448,6 +456,8 @@ static int enum_node(struct rxe_node *node, const char *s, int off, int len,
         struct comb_emit_ctx c = { emit, ectx };
         return comb_walk(node, s, off, len, comb_emit_cb, &c);
     }
+    if (node->is_policy)                      // a {{n,m!floors}} policy
+        return policy_walk(node, s, off, len, emit, ectx);
     if (node->is_shuffle) {                   // a keyed group: remap the index
         for (int q = off; q <= len; q++) {
             struct shuf_bridge b = { emit, ectx, q, node->shuffle };
@@ -687,6 +697,125 @@ static int comb_walk(struct rxe_node *node, const char *s, int off, int len,
     return stop;
 }
 
+// Ranking a policy composition. A member of length L is a string over the union
+// of the branches; to rank it we recover, for each position, which branch it
+// came from and its index within that branch -- its decomposition -- then hand
+// that to rxe_policy_local, the inverse of the seek. A character that lies in
+// more than one branch (overlapping classes) gives that position more than one
+// choice, so the member reaches more than one index -- the library's usual
+// duplicate contract, honoured by walking every decomposition.
+#define PMAX_OPT 8                 // choices per character before overlap is capped
+
+struct pwalk {
+    struct rxe_node *node;
+    const char *s;
+    int  off, k;
+    int *cmN;                      // options for byte value c
+    int (*cmT)[PMAX_OPT];          // the branch of each option
+    int (*cmC)[PMAX_OPT];          // the index within that branch
+    int *cls, *cidx;               // the decomposition being built
+    int *cnt;                      // scratch: per-branch tally
+    emit_fn emit;
+    void *ectx;
+    int  count_only;               // count valid decompositions rather than emit
+    mpz_ptr counter;
+};
+
+static int pwalk_rec(struct pwalk *w, int L, int p)
+{
+    if (p == L) {
+        int k = w->k;
+        for (int i = 0; i < k; i++) w->cnt[i] = 0;
+        for (int q = 0; q < L; q++) w->cnt[w->cls[q]]++;
+        const int *fl = w->node->policy_floor;
+        for (int i = 0; i < k; i++)
+            if (w->cnt[i] < (fl[i] < 0 ? 0 : fl[i])) return 0;   // a floor unmet: not a member
+        if (w->count_only) { mpz_add_ui(w->counter, w->counter, 1); return 0; }
+        mpz_t idx;
+        mpz_init(idx);
+        rxe_policy_local(w->node, w->cls, w->cidx, L, idx);
+        int stop = w->emit(w->ectx, idx, w->off + L);
+        mpz_clear(idx);
+        return stop;
+    }
+    unsigned char c = (unsigned char)w->s[w->off + p];
+    for (int o = 0; o < w->cmN[c]; o++) {
+        w->cls[p]  = w->cmT[c][o];
+        w->cidx[p] = w->cmC[c][o];
+        if (pwalk_rec(w, L, p + 1)) return 1;
+    }
+    return 0;                       // no option for this character: dead end
+}
+
+// Shared by the emit walk and the count: build the character map once, then
+// decompose s[off..off+L) for each length L in [Llo,Lhi].
+static int policy_run(struct rxe_node *node, const char *s, int off, int len,
+                      int Llo, int Lhi, emit_fn emit, void *ectx,
+                      int count_only, mpz_ptr counter)
+{
+    int cmN[256];
+    int cmT[256][PMAX_OPT], cmC[256][PMAX_OPT];         // 16 KB, well within the stack
+    for (int i = 0; i < 256; i++) cmN[i] = 0;
+
+    // Map each character to the (branch, index-within-branch) it can come from,
+    // by rendering every member of every branch once.
+    int t = 0;
+    char buf[8];
+    mpz_t u;
+    mpz_init(u);
+    for (struct rxe_alt *a = node->rxe->head; a; a = a->next, t++) {
+        if (!mpz_fits_ulong_p(a->nitems)) continue;         // width-1 keeps this small
+        unsigned long sz = mpz_get_ui(a->nitems);
+        for (unsigned long ci = 0; ci < sz; ci++) {
+            mpz_add_ui(u, a->start, ci);
+            rxe_seek(node->rxe, u);
+            buf[0] = 0;
+            rxe_current(buf, (int)sizeof buf, node->rxe);
+            unsigned char c = (unsigned char)buf[0];
+            if (buf[0] && cmN[c] < PMAX_OPT) {
+                cmT[c][cmN[c]] = t;
+                cmC[c][cmN[c]] = (int)ci;
+                cmN[c]++;
+            }
+        }
+    }
+    mpz_clear(u);
+
+    struct pwalk w;
+    w.node = node; w.s = s; w.off = off; w.k = node->policy_nfloor;
+    w.cmN = cmN; w.cmT = cmT; w.cmC = cmC;
+    w.cls  = NEW(Lhi > 0 ? Lhi : 1, int);
+    w.cidx = NEW(Lhi > 0 ? Lhi : 1, int);
+    w.cnt  = NEW(w.k > 0 ? w.k : 1, int);
+    w.emit = emit; w.ectx = ectx; w.count_only = count_only; w.counter = counter;
+
+    int stop = 0;
+    for (int L = Llo; L <= Lhi && !stop; L++) {
+        if (off + L > len) break;
+        stop = pwalk_rec(&w, L, 0);
+    }
+    rxe_mem_free(w.cls); rxe_mem_free(w.cidx); rxe_mem_free(w.cnt);
+    return stop;
+}
+
+static int policy_walk(struct rxe_node *node, const char *s, int off, int len,
+                       emit_fn emit, void *ectx)
+{
+    return policy_run(node, s, off, len, node->rep_min, node->rep_max,
+                      emit, ectx, 0, NULL);
+}
+
+// The count that consumes exactly s[off..q): the valid decompositions of that
+// one length, each a distinct index.
+static void policy_count(mpz_t out, struct rxe_node *node,
+                         const char *s, int off, int q)
+{
+    mpz_set_ui(out, 0);
+    int L = q - off;
+    if (L < node->rep_min || L > node->rep_max) return;
+    policy_run(node, s, off, q, L, L, NULL, NULL, 1, out);
+}
+
 // Count is the choices that consume exactly s[off..q); a choice ending short of
 // q fills a smaller segment and belongs to another split, so it is not counted
 // here. Each valid choice is one index, so counting them is counting indices.
@@ -716,26 +845,9 @@ static void comb_count(mpz_t out, struct rxe_node *node,
 // infinite set to the length-indexed ranker in lens.c; a non-shortlex infinite
 // set -- a backreference that keeps an infinite set in diagonal order -- is
 // refused, as is a shortlex set the ranker does not cover yet.
-// A policy composition {{n,m!floors}} enumerates and seeks, but its inverse --
-// ranking a member back to its index -- is not implemented yet, so a tree that
-// holds one is refused rather than mis-ranked through the base alternation.
-static int tree_has_policy(struct rxe *rxe)
-{
-    for (struct rxe_alt *a = rxe->head; a; a = a->next)
-        for (struct rxe_node *n = a->head; n; n = n->next) {
-            if (n->is_policy) return 1;
-            if (n->rxe && !n->is_backref && tree_has_policy(n->rxe)) return 1;
-        }
-    return 0;
-}
-
 static int rank_walk(struct rxe *rxe, const char *s, rank_sink sink, void *ctx)
 {
     if (!rxe) { g_reason = "null expression"; return -1; }
-    if (tree_has_policy(rxe)) {
-        g_reason = "a policy composition, which rank does not handle yet";
-        return -1;
-    }
     if (rxe_is_infinite(rxe)) {
         if (!rxe_is_shortlex(rxe)) {
             g_reason = "infinite set kept in diagonal order by a backreference";

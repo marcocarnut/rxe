@@ -145,20 +145,24 @@ void rxe_policy_nitems(mpz_t out, struct rxe *base, int lo, int hi,
 
 /* --------------------------- Decoding ----------------------------------- */
 
-// State threaded through the count-vector walk: everything the search needs to
-// size a segment and, when the index lands in one, to keep it.
+// State threaded through the count-vector walk, which serves both directions.
+// Decode (target == NULL): 'j' is the remaining index; each skipped segment is
+// subtracted, and the segment it lands in is kept in 'cv'. Rank (target set):
+// the sizes of the segments strictly before 'target' in the walk order are
+// accumulated into 'acc', stopping at target -- the offset of target's block.
 struct pdec {
     int k, L, soaker, f;
     mpz_t *s;                 // branch cardinalities
     const int *floors;
-    mpz_t j;                  // remaining index; each skipped segment is subtracted
+    mpz_t j;                  // decode: remaining index
+    mpz_t acc;                // rank: sum of sizes before the target
+    const int *target;        // rank: the count-vector whose offset we want
     int *ext;                 // scratch: per-branch surplus above the floor
-    int *cv;                  // output: the found count-vector
+    int *cv;                  // decode output: the found count-vector
     int found;
 };
 
-// Test one fully-assigned count-vector: if the remaining index falls inside its
-// block, keep it and stop; otherwise subtract its size and go on.
+// Consider one fully-assigned count-vector in walk order.
 static int pdec_take(struct pdec *c)
 {
     int k = c->k, nssum = 0;
@@ -169,9 +173,17 @@ static int pdec_take(struct pdec *c)
     mpz_t seg;
     mpz_init(seg);
     seg_size(seg, c->L, cv, c->s, k);
-    int hit = mpz_cmp(c->j, seg) < 0;
-    if (hit) c->found = 1;
-    else     mpz_sub(c->j, c->j, seg);
+    int hit;
+    if (c->target) {                                  // rank: stop at the target
+        hit = 1;
+        for (int i = 0; i < k; i++) if (cv[i] != c->target[i]) { hit = 0; break; }
+        if (hit) c->found = 1;
+        else     mpz_add(c->acc, c->acc, seg);
+    } else {                                           // decode: stop where j lands
+        hit = mpz_cmp(c->j, seg) < 0;
+        if (hit) c->found = 1;
+        else     mpz_sub(c->j, c->j, seg);
+    }
     mpz_clear(seg);
     return hit;
 }
@@ -219,11 +231,12 @@ static int policy_decode(struct rxe_node *node, const mpz_t pos)
     for (int i = 0; i < k; i++) if (i != soaker) ns[m++] = i;
     struct pdec c;
     c.k = k; c.L = L; c.soaker = soaker; c.f = L - floor_sum(node->policy_floor, k);
-    c.s = s; c.floors = node->policy_floor; c.found = 0;
+    c.s = s; c.floors = node->policy_floor; c.found = 0; c.target = NULL;
     c.ext = NEW(k, int); c.cv = NEW(k, int);
     mpz_init_set(c.j, j);
+    mpz_init(c.acc);
     for (int d = 0; d <= c.f && !c.found; d++) pdec_walk(&c, ns, m, 0, d);
-    mpz_clear(j);
+    mpz_clear(j); mpz_clear(c.acc);
 
     // 3. within the count-vector: arrangement (multiset permutation) and chars.
     int rc = 1;
@@ -275,6 +288,84 @@ static int policy_decode(struct rxe_node *node, const mpz_t pos)
     for (int i = 0; i < k; i++) { mpz_clear(s[i]); mpz_clear(start[i]); }
     rxe_mem_free(s); rxe_mem_free(start);
     return rc;
+}
+
+// The local index of a member from its decomposition: the class of each
+// position (cls[p], a branch index) and the character chosen within it
+// (cidx[p]). Exact inverse of policy_decode -- shorter lengths, then the
+// count-vectors before this one in the minimal-first walk, then the arrangement
+// (a multiset-permutation rank) and the characters (a mixed radix).
+void rxe_policy_local(struct rxe_node *node, const int *cls, const int *cidx,
+                      int L, mpz_t out)
+{
+    int k = node->policy_nfloor;
+    int lo = node->rep_min, hi = node->rep_max;
+    int soaker = node->policy_soaker >= 0 ? node->policy_soaker : k - 1;
+
+    mpz_t *s = NEW(k, mpz_t), *start = NEW(k, mpz_t);
+    branch_info(node->rxe, s, start, k);
+
+    int *cv = NEW(k, int);
+    for (int i = 0; i < k; i++) cv[i] = 0;
+    for (int p = 0; p < L; p++) cv[cls[p]]++;
+
+    // 1. shorter lengths, all laid before this one.
+    mpz_t *dp = NEW(hi + 1, mpz_t);
+    for (int j = 0; j <= hi; j++) mpz_init(dp[j]);
+    policy_dp(node->rxe, hi, node->policy_floor, k, dp);
+    mpz_set_ui(out, 0);
+    for (int Lp = lo; Lp < L; Lp++) mpz_add(out, out, dp[Lp]);
+    for (int j = 0; j <= hi; j++) mpz_clear(dp[j]);
+    rxe_mem_free(dp);
+
+    // 2. the count-vectors laid before this one in minimal-first order.
+    int *ns = NEW(k > 0 ? k : 1, int), m = 0;
+    for (int i = 0; i < k; i++) if (i != soaker) ns[m++] = i;
+    struct pdec c;
+    c.k = k; c.L = L; c.soaker = soaker; c.f = L - floor_sum(node->policy_floor, k);
+    c.s = s; c.floors = node->policy_floor; c.found = 0; c.target = cv;
+    c.ext = NEW(k, int); c.cv = NEW(k, int);
+    mpz_init_set_ui(c.j, 0);
+    mpz_init_set_ui(c.acc, 0);
+    for (int d = 0; d <= c.f && !c.found; d++) pdec_walk(&c, ns, m, 0, d);
+    mpz_add(out, out, c.acc);
+    mpz_clear(c.j); mpz_clear(c.acc);
+    rxe_mem_free(c.ext); rxe_mem_free(c.cv); rxe_mem_free(ns);
+
+    // 3. within the count-vector: the arrangement rank * char_size + char rank.
+    mpz_t char_size;
+    mpz_init_set_ui(char_size, 1);
+    { mpz_t p; mpz_init(p);
+      for (int i = 0; i < k; i++) { mpz_pow_ui(p, s[i], (unsigned long)cv[i]); mpz_mul(char_size, char_size, p); }
+      mpz_clear(p); }
+
+    mpz_t arr;
+    mpz_init_set_ui(arr, 0);
+    { int *rem = NEW(k, int); for (int i = 0; i < k; i++) rem[i] = cv[i];
+      mpz_t ways; mpz_init(ways);
+      for (int p = 0; p < L; p++) {
+          int t = cls[p];
+          for (int u = 0; u < t; u++) {
+              if (rem[u] == 0) continue;
+              rem[u]--; multinom(ways, L - p - 1, rem, k); mpz_add(arr, arr, ways); rem[u]++;
+          }
+          rem[t]--;
+      }
+      mpz_clear(ways); rxe_mem_free(rem); }
+
+    mpz_t chr;
+    mpz_init_set_ui(chr, 0);
+    for (int p = 0; p < L; p++) { mpz_mul(chr, chr, s[cls[p]]); mpz_add_ui(chr, chr, (unsigned long)cidx[p]); }
+
+    mpz_t tmp;
+    mpz_init(tmp);
+    mpz_mul(tmp, arr, char_size);
+    mpz_add(out, out, tmp);
+    mpz_add(out, out, chr);
+    mpz_clear(tmp); mpz_clear(arr); mpz_clear(chr); mpz_clear(char_size);
+
+    for (int i = 0; i < k; i++) { mpz_clear(s[i]); mpz_clear(start[i]); }
+    rxe_mem_free(s); rxe_mem_free(start); rxe_mem_free(cv);
 }
 
 /* --------------------------- Public API --------------------------------- */
