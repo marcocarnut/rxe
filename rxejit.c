@@ -1622,12 +1622,13 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
           "    for (int k = AMIN; k <= BMAX; k++) { unsigned long long rk = 1; for (int i = 0; i < k; i++) rk *= R; NALL += rk; }\n"
           "    double t0 = rt_now(), tlast = t0; unsigned long long done = 0, gpu_ns = 0;\n"
           "#endif\n"
-          "    for (int k = AMIN; k <= BMAX; k++) {\n"
+          "    int allfound = 0;\n"
+          "    for (int k = AMIN; k <= BMAX && !allfound; k++) {\n"
           "        int gw = k < GT ? k : GT, hi = k - gw, plen = hi * L;\n"
           "        cl_ulong loN = 1; for (int i = 0; i < gw; i++) loN *= R;\n"
           "        cl_ulong npfx = 1; for (int i = 0; i < hi; i++) npfx *= R;\n"
           "        CK(clSetKernelArg(kern[k], 1, sizeof loN, &loN));\n"
-          "        for (cl_ulong pi = 0; pi < npfx; pi++) {\n"
+          "        for (cl_ulong pi = 0; pi < npfx && !allfound; pi++) {\n"
           "            unsigned char pbuf[MAXW]; cl_ulong pf = pi;\n"
           "            for (int hp = hi - 1; hp >= 0; hp--) { unsigned dd = pf % R; pf /= R;\n"
           "                for (int t = 0; t < L; t++) pbuf[hp*L + t] = A0h[dd*L + t]; }\n"
@@ -1639,7 +1640,10 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
           "                CK(clSetKernelArg(kern[k], 0, sizeof base, &base));\n"
           "                cl_event ev;\n"
           "                CK(clEnqueueNDRangeKernel(q, kern[k], 1, NULL, &global, NULL, 0, NULL, &ev));\n"
-          "                if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
+          "                if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
+          "                    /* Stop once every target is cracked (mn synced by the wait). */\n"
+          "                    cl_uint hc = 0; CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof hc, &hc, 0, NULL, NULL));\n"
+          "                    if (hc >= ntgt) { prev = ev; prev_n = n; allfound = 1; break; } }\n"
           "                prev = ev; prev_n = n;\n"
           "            }\n"
           "            if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
@@ -1686,34 +1690,58 @@ static void emit_cl_lay(FILE *ms, const struct wheel *w, int bb, int mb, const c
 // (The wheels' bytes lie back to back, so wheel i's alternative d starts at
 // AW[byte_base[i] + d*L]; a variable wheel's (offset,length) sit at
 // AWO/AWL[meta_base[i] + d] and its bytes at AW[byte_base[i] + offset].)
+static int cl_wheel_bytes(const struct wheel *w)
+{
+    return w->L ? w->n * w->L : (w->n ? w->aoff[w->n - 1] + w->alen[w->n - 1] : 0);
+}
+// Whether two wheels are the same table -- same shape and bytes (and, for a
+// variable wheel, the same offset/length lists). Identical wheels share one copy
+// in AW[], so (re){n}'s n repeats of one class store the class once.
+static int cl_wheels_equal(const struct wheel *a, const struct wheel *b)
+{
+    if (a->L != b->L || a->n != b->n) return 0;
+    int nb = cl_wheel_bytes(a);
+    if (nb != cl_wheel_bytes(b)) return 0;
+    if (nb && memcmp(a->base, b->base, (size_t)nb)) return 0;
+    if (a->L == 0)
+        for (int j = 0; j < a->n; j++)
+            if (a->aoff[j] != b->aoff[j] || a->alen[j] != b->alen[j]) return 0;
+    return 1;
+}
+
 static void emit_cl_merged(FILE *ms, const struct wheel *w, int nw,
                            int *byte_base, int *meta_base)
 {
-    int nb = 0, nm = 0;
+    int nb = 0, nm = 0, novel[MAXW];    // novel[i]: does wheel i add a fresh copy?
     for (int i = 0; i < nw; i++) {
+        int dup = -1;
+        for (int j = 0; j < i; j++) if (cl_wheels_equal(&w[i], &w[j])) { dup = j; break; }
+        if (dup >= 0) {                 // reuse the earlier identical wheel's slot
+            byte_base[i] = byte_base[dup]; meta_base[i] = meta_base[dup]; novel[i] = 0;
+            continue;
+        }
+        novel[i] = 1;
         byte_base[i] = nb; meta_base[i] = nm;
-        nb += w[i].L ? w[i].n * w[i].L
-                     : (w[i].n ? w[i].aoff[w[i].n - 1] + w[i].alen[w[i].n - 1] : 0);
+        nb += cl_wheel_bytes(&w[i]);
         if (w[i].L == 0) nm += w[i].n;
     }
     fputs("static __constant uchar AW[] = {", ms);
     if (nb == 0) fputs("0", ms);
     { int first = 1;
-      for (int i = 0; i < nw; i++) {
-          int bytes = w[i].L ? w[i].n * w[i].L
-                             : (w[i].n ? w[i].aoff[w[i].n - 1] + w[i].alen[w[i].n - 1] : 0);
+      for (int i = 0; i < nw; i++) if (novel[i]) {
+          int bytes = cl_wheel_bytes(&w[i]);
           for (int j = 0; j < bytes; j++) { fprintf(ms, "%s%d", first ? "" : ",", (unsigned char)w[i].base[j]); first = 0; }
       } }
     fputs("};\n", ms);
     if (nm > 0) {
         int first = 1;
         fputs("static __constant int AWO[] = {", ms);
-        for (int i = 0; i < nw; i++) if (w[i].L == 0)
+        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
             for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].aoff[j]); first = 0; }
         fputs("};\n", ms);
         first = 1;
         fputs("static __constant int AWL[] = {", ms);
-        for (int i = 0; i < nw; i++) if (w[i].L == 0)
+        for (int i = 0; i < nw; i++) if (novel[i] && w[i].L == 0)
             for (int j = 0; j < w[i].n; j++) { fprintf(ms, "%s%d", first ? "" : ",", w[i].alen[j]); first = 0; }
         fputs("};\n", ms);
     }
@@ -1988,7 +2016,11 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
           "        CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
           "        cl_event ev;\n"
           "        CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, &ev));\n"
-          "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
+          "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
+          "            /* Stop once every target is cracked: the finished tiles' hit\n"
+          "               count (mn is already synced by the wait) has reached ntgt. */\n"
+          "            cl_uint hc = 0; CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof hc, &hc, 0, NULL, NULL));\n"
+          "            if (hc >= ntgt) { prev = ev; prev_n = nn; break; } }\n"
           "        prev = ev; prev_n = nn;\n"
           "    }\n"
           "    if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
@@ -2184,7 +2216,11 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "        CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
           "        cl_event ev;\n"
           "        CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, &ev));\n"
-          "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
+          "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
+          "            /* Stop once every target is cracked: the finished tiles' hit\n"
+          "               count (mn is already synced by the wait) has reached ntgt. */\n"
+          "            cl_uint hc = 0; CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof hc, &hc, 0, NULL, NULL));\n"
+          "            if (hc >= ntgt) { prev = ev; prev_n = nn; break; } }\n"
           "        prev = ev; prev_n = nn;\n"
           "    }\n"
           "    if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
@@ -2394,7 +2430,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    cl_mem mpfx = clCreateBuffer(ctx, CL_MEM_READ_ONLY, MAXW, NULL, &e); CK(e);\n\n"
           "    cl_ulong TILE = 1ULL << 24, loN = LON;\n"
           "#if PSEC\n    double t0 = rt_now(), tlast = t0; unsigned long long gpu_ns = 0, done = 0;\n#endif\n"
-          "    unsigned char rec[MAXW + 1]; int plen;\n"
+          "    unsigned char rec[MAXW + 1]; int plen, allfound = 0;\n"
           "    while (fread(rec, 1, 1, pf) == 1 && (plen = rec[0]) >= 0) {\n"
           "        if (plen > MAXW) { fprintf(stderr, \"rxejit -G: bad prefix\\n\"); return 2; }\n"
           "        if (plen && fread(rec, 1, plen, pf) != (size_t)plen) break;\n"
@@ -2418,10 +2454,14 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "            CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
           "            cl_event ev;\n"
           "            CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, &ev));\n"
-          "            if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
+          "            if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
+          "                /* Stop once every target is cracked (mn synced by the wait). */\n"
+          "                cl_uint hc = 0; CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof hc, &hc, 0, NULL, NULL));\n"
+          "                if (hc >= ntgt) { prev = ev; prev_n = n; allfound = 1; break; } }\n"
           "            prev = ev; prev_n = n;\n"
           "        }\n"
           "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev); }\n"
+          "        if (allfound) break;\n"
           "    }\n"
           "    fclose(pf);\n"
           "    CK(clEnqueueReadBuffer(q, mn, CL_TRUE, 0, sizeof nhits, &nhits, 0, NULL, NULL));\n"
