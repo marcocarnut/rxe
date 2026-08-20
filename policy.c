@@ -155,6 +155,24 @@ void rxe_policy_nitems(mpz_t out, struct rxe *base, int lo, int hi,
 // would exceed 64 bits -- past what a u64 odometer digit can address -- or if
 // there are more than 'cap' segments. The walk mirrors pdec_walk exactly, so a
 // generated candidate at an index is the interpreter's member at it.
+// Whether an mpz fits an unsigned 64-bit int, and its value as one -- independent
+// of the platform's 'unsigned long' width (32 bits under emscripten/WASM, 64 on a
+// 64-bit host), which mpz_fits_ulong_p / mpz_get_ui follow. The segment offsets
+// run to 64 bits on any host, so the code generators need the full width there.
+static int mpz_fits_u64(const mpz_t z)
+{
+    return mpz_sgn(z) >= 0 && mpz_sizeinbase(z, 2) <= 64;
+}
+static unsigned long long mpz_get_u64(const mpz_t z)
+{
+    unsigned char buf[8] = {0};
+    size_t count = 0;
+    mpz_export(buf, &count, -1, 1, 0, 0, z);      // least-significant byte first
+    unsigned long long v = 0;
+    for (size_t i = 0; i < count && i < 8; i++) v |= (unsigned long long)buf[i] << (8 * i);
+    return v;
+}
+
 struct segw {
     int k, L, soaker, f, m, cap, nseg, err;
     const int *floors, *ns;
@@ -175,16 +193,16 @@ static void segw_emit(struct segw *w)
     for (int i = 0; i < k; i++)
         w->cv[i] = (w->floors[i] < 0 ? 0 : w->floors[i]) + w->ext[i];
     seg_size(w->seg, w->L, w->cv, w->s, k);
-    if (!mpz_fits_ulong_p(w->seg) || !mpz_fits_ulong_p(w->total)) {
+    if (!mpz_fits_u64(w->seg) || !mpz_fits_u64(w->total)) {
         w->err = 1; w->why = "more members than fit 64 bits"; return;
     }
     if (w->nseg >= w->cap) { w->err = 1; w->why = "too many policy segments to bake"; return; }
     w->seg_L[w->nseg] = w->L;
     for (int i = 0; i < k; i++) w->seg_cv[w->nseg * k + i] = w->cv[i];
-    w->seg_off[w->nseg] = mpz_get_ui(w->total);
+    w->seg_off[w->nseg] = mpz_get_u64(w->total);
     w->nseg++;
     mpz_add(w->total, w->total, w->seg);
-    if (!mpz_fits_ulong_p(w->total)) { w->err = 1; w->why = "more members than fit 64 bits"; }
+    if (!mpz_fits_u64(w->total)) { w->err = 1; w->why = "more members than fit 64 bits"; }
 }
 
 static void segw_walk(struct segw *w, int idx, int rem)
@@ -228,7 +246,7 @@ int rxe_policy_segments(const unsigned long *s_ul, int k, int lo, int hi,
             segw_walk(&w, 0, d);
         }
     }
-    if (!w.err) seg_off[w.nseg] = mpz_get_ui(w.total);   // grand total
+    if (!w.err) seg_off[w.nseg] = mpz_get_u64(w.total);   // grand total
 
     int rc = w.err ? -1 : w.nseg;
     if (w.err && why) *why = w.why;
