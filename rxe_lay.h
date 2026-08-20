@@ -79,6 +79,21 @@ struct build {
     int           perm_ordered;   // 1 = permutations {{k!}}, 0 = combinations {{k}}
     int           perm_chop;      // {{...?}}: bytes to quell from the last item
     struct wheel  perm_pool;
+
+    // A policy composition (A|B|...){{lo,hi!floors}}: every length lo..hi string
+    // over the union of the k width-1 branches with branch i at least floor_i
+    // times, in minimal-compliance-first order. Like the permutation it is one
+    // super-wheel -- pre = w[0..policy_at), post = the wheels after -- whose
+    // digit selects a (length, count-vector) segment (minimal-first) and, within
+    // it, an arrangement (a multiset permutation) and the characters. The pool is
+    // the baked union of the branches; s[i] / cstart[i] are branch i's member
+    // count and its start in that union. The segment table itself is built on
+    // demand by the back ends (rxe_policy_segments), not stored here.
+    int           policy_active, policy_at, policy_lo, policy_hi, policy_k, policy_soaker;
+    int           policy_floor[RXE_POLICY_MAXCLASS];
+    unsigned long policy_s[RXE_POLICY_MAXCLASS];
+    unsigned long policy_cstart[RXE_POLICY_MAXCLASS];
+    struct wheel  policy_pool;
 };
 
 // Gather the wheels for the whole pattern into 'b' (which need not be

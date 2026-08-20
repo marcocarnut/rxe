@@ -349,6 +349,48 @@ then printf 'FAIL  -d should decline a permutation\n'; fail=$((fail + 1)); else 
 if "$RXEJIT" -d '(a|b|c){{2}}' >/dev/null 2>&1
 then printf 'FAIL  -d should decline a combination\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
 
+# A policy composition (A|B|...){{lo,hi!floors}} is a super-wheel like the choice:
+# the digit unranks to a member -- length, count-vector (minimal-first), then the
+# arrangement and characters -- rebuilt each step. The codegen and the engine
+# must agree exactly, so the same enumeration/count diff pins it, including the
+# minimal-compliance-first order that is the operator's whole point.
+same '(a|b|c){{3!1,1,1}}'        # one of each, length 3 -- the 3! arrangements
+same '([01]|[ab]){{3!1,0}}'      # a floor of 0: the second class is unconstrained
+same '([01]|[ab]){{2,3!1,0}}'    # a length range unions the per-length blocks
+same '([01]|[ab]){{3!1,+}}'      # '+' marks the soaker (surplus absorber)
+same '([01]|[AB]|[abc]){{4!1,1,2}}'  # three classes, uneven floors and sizes
+same 'x([01]|[ab]){{2!1,0}}y'    # pre and post fixed wheels around the policy
+same '([01]|[ab]){{2!1,0}}[0-9]' # a post odometer, less significant than the policy
+same '([ab]|[bc]){{2!1,0}}'      # overlapping branches -> duplicate members
+# The count sink threads; the tally must not depend on the thread count.
+poc1=$("$RXEJIT" -n -j 1 '([a-z]|[0-9]){{4!1,1}}')
+poc8=$("$RXEJIT" -n -j 8 '([a-z]|[0-9]){{4!1,1}}')
+if [ "$poc1" = "$poc8" ] && [ "$poc1" = "1212640" ]; then pass=$((pass + 1)); else
+    printf 'FAIL  policy count: -j1=%s -j8=%s (want 1212640)\n' "$poc1" "$poc8"; fail=$((fail + 1)); fi
+# Keycracking a policy: hide members (2 lower + 1 digit, in various orders) and
+# the -m sink must find exactly them -- the CPU is the oracle. md5sum is the
+# independent check on the digests.
+if command -v md5sum >/dev/null 2>&1; then
+    : > "$tmp/polkh"
+    for w in ab5 z9q 5ab; do printf '%s' "$w" | md5sum | cut -d' ' -f1; done > "$tmp/polkh"
+    "$RXEJIT" -m "$tmp/polkh" -H md5 '([a-z]|[0-9]){{3!2,1}}' 2>/dev/null | sort > "$tmp/polgot"
+    { printf '%s:ab5\n' "$(printf ab5 | md5sum | cut -d' ' -f1)"
+      printf '%s:z9q\n' "$(printf z9q | md5sum | cut -d' ' -f1)"
+      printf '%s:5ab\n' "$(printf 5ab | md5sum | cut -d' ' -f1)"; } | sort > "$tmp/polwant"
+    if cmp -s "$tmp/polgot" "$tmp/polwant"; then pass=$((pass + 1)); else
+        printf 'FAIL  policy keycrack\n'; diff "$tmp/polwant" "$tmp/polgot"; fail=$((fail + 1)); fi
+fi
+# The dedup sink declines a policy (its members alias across positions), and -S
+# emits valid standalone C for the write, count, and keycrack sinks.
+if "$RXEJIT" -d '(a|b|c){{3!1,1,1}}' >/dev/null 2>&1
+then printf 'FAIL  -d should decline a policy\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+emits_compiles '([01]|[ab]){{3!1,0}}'
+emits_compiles -n '([01]|[ab]){{2,3!1,0}}'
+emits_compiles -m /dev/null -H md5 '([a-z]|[0-9]){{3!2,1}}'
+# A policy is not yet on the GPU, so -G must decline it (and stay on the CPU).
+if "$RXEJIT" -G -m /dev/null -H md5 '([a-z]|[0-9]){{3!2,1}}' >/dev/null 2>&1
+then printf 'FAIL  -G should decline a policy\n'; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+
 # Dictionaries: a [:name:] wheel of the word list, in the -D directory. Write and
 # count agree with rxenum -e; dedup finds the word repeated in the list.
 dict_ok() {

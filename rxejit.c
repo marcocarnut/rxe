@@ -51,6 +51,9 @@
 #include "rxejit_rt_embed.h"       // RXEJIT_RT: the runtime, as a C string
 #include "rxejit_cl_embed.h"       // RXEJIT_CL: the device runtime for -G
 #include "rxe_lay.h"       // regex -> odometer wheels, now in the library
+#include "policy.h"        // rxe_policy_segments: the policy segment table
+
+#define POLICY_MAXSEG 8192         // most (length, count-vector) blocks bakeable
 
 
 // What the generated loop does with each member. write is the default -- the
@@ -762,6 +765,189 @@ static void emit_perm_body(FILE *o, const struct build *B,
     if (acc) fputs("    *acc += n;\n", o);
 }
 
+// Build the policy's segment table for the code generators: one (length,
+// count-vector) block per segment, in minimal-compliance-first order, with the
+// cumulative offsets. Returns the segment count and the arrays (malloc'd, the
+// caller frees) plus *NPOL = the grand total; -1 with *why on overflow / too
+// many. Shared by the CPU body and the GPU kernel, so both bake the same order.
+static int policy_segtable(const struct build *B, int **segL, int **segCV,
+                           unsigned long long **segOFF, unsigned long long *NPOL,
+                           const char **why)
+{
+    int k = B->policy_k, cap = POLICY_MAXSEG;
+    int *sL = malloc((size_t)(cap + 1) * sizeof *sL);
+    int *sCV = malloc((size_t)(cap + 1) * (size_t)k * sizeof *sCV);
+    unsigned long long *sOFF = malloc((size_t)(cap + 1) * sizeof *sOFF);
+    if (!sL || !sCV || !sOFF) {
+        free(sL); free(sCV); free(sOFF);
+        if (why) *why = "out of memory";
+        return -1;
+    }
+    int nseg = rxe_policy_segments(B->policy_s, k, B->policy_lo, B->policy_hi,
+                                   B->policy_floor, B->policy_soaker, cap,
+                                   sL, sCV, sOFF, why);
+    if (nseg < 0) { free(sL); free(sCV); free(sOFF); return -1; }
+    *segL = sL; *segCV = sCV; *segOFF = sOFF; *NPOL = sOFF[nseg];
+    return nseg;
+}
+
+// Just the policy's cardinality (and the segment-table verdict): the radix of
+// its super-wheel, folded into the member total and gated for the u64 odometer.
+static int policy_total(const struct build *B, unsigned long long *NPOL, const char **why)
+{
+    int *sL, *sCV; unsigned long long *sOFF;
+    int nseg = policy_segtable(B, &sL, &sCV, &sOFF, NPOL, why);
+    if (nseg >= 0) { free(sL); free(sCV); free(sOFF); }
+    return nseg;
+}
+
+// Emit a Pascal triangle BINOMP[a*(hi+1)+b] = C(a,b) for a,b <= hi, the table
+// the multiset-permutation unrank multiplies binomials from. Saturates past 64
+// bits (only ever compared against a remainder that fits, so "too big" reads as
+// "greater"). 'qual' is the storage qualifier ("static const" / "__constant").
+static void emit_binomp(FILE *o, int hi, const char *qual, const char *ull)
+{
+    int H1 = hi + 1;
+    fprintf(o, "%s %s BINOMP[] = {", qual, ull);
+    for (int a = 0; a < H1; a++)
+        for (int b = 0; b < H1; b++) {
+            unsigned long long v;
+            if (choose_block(a, b, 0, &v)) v = ~0ULL;
+            fprintf(o, "%s%llu%s", (a || b) ? "," : "", v, ull[0] == 'u' ? "UL" : "ULL");
+        }
+    fputs("};\n", o);
+}
+
+// Emit the per-run policy tables: the pool bytes PB (the width-1 union of the
+// branches), the segment table (SEGOFF cumulative offsets, SEGL lengths, SEGCV
+// count-vectors), the branch sizes PSVAL and union starts PCSTART, and the
+// Pascal table. 'qual' picks host ("static const") or device ("__constant")
+// storage; 'ull' the 64-bit type name. Returns nseg, or -1 with *why.
+static int emit_policy_tables(FILE *o, const struct build *B, const char *qual,
+                              const char *ull, unsigned long long *NPOL,
+                              const char **why)
+{
+    int k = B->policy_k, hi = B->policy_hi;
+    const struct wheel *pool = &B->policy_pool;
+    int *segL, *segCV; unsigned long long *segOFF;
+    int nseg = policy_segtable(B, &segL, &segCV, &segOFF, NPOL, why);
+    if (nseg < 0) return -1;
+
+    int bytes = pool->n * pool->L;              // width-1 union: n bytes
+    fprintf(o, "%s unsigned char PB[] = {", qual);
+    if (bytes == 0) fputs("0", o);
+    for (int j = 0; j < bytes; j++) fprintf(o, "%s%d", j ? "," : "", (unsigned char)pool->base[j]);
+    fputs("};\n", o);
+
+    fprintf(o, "%s %s SEGOFF[] = {", qual, ull);
+    for (int i = 0; i <= nseg; i++) fprintf(o, "%s%llu%s", i ? "," : "", segOFF[i], ull[0] == 'u' ? "UL" : "ULL");
+    fputs("};\n", o);
+    fprintf(o, "%s int SEGL[] = {", qual);
+    for (int i = 0; i < nseg; i++) fprintf(o, "%s%d", i ? "," : "", segL[i]);
+    if (nseg == 0) fputs("0", o);
+    fputs("};\n", o);
+    fprintf(o, "%s int SEGCV[] = {", qual);
+    for (int i = 0; i < nseg * k; i++) fprintf(o, "%s%d", i ? "," : "", segCV[i]);
+    if (nseg * k == 0) fputs("0", o);
+    fputs("};\n", o);
+    fprintf(o, "%s int PSVAL[] = {", qual);
+    for (int i = 0; i < k; i++) fprintf(o, "%s%lu", i ? "," : "", B->policy_s[i]);
+    fputs("};\n", o);
+    fprintf(o, "%s int PCSTART[] = {", qual);
+    for (int i = 0; i < k; i++) fprintf(o, "%s%lu", i ? "," : "", B->policy_cstart[i]);
+    fputs("};\n", o);
+    emit_binomp(o, hi, qual, ull);
+
+    free(segL); free(segCV); free(segOFF);
+    return nseg;
+}
+
+// The heart shared by the CPU body and the GPU kernel: decode the policy digit
+// 'r' (already in scope, a 64-bit index into the set) into an actual member and
+// lay it into buf at position p. Binary-search the segment (a length + count-
+// vector block, minimal-first), split the within-segment offset into the
+// arrangement rank and the character rank, unrank the arrangement as a multiset
+// permutation (position p's class), and the characters as a mixed radix (last
+// position least significant) -- the exact three steps policy_decode runs, in
+// u64 (safe: every partial product is <= the segment size, which the table
+// guarantees fits 64 bits). 'px' indents; 'gpu' picks ulong over unsigned long
+// long. Tables SEGOFF/SEGL/SEGCV/PSVAL/PCSTART/BINOMP/PB must be in scope.
+static void emit_policy_core(FILE *o, const struct build *B, int nseg,
+                             const char *px, int gpu)
+{
+    const char *U = gpu ? "ulong" : "unsigned long long";
+    int k = B->policy_k, hi = B->policy_hi, H1 = hi + 1, mx = hi < 1 ? 1 : hi;
+    fprintf(o, "%s{ int slo = 0, shi = %d;\n", px, nseg - 1);
+    fprintf(o, "%s  while (slo < shi) { int smid = (slo + shi + 1) >> 1;\n", px);
+    fprintf(o, "%s      if (SEGOFF[smid] <= r) slo = smid; else shi = smid - 1; }\n", px);
+    fprintf(o, "%s  int seg = slo, L = SEGL[seg];\n", px);
+    fprintf(o, "%s  %s local = r - SEGOFF[seg], char_size = 1;\n", px, U);
+    fprintf(o, "%s  int cvv[%d], rem[%d];\n", px, k, k);
+    fprintf(o, "%s  for (int t = 0; t < %d; t++) { cvv[t] = SEGCV[seg*%d + t]; rem[t] = cvv[t];\n", px, k, k);
+    fprintf(o, "%s      for (int c = 0; c < cvv[t]; c++) char_size *= (%s)PSVAL[t]; }\n", px, U);
+    fprintf(o, "%s  %s arr = local / char_size, chr = local %% char_size;\n", px, U);
+    fprintf(o, "%s  int cls[%d], uni[%d];\n", px, mx, mx);
+    fprintf(o, "%s  for (int pp = 0; pp < L; pp++)\n", px);
+    fprintf(o, "%s      for (int t = 0; t < %d; t++) {\n", px, k);
+    fprintf(o, "%s          if (rem[t] == 0) continue;\n", px);
+    fprintf(o, "%s          rem[t]--;\n", px);
+    fprintf(o, "%s          %s ways = 1; int avail = L - pp - 1;\n", px, U);
+    fprintf(o, "%s          for (int u = 0; u < %d; u++) { ways *= BINOMP[avail*%d + rem[u]]; avail -= rem[u]; }\n", px, k, H1);
+    fprintf(o, "%s          if (arr < ways) { cls[pp] = t; break; }\n", px);
+    fprintf(o, "%s          arr -= ways; rem[t]++;\n", px);
+    fprintf(o, "%s      }\n", px);
+    fprintf(o, "%s  for (int pp = L - 1; pp >= 0; pp--) {\n", px);
+    fprintf(o, "%s      int cl = cls[pp]; %s ci = chr %% (%s)PSVAL[cl]; chr /= (%s)PSVAL[cl];\n", px, U, U, U);
+    fprintf(o, "%s      uni[pp] = PCSTART[cl] + (int)ci; }\n", px);
+    fprintf(o, "%s  for (int pp = 0; pp < L; pp++) buf[p++] = PB[uni[pp]];\n", px);
+    fprintf(o, "%s}\n", px);
+}
+
+// The run() body for a pattern with a policy composition (A|B|...){{lo,hi!x}}.
+// Structurally the permutation body: the policy is one super-wheel of radix NPOL
+// between the pre wheels (more significant) and the post wheels (less), seeded
+// and stepped as a mixed-radix odometer. Only the digit's meaning differs -- it
+// unranks to a policy member (emit_policy_core) rather than a choice of pool
+// items. The member is rebuilt each step (its length and shape vary), which the
+// hash-bound sink hides.
+static void emit_policy_body(FILE *o, const struct build *B, int nseg,
+                             unsigned long long NPOL, int count, int match,
+                             int hash, int progress, int acc)
+{
+    int P = B->policy_at, nw = B->nw, Q = nw - P;
+    const struct wheel *pre = B->w, *post = B->w + P;
+
+    fputs("    unsigned long long f = from;\n", o);
+    for (int i = Q - 1; i >= 0; i--)
+        fprintf(o, "    int q%d = f %% %d; f /= %d;\n", i, post[i].n, post[i].n);
+    fprintf(o, "    unsigned long long r = f %% %lluULL; f /= %lluULL;\n", NPOL, NPOL);
+    for (int i = P - 1; i >= 0; i--)
+        fprintf(o, "    int i%d = f %% %d; f /= %d;\n", i, pre[i].n, pre[i].n);
+    if (acc) fputs("    unsigned long long n = 0;\n", o);
+    fputs("    unsigned long long done = 0;\n", o);
+
+    fputs("    for (;;) {\n", o);
+    fputs("        int p = 0;\n", o);
+    for (int i = 0; i < P; i++) { char dv[16]; snprintf(dv, sizeof dv, "i%d", i); emit_compact_lay(o, i, &pre[i], dv); }
+    emit_policy_core(o, B, nseg, "        ", 0);
+    for (int i = 0; i < Q; i++) { char dv[16]; snprintf(dv, sizeof dv, "q%d", i); emit_compact_lay(o, P + i, &post[i], dv); }
+    fputs("        buf[p] = '\\n';\n", o);
+
+    emit_sink(o, 0, match, count, hash, "p", "p + 1");
+    fputs("        if (count && ++done == count) break;\n", o);
+    if (progress) fputs("        if ((done & 0xffff) == 0) __atomic_store_n(prog, done, __ATOMIC_RELAXED);\n", o);
+
+    fputs("        { int carry = 1;\n", o);
+    for (int i = Q - 1; i >= 0; i--)
+        fprintf(o, "          if (carry) { if (++q%d < %d) carry = 0; else q%d = 0; }\n", i, post[i].n, i);
+    fprintf(o, "          if (carry) { if (++r < %lluULL) carry = 0; else r = 0; }\n", NPOL);
+    for (int i = P - 1; i >= 0; i--)
+        fprintf(o, "          if (carry) { if (++i%d < %d) carry = 0; else i%d = 0; }\n", i, pre[i].n, i);
+    fputs("          if (carry) break; }\n", o);
+    fputs("    }\n", o);
+    if (acc) fputs("    *acc += n;\n", o);
+}
+
 // The generated program. Its core is run(from, count): seed the odometer to
 // the member at index 'from' -- the mixed-radix digits of 'from', least
 // significant wheel first -- then step it, handing 'count' members to the sink
@@ -814,6 +1000,8 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         variable = 1;
         if (B->perm_pool.L != 1) multi = 1;
     }
+    if (B->policy_active) variable = 1;   // a policy member is unranked each step
+                                          // (its pool is width-1, so no memcpy)
 
     int wmax[MAXW];                             // each wheel's longest branch
     for (int i = 0; i < nw; i++) {
@@ -847,6 +1035,12 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
         if (pool->L) poolmax = pool->L;
         else for (int j = 0; j < pool->n; j++) if (pool->alen[j] > poolmax) poolmax = pool->alen[j];
         bufcap = PW + B->perm_hi * poolmax + QW;
+    }
+    if (B->policy_active) {       // the width-1 union pool is out of the op stream
+        int PW = 0, QW = 0;
+        for (int i = 0; i < B->policy_at; i++) PW += wmax[i];
+        for (int i = B->policy_at; i < nw; i++) QW += wmax[i];
+        bufcap = PW + B->policy_hi + QW;      // at most hi bytes, one per position
     }
     int off[MAXW], TL = 0;
     if (!variable) for (int i = 0; i < nw; i++) { off[i] = TL; TL += w[i].L; }
@@ -968,6 +1162,14 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
             fputs("};\n", o);
         }
     }
+    int policy_nseg = 0;
+    unsigned long long policy_NPOL = 1;
+    if (B->policy_active) {
+        const char *why = NULL;
+        policy_nseg = emit_policy_tables(o, B, "    static const", "unsigned long long",
+                                         &policy_NPOL, &why);
+        // main gates the segment table before emit, so this cannot fail here.
+    }
 
     fprintf(o, "    unsigned char buf[%d];\n", bufcap + 1);
 
@@ -978,6 +1180,11 @@ static void emit(FILE *o, const char *pattern, const struct build *B,
     }
     if (B->perm_active) {
         emit_perm_body(o, B, count, match, hash, progress, acc);
+        fputs("}\n\n", o);
+        goto after_run;
+    }
+    if (B->policy_active) {
+        emit_policy_body(o, B, policy_nseg, policy_NPOL, count, match, hash, progress, acc);
         fputs("}\n\n", o);
         goto after_run;
     }
@@ -2318,6 +2525,8 @@ int main(int argc, char **argv)
     struct build b;
     int nw = rxe_lay_build(&b, rxe);
     int ret;
+    unsigned long long pol_NPOL = 1;   // the policy super-wheel's radix, if any
+    const char *pol_why = NULL;
     if (nw < 0) {
         fprintf(stderr, "%s: cannot compile this pattern yet -- it has %s.\n",
                 prog, rxe_lay_reason());
@@ -2329,6 +2538,15 @@ int main(int argc, char **argv)
     } else if (b.perm_active && sink == SINK_DUP) {
         fprintf(stderr, "%s: cannot compile this pattern yet -- it has "
                 "a permutation with the dedup sink.\n", prog);
+        ret = 1;
+    } else if (b.policy_active && sink == SINK_DUP) {
+        fprintf(stderr, "%s: cannot compile this pattern yet -- it has "
+                "a policy composition with the dedup sink.\n", prog);
+        ret = 1;
+    } else if (b.policy_active && policy_total(&b, &pol_NPOL, &pol_why) < 0) {
+        // The segment table overflows a u64 index or exceeds the bake cap -- the
+        // odometer decodes a 64-bit digit, so a set past that cannot be laid.
+        fprintf(stderr, "%s: cannot compile this pattern yet -- it has %s.\n", prog, pol_why);
         ret = 1;
     } else {
         // The member total, baked in so the threaded count can split [0, N).
@@ -2370,6 +2588,7 @@ int main(int argc, char **argv)
             mpz_mul(N, N, sum);
             mpz_clear(blk); mpz_clear(sum);
         }
+        if (b.policy_active) mpz_mul_ui(N, N, (unsigned long)pol_NPOL);
         char nbuf[32];
         const char *nmemb = NULL;
         if (mpz_fits_ulong_p(N)) { gmp_snprintf(nbuf, sizeof nbuf, "%Zu", N); nmemb = nbuf; }
@@ -2382,7 +2601,9 @@ int main(int argc, char **argv)
         const char *gpu_no = NULL;
         int gpu_kind = 0;                       // 1 fixed mask, 2 loop repeat, 3 generic
         int gpu_G = 0, gpu_lowvar = 0;
-        if (gpu && b.perm_active) {
+        if (gpu && b.policy_active) {
+            gpu_no = "a policy composition not yet on the GPU";
+        } else if (gpu && b.perm_active) {
             // A choice runs whole on the GPU: each lane unranks its index. The
             // widest candidate must fit one hash block. The pool itself is a
             // __global buffer, so a big dictionary is fine; only an unordered

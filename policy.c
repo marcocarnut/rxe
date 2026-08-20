@@ -143,6 +143,101 @@ void rxe_policy_nitems(mpz_t out, struct rxe *base, int lo, int hi,
     rxe_mem_free(dp);
 }
 
+/* --------------------------- Segments (for the back ends) --------------- */
+
+// The code generators (rxejit's C/OpenCL, jsrxe's WGSL) decode a policy member
+// from a 64-bit index over a baked table of segments -- one per (length,
+// count-vector) block, in the same minimal-compliance-first order the
+// interpreter walks. This lays that table out for them: seg_L[i], the count
+// vector seg_cv[i*k + t], and the cumulative offset seg_off[i] (members before
+// segment i); seg_off[nseg] is the grand total. 's' holds the k branch
+// cardinalities. Returns the segment count, or -1 (with *why set) if the total
+// would exceed 64 bits -- past what a u64 odometer digit can address -- or if
+// there are more than 'cap' segments. The walk mirrors pdec_walk exactly, so a
+// generated candidate at an index is the interpreter's member at it.
+struct segw {
+    int k, L, soaker, f, m, cap, nseg, err;
+    const int *floors, *ns;
+    mpz_t *s;
+    int *ext, *cv;
+    mpz_t total, seg;
+    int *seg_L, *seg_cv;
+    unsigned long long *seg_off;
+    const char *why;
+};
+
+static void segw_emit(struct segw *w)
+{
+    if (w->err) return;
+    int k = w->k, nssum = 0;
+    for (int i = 0; i < k; i++) if (i != w->soaker) nssum += w->ext[i];
+    w->ext[w->soaker] = w->f - nssum;
+    for (int i = 0; i < k; i++)
+        w->cv[i] = (w->floors[i] < 0 ? 0 : w->floors[i]) + w->ext[i];
+    seg_size(w->seg, w->L, w->cv, w->s, k);
+    if (!mpz_fits_ulong_p(w->seg) || !mpz_fits_ulong_p(w->total)) {
+        w->err = 1; w->why = "more members than fit 64 bits"; return;
+    }
+    if (w->nseg >= w->cap) { w->err = 1; w->why = "too many policy segments to bake"; return; }
+    w->seg_L[w->nseg] = w->L;
+    for (int i = 0; i < k; i++) w->seg_cv[w->nseg * k + i] = w->cv[i];
+    w->seg_off[w->nseg] = mpz_get_ui(w->total);
+    w->nseg++;
+    mpz_add(w->total, w->total, w->seg);
+    if (!mpz_fits_ulong_p(w->total)) { w->err = 1; w->why = "more members than fit 64 bits"; }
+}
+
+static void segw_walk(struct segw *w, int idx, int rem)
+{
+    if (w->err) return;
+    if (w->m == 0)         { segw_emit(w); return; }
+    if (idx == w->m - 1)   { w->ext[w->ns[idx]] = rem; segw_emit(w); return; }
+    for (int v = 0; v <= rem && !w->err; v++) {
+        w->ext[w->ns[idx]] = v;
+        segw_walk(w, idx + 1, rem - v);
+    }
+}
+
+int rxe_policy_segments(const unsigned long *s_ul, int k, int lo, int hi,
+                        const int *floors, int soaker0, int cap,
+                        int *seg_L, int *seg_cv, unsigned long long *seg_off,
+                        const char **why)
+{
+    if (why) *why = NULL;
+    int soaker = soaker0 >= 0 ? soaker0 : k - 1;
+    struct segw w;
+    w.k = k; w.soaker = soaker; w.cap = cap; w.nseg = 0; w.err = 0; w.why = NULL;
+    w.floors = floors; w.seg_L = seg_L; w.seg_cv = seg_cv; w.seg_off = seg_off;
+    w.s = NEW(k, mpz_t);
+    for (int i = 0; i < k; i++) mpz_init_set_ui(w.s[i], s_ul[i]);
+    w.ext = NEW(k, int); w.cv = NEW(k, int);
+    w.ns = NULL;
+    int *ns = NEW(k > 0 ? k : 1, int), m = 0;
+    for (int i = 0; i < k; i++) if (i != soaker) ns[m++] = i;
+    w.ns = ns; w.m = m;
+    mpz_init_set_ui(w.total, 0);
+    mpz_init(w.seg);
+
+    int fsum = floor_sum(floors, k);
+    for (int L = lo; L <= hi && !w.err; L++) {
+        int f = L - fsum;
+        if (f < 0) continue;
+        w.L = L; w.f = f;
+        for (int d = 0; d <= f && !w.err; d++) {
+            if (m == 0 && d > 0) break;      // one class: a single vector per length
+            segw_walk(&w, 0, d);
+        }
+    }
+    if (!w.err) seg_off[w.nseg] = mpz_get_ui(w.total);   // grand total
+
+    int rc = w.err ? -1 : w.nseg;
+    if (w.err && why) *why = w.why;
+    for (int i = 0; i < k; i++) mpz_clear(w.s[i]);
+    rxe_mem_free(w.s); rxe_mem_free(w.ext); rxe_mem_free(w.cv); rxe_mem_free(ns);
+    mpz_clear(w.total); mpz_clear(w.seg);
+    return rc;
+}
+
 /* --------------------------- Decoding ----------------------------------- */
 
 // State threaded through the count-vector walk, which serves both directions.

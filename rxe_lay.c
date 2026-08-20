@@ -276,6 +276,55 @@ static int add_perm(struct build *b, struct rxe_node *nd)
     return 0;
 }
 
+// A policy composition (A|B|...){{lo,hi!floors}}: every length lo..hi string over
+// the union of the k width-1 branches with branch i appearing at least floor_i
+// times, in minimal-compliance-first order. Like the permutation it is one
+// super-wheel with pre/post fixed structure around it; its pool is the base
+// alternation baked as one width-1 wheel (member u is union index u -- branch i
+// occupies [cstart_i, cstart_i + s_i)). The back ends bake the segment table and
+// unrank a member from its index; here we only capture the shape and the pool.
+static int add_policy(struct build *b, struct rxe_node *nd)
+{
+    if (b->perm_active || b->lr_active || b->policy_active)
+        { reason = "more than one combinatorial choice or large repeat"; return -1; }
+    if (b->ngref) { reason = "a policy composition with a backreference"; return -1; }
+    int lo = nd->rep_min, hi = nd->rep_max, k = nd->policy_nfloor;
+    if (k < 1 || k > RXE_POLICY_MAXCLASS) { reason = "a policy composition with too many branches"; return -1; }
+
+    // The pool is the whole base alternation as one wheel -- its members are the
+    // branch characters in union order, exactly as branch_info / the interpreter
+    // number them. Width-1 (the v1 restriction, enforced at parse), so the wheel
+    // is fixed L==1 and a member is one byte PB[union index].
+    int w0 = b->nw, op0 = b->nops;
+    if (bake_alt(b, nd->rxe)) return -1;
+    struct wheel pool = b->w[w0];
+    if (pool.L != 1) { reason = "a policy composition over multi-character branches"; return -1; }
+
+    // Per-branch sizes s_i and their start offsets in the union (a prefix sum) --
+    // the segment machinery and the character unrank need both.
+    int t = 0;
+    unsigned long acc = 0;
+    for (struct rxe_alt *a = nd->rxe->head; a && t < k; a = a->next, t++) {
+        if (!mpz_fits_ulong_p(a->nitems)) { reason = "a policy branch too large to unroll"; return -1; }
+        b->policy_s[t]      = mpz_get_ui(a->nitems);
+        b->policy_cstart[t] = acc;
+        acc += b->policy_s[t];
+    }
+    if (t != k) { reason = "a policy composition whose branch count changed"; return -1; }
+
+    b->policy_pool   = pool;
+    b->policy_lo     = lo;
+    b->policy_hi     = hi;
+    b->policy_k      = k;
+    b->policy_soaker = nd->policy_soaker;   // -1 => back end defaults to the last
+    for (int i = 0; i < k; i++) b->policy_floor[i] = nd->policy_floor[i];
+    b->policy_at     = w0;
+    b->policy_active = 1;
+    b->nw            = w0;                   // drop the pool wheel from the stream,
+    b->nops          = op0;                  // and the LAY op that went with it
+    return 0;
+}
+
 // One node -> wheel(s): a plain class is one L==1 wheel; an exact {k} repeat is
 // its body's wheels laid down k times; a group recurses into its subexpression.
 static int add_node(struct build *b, struct rxe_node *nd)
@@ -297,6 +346,9 @@ static int add_node(struct build *b, struct rxe_node *nd)
 
     if (nd->is_dict)
         return bake_dict(b, nd);
+
+    if (nd->is_policy)
+        return add_policy(b, nd);
 
     if (nd->is_comb)
         return add_perm(b, nd);
@@ -404,7 +456,7 @@ int rxe_lay_build(struct build *b, struct rxe *rxe)
     b->nw = 0; b->bake = NULL; b->nbake = 0; b->cbake = 0; b->root = rxe;
     b->ops = NULL; b->nops = 0; b->cops = 0;
     b->gref = NULL; b->ngref = 0; b->grxe = NULL; b->ngroup = 0; b->has_backref = 0;
-    b->lr_active = 0; b->perm_active = 0;
+    b->lr_active = 0; b->perm_active = 0; b->policy_active = 0;
     b->w = malloc(MAXW * sizeof *b->w);
     if (!b->w) { reason = "out of memory"; return -1; }
     if (find_refs(b, rxe)) return -1;
