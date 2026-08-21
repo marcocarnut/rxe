@@ -296,12 +296,11 @@ static void aes256_decrypt_block(const unsigned char rk[240], unsigned char s[16
 
 /* Given a parsed key and a passphrase, recover the candidate 32-byte private
  * key. Does NOT yet verify the address (milestone 4). */
-static void bip38_privkey(const struct bip38 *b,
-                          const unsigned char *pw, size_t pwlen,
-                          unsigned char priv[32])
+/* Finish a candidate from its 64-byte scrypt output d = dh1||dh2 (AES + XOR).
+ * Split out so the GPU backend can feed device-computed scrypt straight in. */
+static void bip38_finish(const struct bip38 *b, const unsigned char d[64],
+                         unsigned char priv[32])
 {
-    unsigned char d[64];
-    scrypt_kdf(pw, pwlen, b->addrhash, 4, 16384, 8, 8, d, 64);
     const unsigned char *dh1 = d, *dh2 = d + 32;
     unsigned char rk[240];
     aes256_key_expand(dh2, rk);
@@ -313,6 +312,15 @@ static void bip38_privkey(const struct bip38 *b,
     memcpy(blk, b->enc2, 16);
     aes256_decrypt_block(rk, blk);
     for (int i = 0; i < 16; i++) priv[16 + i] = blk[i] ^ dh1[16 + i];
+}
+
+static void bip38_privkey(const struct bip38 *b,
+                          const unsigned char *pw, size_t pwlen,
+                          unsigned char priv[32])
+{
+    unsigned char d[64];
+    scrypt_kdf(pw, pwlen, b->addrhash, 4, 16384, 8, 8, d, 64);
+    bip38_finish(b, d, priv);
 }
 
 /* ---- RIPEMD-160 -------------------------------------------------------- */
@@ -1258,6 +1266,127 @@ static int gpu_scrypt_test(cl_uint tn)
                       : "gpu scrypt: FAILED");
     return ok ? 0 : 1;
 }
+
+/* Batched GPU crack: enumerate the regex on the host, fill a batch of
+ * passphrases, run scrypt on the device, finish + verify on the host. */
+struct gpu_crack {
+    struct gpu         *g;
+    const struct bip38 *key;
+    cl_uint             N;
+    size_t              cap;         /* lanes per batch */
+    unsigned char      *pwbuf;       /* cap * GPU_MAXPW */
+    cl_uint            *lens;
+    mpz_t              *idxs;        /* member index per lane, for reporting */
+    unsigned char      *gout;        /* cap * 64 */
+    size_t              count;       /* lanes filled in the current batch */
+    unsigned long       tried;
+    unsigned long       toolong;     /* skipped: passphrase > GPU_MAXPW */
+    int                 found;
+    char                pass[512];
+    char                wif[64];
+    mpz_t               hitidx;
+    double              t_gpu;       /* seconds spent in gpu_run */
+};
+
+/* Run the current batch through the GPU and verify each lane. Returns 1 if a
+ * hit was recorded (caller should stop). */
+static int gpu_flush(struct gpu_crack *c)
+{
+    if (c->count == 0) return 0;
+    double t0 = now_sec();
+    if (gpu_run(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash, c->N, c->gout) != 0)
+        return 0;
+    c->t_gpu += now_sec() - t0;
+    c->tried += c->count;
+    for (size_t l = 0; l < c->count; l++) {
+        unsigned char priv[32];
+        bip38_finish(c->key, c->gout + l * 64, priv);
+        if (address_matches(priv, c->key->compressed, c->key->addrhash)) {
+            size_t n = c->lens[l] < sizeof c->pass - 1 ? c->lens[l] : sizeof c->pass - 1;
+            memcpy(c->pass, c->pwbuf + l * GPU_MAXPW, n); c->pass[n] = '\0';
+            privkey_to_wif(priv, c->key->compressed, c->wif);
+            mpz_set(c->hitidx, c->idxs[l]);
+            c->found = 1;
+            c->count = 0;
+            return 1;
+        }
+    }
+    c->count = 0;
+    return 0;
+}
+
+static int gpu_crack_sink(const char *str, size_t len, const mpz_t index, void *v)
+{
+    struct gpu_crack *c = v;
+    if (len > GPU_MAXPW) { c->toolong++; return 0; }   /* GPU handles <= MAXPW */
+    size_t l = c->count;
+    memcpy(c->pwbuf + l * GPU_MAXPW, str, len);
+    c->lens[l] = (cl_uint)len;
+    mpz_set(c->idxs[l], index);
+    c->count++;
+    if (c->count == c->cap) return gpu_flush(c);       /* full -> run + verify */
+    return 0;
+}
+
+static int crack_gpu(const struct bip38 *key, const char *pattern,
+                     size_t batch, cl_uint N, int progress)
+{
+    struct rxe *rxe = rxe_parse(pattern, 0);
+    if (!rxe || rxe_error(rxe)) {
+        fprintf(stderr, "rxe38: bad passphrase regex: %s\n",
+                rxe ? rxe_error_message(rxe) : "parse failed");
+        if (rxe) rxe_free(rxe);
+        return 2;
+    }
+
+    struct gpu g;
+    if (gpu_setup(&g, batch) != 0) { rxe_free(rxe); return 1; }
+    fprintf(stderr, "rxe38 gpu: device = %s, batch = %zu lanes (%.1f GB scratchpad), N = %u\n",
+            g.devname, batch, batch * (double)GPU_BLK * GPU_N / 1e9, N);
+    if (N == GPU_N)
+        fprintf(stderr, "rxe38 gpu: heads-up -- on a display GPU the per-lane scrypt may "
+                        "exceed the watchdog; a headless card is the target.\n");
+
+    struct gpu_crack c;
+    memset(&c, 0, sizeof c);
+    c.g = &g; c.key = key; c.N = N; c.cap = batch;
+    c.pwbuf = calloc(batch, GPU_MAXPW);
+    c.lens  = calloc(batch, sizeof *c.lens);
+    c.gout  = calloc(batch, 64);
+    c.idxs  = calloc(batch, sizeof *c.idxs);
+    for (size_t i = 0; i < batch; i++) mpz_init(c.idxs[i]);
+    mpz_init(c.hitidx);
+
+    double t0 = now_sec();
+    mpz_t from, cnt; mpz_init_set_ui(from, 0); mpz_init_set_ui(cnt, 0);  /* whole set */
+    rxe_foreach(rxe, from, cnt, GPU_MAXPW + 1, gpu_crack_sink, &c);
+    if (!c.found) gpu_flush(&c);                        /* trailing partial batch */
+    double dt = now_sec() - t0;
+    mpz_clear(from); mpz_clear(cnt);
+
+    int rc;
+    if (c.found) {
+        printf("FOUND passphrase: %s\n", c.pass);
+        printf("WIF: %s\n", c.wif);
+        gmp_printf("index: %Zd   (%lu tried, %.1fs wall, %.1fs gpu, %.1f cand/s)\n",
+                   c.hitidx, c.tried, dt, c.t_gpu, dt > 0 ? c.tried / dt : 0);
+        rc = 0;
+    } else {
+        fprintf(stderr, "rxe38: not found (%lu tried, %.1fs, %.1f cand/s)\n",
+                c.tried, dt, dt > 0 ? c.tried / dt : 0);
+        rc = 1;
+    }
+    if (c.toolong)
+        fprintf(stderr, "rxe38 gpu: skipped %lu candidate(s) longer than %d bytes\n",
+                c.toolong, GPU_MAXPW);
+
+    for (size_t i = 0; i < batch; i++) mpz_clear(c.idxs[i]);
+    mpz_clear(c.hitidx);
+    free(c.pwbuf); free(c.lens); free(c.gout); free(c.idxs);
+    gpu_teardown(&g);
+    rxe_free(rxe);
+    return rc;
+}
 #endif /* RXE38_GPU */
 
 int main(int argc, char **argv)
@@ -1273,16 +1402,18 @@ int main(int argc, char **argv)
         return gpu_scrypt_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512);
 #endif
 
-    int jobs = 1, progress = 0;
-    long cap = 0;
+    int jobs = 1, progress = 0, use_gpu = 0;
+    long cap = 0, batch = 0;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         char c = argv[i][1];
         if (c == 'p') { progress = 1; continue; }        /* takes no value */
+        if (c == 'G') { use_gpu = 1; continue; }         /* takes no value */
         const char *val = argv[i][2] ? argv[i] + 2       /* -j4  */
                         : (i + 1 < argc ? argv[++i] : ""); /* -j 4 */
         if (c == 'j')      jobs = atoi(val);
         else if (c == 'c') cap  = atol(val);
+        else if (c == 'b') batch = atol(val);
         else {
             fprintf(stderr, "rxe38: unknown option -%c\n", c);
             return 2;
@@ -1291,10 +1422,12 @@ int main(int argc, char **argv)
 
     if (i >= argc) {
         fprintf(stderr,
-            "usage: %s [-j jobs] [-p] [-c count] <6P...key> [<passphrase-regex>]\n"
+            "usage: %s [-j jobs] [-G] [-b batch] [-p] [-c count] <6P...key> [<regex>]\n"
             "  With a regex, tries each passphrase in the set until the key\n"
             "  decrypts (verified against its address hash). Without one, just\n"
-            "  parses and dumps the key. no-EC-multiply keys (6PR.../6PY...) only.\n",
+            "  parses and dumps the key. no-EC-multiply keys (6PR.../6PY...) only.\n"
+            "  -G uses the OpenCL GPU backend (scrypt on device, verify on host);\n"
+            "  -b sets the GPU batch size in lanes (each lane needs ~16 MB).\n",
             argv[0]);
         return 2;
     }
@@ -1310,6 +1443,18 @@ int main(int argc, char **argv)
         hex("enc1:       ", b.enc1, 16);
         hex("enc2:       ", b.enc2, 16);
         return 0;
+    }
+
+    if (use_gpu) {
+#ifdef RXE38_GPU
+        size_t bt = batch > 0 ? (size_t)batch : 64;      /* default 64 lanes */
+        const char *ns = getenv("RXE38_GPU_N");          /* override N for testing */
+        cl_uint N = ns ? (cl_uint)strtoul(ns, 0, 0) : GPU_N;
+        return crack_gpu(&b, pattern, bt, N, progress);
+#else
+        fprintf(stderr, "rxe38: -G needs the GPU build (make rxe38-gpu)\n");
+        return 2;
+#endif
     }
 
     if (jobs < 1) jobs = 1;
