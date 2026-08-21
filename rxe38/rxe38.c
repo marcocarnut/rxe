@@ -1457,6 +1457,7 @@ int main(int argc, char **argv)
 #endif
     }
 
+    (void)batch;                        /* only consumed by the -G path above */
     if (jobs < 1) jobs = 1;
     return crack(&b, pattern, jobs, progress, cap);
 }
