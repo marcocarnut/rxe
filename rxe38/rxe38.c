@@ -1104,7 +1104,8 @@ struct gpu {
     cl_device_id     dev;
     cl_context       ctx;
     cl_command_queue q;
-    cl_kernel        k;
+    cl_kernel        k;               /* scrypt_kdf, monolithic (the test) */
+    cl_kernel        kph;             /* scrypt_phase, chunked (the cracker) */
     cl_mem           mpw, mlen, mout, mV, mB, mY;
     size_t           cap;             /* lanes the buffers are sized for */
     char             devname[128];
@@ -1145,7 +1146,8 @@ static int gpu_setup(struct gpu *g, size_t cap)
         free(log);
         return -1;
     }
-    g->k = clCreateKernel(pr, "scrypt_kdf", &e); CKG(e);
+    g->k   = clCreateKernel(pr, "scrypt_kdf", &e); CKG(e);
+    g->kph = clCreateKernel(pr, "scrypt_phase", &e); CKG(e);
     clReleaseProgram(pr);
 
     g->cap = cap;
@@ -1180,12 +1182,58 @@ static int gpu_run(struct gpu *g, const unsigned char *pw, const cl_uint *pwlen,
     return 0;
 }
 
+/* Run a batch through the phased kernel: PBKDF2-1, then per ROMix pass a run of
+ * fill and mix chunks of `chunk` iterations each, then PBKDF2-2. Each launch
+ * does a bounded slice so no single submit trips a GPU watchdog. */
+static int gpu_run_phased(struct gpu *g, const unsigned char *pw, const cl_uint *pwlen,
+                          size_t n, const unsigned char salt[4], cl_uint N,
+                          cl_uint chunk, unsigned char *out)
+{
+    CKG(clEnqueueWriteBuffer(g->q, g->mpw, CL_FALSE, 0, n * GPU_MAXPW, pw, 0, NULL, NULL));
+    CKG(clEnqueueWriteBuffer(g->q, g->mlen, CL_FALSE, 0, n * sizeof(cl_uint), pwlen, 0, NULL, NULL));
+    cl_uint saltw = salt[0] | ((cl_uint)salt[1]<<8) | ((cl_uint)salt[2]<<16) | ((cl_uint)salt[3]<<24);
+    cl_uint zero = 0;
+    /* fixed args */
+    CKG(clSetKernelArg(g->kph, 0, sizeof(cl_mem), &g->mpw));
+    CKG(clSetKernelArg(g->kph, 1, sizeof(cl_mem), &g->mlen));
+    CKG(clSetKernelArg(g->kph, 2, sizeof(cl_uint), &saltw));
+    CKG(clSetKernelArg(g->kph, 3, sizeof(cl_mem), &g->mout));
+    CKG(clSetKernelArg(g->kph, 4, sizeof(cl_mem), &g->mV));
+    CKG(clSetKernelArg(g->kph, 5, sizeof(cl_mem), &g->mB));
+    CKG(clSetKernelArg(g->kph, 6, sizeof(cl_mem), &g->mY));
+    CKG(clSetKernelArg(g->kph, 8, sizeof(cl_uint), &N));
+    size_t global = n;
+
+    #define LAUNCH(PHASE, PASS, I0, I1) do { \
+        cl_uint _ph=(PHASE),_ps=(PASS),_i0=(I0),_i1=(I1); \
+        CKG(clSetKernelArg(g->kph, 7, sizeof(cl_uint), &_ph)); \
+        CKG(clSetKernelArg(g->kph, 9, sizeof(cl_uint), &_ps)); \
+        CKG(clSetKernelArg(g->kph,10, sizeof(cl_uint), &_i0)); \
+        CKG(clSetKernelArg(g->kph,11, sizeof(cl_uint), &_i1)); \
+        CKG(clEnqueueNDRangeKernel(g->q, g->kph, 1, NULL, &global, NULL, 0, NULL, NULL)); \
+    } while (0)
+
+    LAUNCH(0, 0, 0, 0);                              /* PBKDF2-1 -> gB */
+    for (cl_uint pass = 0; pass < GPU_P; pass++) {
+        for (cl_uint s = 0; s < N; s += chunk)
+            LAUNCH(1, pass, s, s + chunk < N ? s + chunk : N);   /* fill */
+        for (cl_uint s = 0; s < N; s += chunk)
+            LAUNCH(2, pass, s, s + chunk < N ? s + chunk : N);   /* mix */
+    }
+    LAUNCH(3, 0, 0, 0);                              /* PBKDF2-2 -> out */
+    (void)zero;
+    #undef LAUNCH
+    CKG(clEnqueueReadBuffer(g->q, g->mout, CL_TRUE, 0, n * 64, out, 0, NULL, NULL));
+    return 0;
+}
+
 static void gpu_teardown(struct gpu *g)
 {
     clReleaseMemObject(g->mpw); clReleaseMemObject(g->mlen);
     clReleaseMemObject(g->mout); clReleaseMemObject(g->mV);
     clReleaseMemObject(g->mB); clReleaseMemObject(g->mY);
-    clReleaseKernel(g->k); clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
+    clReleaseKernel(g->k); clReleaseKernel(g->kph);
+    clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
 }
 
 /* --gpu-scrypt-test: run spec-vector passphrases through the kernel in a batch
@@ -1267,12 +1315,52 @@ static int gpu_scrypt_test(cl_uint tn)
     return ok ? 0 : 1;
 }
 
+/* --gpu-phase-test [N [chunk]]: validate the CHUNKED phased kernel against the
+ * CPU scrypt (default chunk = N/4 to exercise multi-chunk resumption). */
+static int gpu_phase_test(cl_uint tn, cl_uint chunk)
+{
+    struct gpu g;
+    if (gpu_setup(&g, 8) != 0) return 1;
+    if (chunk == 0) chunk = tn >= 4 ? tn / 4 : tn;
+    printf("rxe38 gpu: device = %s (phased test N=%u chunk=%u)\n", g.devname, tn, chunk);
+
+    unsigned char salt[4] = { 0xe9, 0x57, 0xa2, 0x4a };
+    const char *pws[] = { "TestingOneTwoThree", "Satoshi", "hunter2", "",
+                          "correct horse", "TestingOneTwoThre", "z", "A longer one!!" };
+    size_t n = 8;
+    unsigned char pwbuf[8 * GPU_MAXPW];
+    cl_uint lens[8];
+    memset(pwbuf, 0, sizeof pwbuf);
+    for (size_t i = 0; i < n; i++) {
+        lens[i] = (cl_uint)strlen(pws[i]);
+        memcpy(pwbuf + i * GPU_MAXPW, pws[i], lens[i]);
+    }
+    unsigned char gout[8 * 64];
+    if (gpu_run_phased(&g, pwbuf, lens, n, salt, tn, chunk, gout) != 0) { gpu_teardown(&g); return 1; }
+
+    int ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char cpu[64];
+        scrypt_kdf((const unsigned char *)pws[i], strlen(pws[i]), salt, 4,
+                   tn, GPU_R, GPU_P, cpu, 64);
+        int match = memcmp(cpu, gout + i * 64, 64) == 0;
+        ok &= match;
+        printf("[%s] lane %zu %-20s gpu=%02x%02x%02x%02x cpu=%02x%02x%02x%02x\n",
+               match ? "PASS" : "FAIL", i, pws[i],
+               gout[i*64],gout[i*64+1],gout[i*64+2],gout[i*64+3], cpu[0],cpu[1],cpu[2],cpu[3]);
+    }
+    gpu_teardown(&g);
+    printf("%s\n", ok ? "gpu phased scrypt: ALL PASS" : "gpu phased scrypt: FAILED");
+    return ok ? 0 : 1;
+}
+
 /* Batched GPU crack: enumerate the regex on the host, fill a batch of
  * passphrases, run scrypt on the device, finish + verify on the host. */
 struct gpu_crack {
     struct gpu         *g;
     const struct bip38 *key;
     cl_uint             N;
+    cl_uint             chunk;       /* ROMix iterations per kernel launch */
     size_t              cap;         /* lanes per batch */
     unsigned char      *pwbuf;       /* cap * GPU_MAXPW */
     cl_uint            *lens;
@@ -1294,7 +1382,8 @@ static int gpu_flush(struct gpu_crack *c)
 {
     if (c->count == 0) return 0;
     double t0 = now_sec();
-    if (gpu_run(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash, c->N, c->gout) != 0)
+    if (gpu_run_phased(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash,
+                       c->N, c->chunk, c->gout) != 0)
         return 0;
     c->t_gpu += now_sec() - t0;
     c->tried += c->count;
@@ -1347,9 +1436,26 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
         fprintf(stderr, "rxe38 gpu: heads-up -- on a display GPU the per-lane scrypt may "
                         "exceed the watchdog; a headless card is the target.\n");
 
+    /* Chunk size: bound work per launch to ~CHUNK*batch blockmixes so a single
+     * submit stays short (watchdog-safe). Tunable via RXE38_GPU_CHUNK. */
+    cl_uint chunk;
+    const char *cs = getenv("RXE38_GPU_CHUNK");
+    if (cs) chunk = (cl_uint)strtoul(cs, 0, 0);
+    else {
+        /* Bound work per launch to stay well under a display watchdog. The Arc
+         * hangs at ~2^18 blockmixes/launch (~12 s), so target 2^15 (~1.5 s) for
+         * margin. On a headless card raise RXE38_GPU_CHUNK for fewer launches. */
+        cl_ulong target = 1u << 15;
+        chunk = (cl_uint)(target / (batch ? batch : 1));
+        if (chunk < 1) chunk = 1;
+        if (chunk > N) chunk = N;
+    }
+    fprintf(stderr, "rxe38 gpu: chunk = %u iterations/launch (%llu blockmixes/launch)\n",
+            chunk, (unsigned long long)chunk * batch);
+
     struct gpu_crack c;
     memset(&c, 0, sizeof c);
-    c.g = &g; c.key = key; c.N = N; c.cap = batch;
+    c.g = &g; c.key = key; c.N = N; c.chunk = chunk; c.cap = batch;
     c.pwbuf = calloc(batch, GPU_MAXPW);
     c.lens  = calloc(batch, sizeof *c.lens);
     c.gout  = calloc(batch, 64);
@@ -1400,6 +1506,9 @@ int main(int argc, char **argv)
 #ifdef RXE38_GPU
     if (argc >= 2 && strcmp(argv[1], "--gpu-scrypt-test") == 0)
         return gpu_scrypt_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512);
+    if (argc >= 2 && strcmp(argv[1], "--gpu-phase-test") == 0)
+        return gpu_phase_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512,
+                              argc >= 4 ? (cl_uint)strtoul(argv[3], 0, 0) : 0);
 #endif
 
     int jobs = 1, progress = 0, use_gpu = 0;

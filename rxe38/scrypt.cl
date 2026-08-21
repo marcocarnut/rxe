@@ -107,6 +107,40 @@ static void hmac_states(sctx *istate, sctx *ostate, const uchar *pw, uint pwlen)
     sha_init(ostate); sha_update(ostate, op, 64);
 }
 
+/* PBKDF2-1: B = PBKDF2(pw, salt, 1, p*128*r), the ROMix input blocks. */
+static void pbkdf2_first(sctx istate, sctx ostate, const uchar salt[4],
+                         __global uchar *B)
+{
+    uint nblocks = (BLK * SP) / 32;
+    for (uint i = 1; i <= nblocks; i++) {
+        uchar msg[8] = { salt[0],salt[1],salt[2],salt[3],
+                         (uchar)(i>>24),(uchar)(i>>16),(uchar)(i>>8),(uchar)i };
+        sctx c = istate; sha_update(&c, msg, 8); uchar inner[32]; sha_final(&c, inner);
+        sctx d = ostate; sha_update(&d, inner, 32); uchar T[32]; sha_final(&d, T);
+        for (int k = 0; k < 32; k++) B[(i-1)*32 + k] = T[k];
+    }
+}
+
+/* PBKDF2-2: out[0..63] = PBKDF2(pw, B, 1, 64), the final dh1||dh2. */
+static void pbkdf2_final(sctx istate, sctx ostate, __global const uchar *B,
+                         __global uchar *out64)
+{
+    for (uint i = 1; i <= 2; i++) {
+        sctx c = istate;
+        uchar chunk[64];
+        uint total = BLK * SP;
+        for (uint off = 0; off < total; off += 64) {
+            for (int k = 0; k < 64; k++) chunk[k] = B[off + k];
+            sha_update(&c, chunk, 64);
+        }
+        uchar ctr[4] = { (uchar)(i>>24),(uchar)(i>>16),(uchar)(i>>8),(uchar)i };
+        sha_update(&c, ctr, 4);
+        uchar inner[32]; sha_final(&c, inner);
+        sctx d = ostate; sha_update(&d, inner, 32); uchar T[32]; sha_final(&d, T);
+        for (int k = 0; k < 32; k++) out64[(i-1)*32 + k] = T[k];
+    }
+}
+
 /* Little-endian 32-bit load/store over a global byte buffer. */
 static uint ld32le(__global const uchar *p)
 { return p[0] | ((uint)p[1]<<8) | ((uint)p[2]<<16) | ((uint)p[3]<<24); }
@@ -235,14 +269,7 @@ __kernel void scrypt_kdf(
 
     /* B = PBKDF2(pw, salt, 1, p*128*r) -- salt is the 4-byte addrhash */
     uchar salt[4] = { (uchar)saltw, (uchar)(saltw>>8), (uchar)(saltw>>16), (uchar)(saltw>>24) };
-    uint nblocks = (BLK * SP) / 32;                 /* 32-byte HMAC blocks */
-    for (uint i = 1; i <= nblocks; i++) {
-        uchar msg[8] = { salt[0],salt[1],salt[2],salt[3],
-                         (uchar)(i>>24),(uchar)(i>>16),(uchar)(i>>8),(uchar)i };
-        sctx c = istate; sha_update(&c, msg, 8); uchar inner[32]; sha_final(&c, inner);
-        sctx d = ostate; sha_update(&d, inner, 32); uchar T[32]; sha_final(&d, T);
-        for (int k = 0; k < 32; k++) B[(i-1)*32 + k] = T[k];
-    }
+    pbkdf2_first(istate, ostate, salt, B);
 
 #ifdef DBG
     if (DBG == 1) {   /* dump the first 64 bytes of B after PBKDF2-1 */
@@ -280,19 +307,58 @@ __kernel void scrypt_kdf(
     }
 #endif
 
-    /* out = PBKDF2(pw, B, 1, 64) -- two 32-byte blocks */
-    for (uint i = 1; i <= 2; i++) {
-        sctx c = istate;
-        uchar chunk[64];
-        uint total = BLK * SP;
-        for (uint off = 0; off < total; off += 64) {
-            for (int k = 0; k < 64; k++) chunk[k] = B[off + k];
-            sha_update(&c, chunk, 64);
+    /* out = PBKDF2(pw, B, 1, 64) */
+    pbkdf2_final(istate, ostate, B, out + (size_t)gid * 64);
+}
+
+/* ---- phased kernel: watchdog-safe scrypt across many short launches ------ *
+ * The host drives one candidate batch through: phase 0 (PBKDF2-1 -> gB), then
+ * per ROMix pass a run of phase-1 (fill) and phase-2 (mix) chunks over
+ * [iStart,iEnd), then phase 3 (PBKDF2-2 -> out). State persists in gB/gV
+ * between launches, so each launch does a bounded slice of work and never
+ * runs long enough to trip a GPU watchdog. */
+__kernel void scrypt_phase(
+    __global const uchar *pw, __global const uint *pwlen, const uint saltw,
+    __global uchar *out, __global uchar *gV, __global uchar *gB, __global uchar *gY,
+    const uint phase, const uint N, const uint passIdx,
+    const uint iStart, const uint iEnd)
+{
+    uint gid = get_global_id(0);
+    __global uchar *B  = gB + (size_t)gid * BLK * SP + (size_t)passIdx * BLK;
+    __global uchar *V  = gV + (size_t)gid * BLK * SN;
+    __global uchar *Y  = gY + (size_t)gid * BLK;
+
+    if (phase == 1) {                    /* ROMix fill chunk */
+        for (uint i = iStart; i < iEnd; i++) {
+            __global uchar *Vi = V + (size_t)i*BLK;
+            for (uint b = 0; b < BLK; b++) Vi[b] = B[b];
+            blockmix(B, Y);
         }
-        uchar ctr[4] = { (uchar)(i>>24),(uchar)(i>>16),(uchar)(i>>8),(uchar)i };
-        sha_update(&c, ctr, 4);
-        uchar inner[32]; sha_final(&c, inner);
-        sctx d = ostate; sha_update(&d, inner, 32); uchar T[32]; sha_final(&d, T);
-        for (int k = 0; k < 32; k++) out[(size_t)gid*64 + (i-1)*32 + k] = T[k];
+        return;
+    }
+    if (phase == 2) {                    /* ROMix mix chunk */
+        for (uint i = iStart; i < iEnd; i++) {
+            uint j = ld32le(B + (2*SR-1)*64) & (N - 1);
+            __global uchar *Vj = V + (size_t)j*BLK;
+            for (uint b = 0; b < BLK; b++) B[b] ^= Vj[b];
+            blockmix(B, Y);
+        }
+        return;
+    }
+
+    /* phases 0 and 3 need the passphrase (HMAC key) */
+    uchar mypw[MAXPW];
+    uint mylen = pwlen[gid];
+    if (mylen > MAXPW) mylen = MAXPW;
+    for (uint i = 0; i < mylen; i++) mypw[i] = pw[(size_t)gid*MAXPW + i];
+    sctx istate, ostate;
+    hmac_states(&istate, &ostate, mypw, mylen);
+
+    __global uchar *Bbase = gB + (size_t)gid * BLK * SP;
+    if (phase == 0) {
+        uchar salt[4] = { (uchar)saltw, (uchar)(saltw>>8), (uchar)(saltw>>16), (uchar)(saltw>>24) };
+        pbkdf2_first(istate, ostate, salt, Bbase);
+    } else {                             /* phase 3 */
+        pbkdf2_final(istate, ostate, Bbase, out + (size_t)gid * 64);
     }
 }
