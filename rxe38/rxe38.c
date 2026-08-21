@@ -1132,9 +1132,13 @@ static int gpu_setup(struct gpu *g, size_t cap)
 
     const char *src = SCRYPT_CL;
     cl_program pr = clCreateProgramWithSource(g->ctx, 1, &src, NULL, &e); CKG(e);
-    char opts[128];
+    char opts[160];
     const char *dbg = getenv("RXE38_GPU_DBG");
-    snprintf(opts, sizeof opts, "-D SN=%d -D SR=%d -D SP=%d -D MAXPW=%d -D DBG=%d",
+    /* Pin to OpenCL 1.2: no generic address space, so unqualified pointer
+     * function params default to private on every vendor. Without this the
+     * NVIDIA compiler makes struct-member pointers __generic and rejects the
+     * calls (Intel's compiler is lenient). */
+    snprintf(opts, sizeof opts, "-cl-std=CL1.2 -D SN=%d -D SR=%d -D SP=%d -D MAXPW=%d -D DBG=%d",
              GPU_N, GPU_R, GPU_P, GPU_MAXPW, dbg ? atoi(dbg) : 0);
     if (clBuildProgram(pr, 1, &g->dev, opts, NULL, NULL) != CL_SUCCESS) {
         size_t ln = 0;
