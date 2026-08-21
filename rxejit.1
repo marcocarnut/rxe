@@ -79,6 +79,11 @@ is MD4 of the UTF-16LE encoding (the Windows password hash).
 .B \-d
 Report duplicate members: hash each into a per-thread set and merge at the join.
 Exit status 0 if all members are distinct, 1 if any repeats.
+.IP
+Note that this is less useful than it looks: the set is held in memory, so it
+grows with the member count and blows up long before the sets you would actually
+find interesting. In practice it only works on small patterns \-\- using it on a
+large one is flirting with the OOM killer.
 .TP
 .B \-v
 With
@@ -139,9 +144,13 @@ C string in the output. Invaluable for inspecting exactly what a pattern
 compiles to.
 .SH KEYCRACKING
 The core keycrack workflow is:
+.PP
 .RS
+.nf
 rxejit \-m \fIhashes.txt\fR \-H md5 '[a-z]{8}'
+.fi
 .RE
+.PP
 which hashes every member of the mask, looks each digest up in the sorted target
 set, and prints
 .IR digest : plaintext
@@ -238,9 +247,13 @@ for
 sets the run length. Every
 .B -G
 run prints which mode is active, e.g.
+.PP
 .RS
+.nf
 rxejit -G: odometer incremental (RUN=16)
+.fi
 .RE
+.PP
 The default per kernel, and the measured effect:
 .TP
 .B fixed-mask \-\- incremental by default (RUN=8)
@@ -384,31 +397,46 @@ backend, with a printed reason).
 .SH EXAMPLES
 Crack a list of MD5 digests over an 8-lowercase-letter keyspace on the GPU,
 watching the rate:
+.PP
 .RS
+.nf
 rxejit \-G \-p 1 \-m hashes.txt \-H md5 '[a-z]{8}'
+.fi
 .RE
 .PP
 Crack a six-word EFF diceware passphrase, dictionaries in ./dicts:
+.PP
 .RS
+.nf
 rxejit \-G \-D dicts \-m hashes.txt \-H sha256 '[:efflarge:]{6}'
+.fi
 .RE
 .PP
 Crack an eight-character password-policy keyspace (at least two of each class):
+.PP
 .RS
+.nf
 rxejit \-G \-m hashes.txt \-H ntlm '([a-z]|[A-Z]|[0-9]){{8!2,2,2}}'
+.fi
 .RE
 .PP
 Inspect the generated OpenCL for a pattern without running it:
+.PP
 .RS
+.nf
 rxejit \-S \-G \-H md5 \-m /dev/null '[a-z]{8}'
+.fi
 .RE
 .PP
 A/B the incremental odometer against the per-candidate baseline for a policy
 crack on the same GPU:
+.PP
 .RS
+.nf
 RXEJIT_GPU_RUN=1  rxejit \-G \-p 1 \-m hashes.txt \-H md5 '([a-z]|[0-9]){{8!3,3}}'
 .br
 RXEJIT_GPU_RUN=16 rxejit \-G \-p 1 \-m hashes.txt \-H md5 '([a-z]|[0-9]){{8!3,3}}'
+.fi
 .RE
 .SH SEE ALSO
 .BR rxenum (1),
