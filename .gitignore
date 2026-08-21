@@ -15,3 +15,4 @@ rxejit_rt_embed.h
 rxejit_cl_embed.h
 tests/api
 tests/api-asan
+rxe38/rxe38

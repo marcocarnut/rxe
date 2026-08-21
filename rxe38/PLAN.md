@@ -1,9 +1,9 @@
 # rxe38 — a BIP38 (no-EC-multiply) passphrase cracker
 
 **Status: CPU implementation COMPLETE.** All five milestones built and passing
-on branch `rxe38` (`rxe38.c`, one file). `make rxe38` builds it; `make
-bip38-test` runs the self-tests. The whole cryptographic core is diff-exact
-against `bip38_oracle.py`, and the CLI cracks the BIP38 spec vectors end to end
+on branch `rxe38` (`rxe38/rxe38.c`, one file). `make rxe38` builds it; `make
+rxe38-test` runs the self-tests. The whole cryptographic core is diff-exact
+against `oracle.py`, and the CLI cracks the BIP38 spec vectors end to end
 (recovering passphrase + WIF) at ~4–5 candidates/s/core — the scrypt-bound
 regime the plan anticipated. GPU is the open next step (a separate reassessment;
 see the note at the end).
@@ -65,7 +65,7 @@ privkey). So per candidate we still do privkey → pubkey (**secp256k1 multiply,
 mandatory**) → hash160 → base58 address → SHA256d[:4] == addresshash. Without it
 every passphrase would "succeed". secp256k1 is load-bearing.
 
-## The pipeline (no-EC-multiply) — see bip38_oracle.py for the exact bytes
+## The pipeline (no-EC-multiply) — see oracle.py for the exact bytes
 
 ```
 base58check-decode(6P...)  -> 39 bytes: [0x01 0x42] flag(1) addrhash(4) enc1(16) enc2(16)
@@ -94,7 +94,7 @@ per candidate passphrase (UTF-8; BIP38 says NFC-normalize — matters only for n
 
 Then measure the real rate and decide whether GPU is worth it (separate effort).
 
-## Test vectors (BIP38 spec, no-EC-multiply) — the four in bip38_oracle.py
+## Test vectors (BIP38 spec, no-EC-multiply) — the four in oracle.py
 
 | passphrase | encrypted key | compressed | addrhash | WIF |
 |---|---|---|---|---|

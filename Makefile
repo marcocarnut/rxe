@@ -58,16 +58,16 @@ rxejit_cl_embed.h: rxejit_cl.cl
 
 # rxe38: a standalone BIP38 (no-EC-multiply) passphrase cracker. Links librxe's
 # enumerator to walk a regex keyspace; scrypt/AES-256/secp256k1(gmp) are
-# hand-written and self-checked against bip38/bip38_oracle.py. Not built by
-# 'all'. 'make bip38-test' runs its RFC/FIPS/spec-vector self-tests.
-rxe38: bip38/rxe38.c librxe.a rxe.h rxejit_rt.h
-	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -I. bip38/rxe38.c librxe.a \
-	    -lgmp -lm -lpthread -o bip38/rxe38
+# hand-written and self-checked against rxe38/oracle.py. Not built by 'all'.
+# 'make rxe38-test' runs its RFC/FIPS/spec-vector self-tests.
+rxe38: rxe38/rxe38.c librxe.a rxe.h rxejit_rt.h
+	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -I. rxe38/rxe38.c librxe.a \
+	    -lgmp -lm -lpthread -o rxe38/rxe38
 
-bip38-test: rxe38
-	./bip38/rxe38 --test-scrypt
-	./bip38/rxe38 --test-priv
-	./bip38/rxe38 --test-verify
+rxe38-test: rxe38
+	./rxe38/rxe38 --test-scrypt
+	./rxe38/rxe38 --test-priv
+	./rxe38/rxe38 --test-verify
 
 rxenum.o: rxenum.c rxe.h
 
@@ -153,7 +153,7 @@ bench: rxenum rxedup
 	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h rxejit_cl_embed.h tests/api tests/api-asan bip38/rxe38
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h rxejit_cl_embed.h tests/api tests/api-asan rxe38/rxe38
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
@@ -178,5 +178,5 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxejit.1
 
-.PHONY: all test test-asan bench clean install uninstall rxe38 bip38-test
+.PHONY: all test test-asan bench clean install uninstall rxe38 rxe38-test
 

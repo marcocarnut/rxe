@@ -2,7 +2,7 @@
  * rxe38 -- crack a BIP38-encrypted Bitcoin private key (no-EC-multiply mode)
  * by trying passphrases drawn from a regex-described keyspace.
  *
- * Built in milestones, each diffed against bip38/bip38_oracle.py (the
+ * Built in milestones, each diffed against rxe38/oracle.py (the
  * differential ground truth). This file grows one milestone at a time:
  *
  *   1. base58check decode + BIP38 parse            <-- current
