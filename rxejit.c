@@ -53,6 +53,34 @@
 #include "rxe_lay.h"       // regex -> odometer wheels, now in the library
 #include "policy.h"        // rxe_policy_segments: the policy segment table
 
+// Emitted into every generated program that reports -p progress: a rate
+// formatter that scales H/s -> KH/s -> ... -> PH/s, and a duration formatter
+// that prints the two most-significant non-zero units (years down to seconds),
+// so a rate reads "2.37 GH/s" and an ETA reads "1y 84d" / "3h 12m" / "8s". Each
+// returns into a small rotating buffer pool so several calls can coexist in one
+// fprintf (the CPU line formats both elapsed and eta).
+static const char RT_FMT[] =
+    "static const char *rt_rate(double r) {\n"
+    "    static char rb[4][24]; static int ri; char *b = rb[ri++ & 3];\n"
+    "    static const char *u[] = {\"H/s\",\"KH/s\",\"MH/s\",\"GH/s\",\"TH/s\",\"PH/s\"};\n"
+    "    int i = 0; while (r >= 1000.0 && i < 5) { r /= 1000.0; i++; }\n"
+    "    snprintf(b, 24, \"%.4g %s\", r, u[i]); return b;\n"
+    "}\n"
+    "static const char *rt_eta(double s) {\n"
+    "    static char rb[4][24]; static int ri; char *b = rb[ri++ & 3];\n"
+    "    if (!(s > 0)) s = 0;\n"
+    "    unsigned long long t = (unsigned long long)(s + 0.5);\n"
+    "    unsigned long long y = t / 31536000ULL; t %= 31536000ULL;\n"
+    "    unsigned long long d = t / 86400ULL; t %= 86400ULL;\n"
+    "    unsigned h = (unsigned)(t / 3600); t %= 3600; unsigned m = (unsigned)(t / 60); unsigned se = (unsigned)(t % 60);\n"
+    "    if (y)      snprintf(b, 24, \"%lluy %llud\", y, d);\n"
+    "    else if (d) snprintf(b, 24, \"%llud %uh\", d, h);\n"
+    "    else if (h) snprintf(b, 24, \"%uh %um\", h, m);\n"
+    "    else if (m) snprintf(b, 24, \"%um %us\", m, se);\n"
+    "    else        snprintf(b, 24, \"%us\", se);\n"
+    "    return b;\n"
+    "}\n";
+
 #define POLICY_MAXSEG 8192         // most (length, count-vector) blocks bakeable
 #define AW_CONST_MAX (48 * 1024)   // wheel tables past this go __global (NVIDIA's
                                    // __constant bank is 64 KB; a big dict overflows)
@@ -1397,7 +1425,7 @@ after_run:
             ? "    s->done = 0;\n    run(s->from, s->count, &s->total, &s->done);\n"
             : "    run(s->from, s->count, &s->total);\n", o);
         fputs("    return 0;\n}\n\n", o);
-        if (progress)
+        if (progress) {
             // A monitor thread every PSEC seconds: sum the shards' progress (a
             // relaxed atomic, so no lock and no torn read TSan complains of),
             // and print percent / rate / elapsed / eta. Cancelled at the join so
@@ -1405,8 +1433,9 @@ after_run:
             fputs("static struct shard *SH; static int NT;\n"
                   "static unsigned long long NALL; static int RUNNING = 1;\n"
                   "static double T0;\n"
-                  "static double rt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }\n"
-                  "static void *monitor(void *u)\n{\n"
+                  "static double rt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }\n", o);
+            fputs(RT_FMT, o);
+            fputs("static void *monitor(void *u)\n{\n"
                   "    (void)u;\n"
                   "    while (__atomic_load_n(&RUNNING, __ATOMIC_RELAXED)) {\n"
                   "        sleep(PSEC);\n"
@@ -1417,10 +1446,11 @@ after_run:
                   "        double fr = NALL ? (double)d / (double)NALL : 0;\n"
                   "        double rate = el > 0 ? d / el : 0;\n"
                   "        double eta = fr > 0 ? el * (1 - fr) / fr : 0;\n"
-                  "        fprintf(stderr, \"progress: %5.1f%%  %llu/%llu  %.3g/s  elapsed %.0fs  eta %.0fs\\n\",\n"
-                  "                fr * 100, d, NALL, rate, el, eta);\n"
+                  "        fprintf(stderr, \"progress: %5.1f%%  %llu/%llu  %s  elapsed %s  eta %s\\n\",\n"
+                  "                fr * 100, d, NALL, rt_rate(rate), rt_eta(el), rt_eta(eta));\n"
                   "    }\n"
                   "    return 0;\n}\n\n", o);
+        }
         fputs("int main(int argc, char **argv)\n{\n", o);
         if (match) {
             fputs("    if (argc < 2) { fprintf(stderr, \"usage: %s TARGETFILE [jobs]\\n\", argv[0]); return 2; }\n", o);
@@ -1554,6 +1584,7 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
           "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <CL/cl.h>\n\n", o);
     fprintf(o, "#define PSEC %d\n", psec);
     fputs("static double rt_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}\n", o);
+    fputs(RT_FMT, o);
     fputs(RXEJIT_RT, o); fputc('\n', o);
 
     fputs("static const char *KSRC =\n", o);
@@ -1593,9 +1624,9 @@ static void emit_gpu_hybrid(FILE *o, const char *pattern, const struct build *B,
           "    gpu_ns += s1_ - s0_; done += (NN);\\\n"
           "    double now_ = rt_now();\\\n"
           "    if (now_ - tlast >= PSEC) { double el_ = now_ - t0, fr_ = NALL ? (double)done / NALL : 0;\\\n"
-          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %.3g/s  eta %.0fs  busy %.0f%%\\n\",\\\n"
-          "                fr_ * 100, done, (unsigned long long)NALL, el_ > 0 ? done / el_ : 0,\\\n"
-          "                fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0, el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
+          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %s  eta %s  busy %.0f%%\\n\",\\\n"
+          "                fr_ * 100, done, (unsigned long long)NALL, rt_rate(el_ > 0 ? done / el_ : 0),\\\n"
+          "                rt_eta(fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0), el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
           "        tlast = now_; }\\\n"
           "} while (0)\n"
           "#else\n"
@@ -1980,6 +2011,7 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
           "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <CL/cl.h>\n\n", o);
     fprintf(o, "#define PSEC %d\n", psec);
     fputs("static double rt_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}\n", o);
+    fputs(RT_FMT, o);
     fputs(RXEJIT_RT, o); fputc('\n', o);
 
     fputs("static const char *KSRC =\n", o);
@@ -2044,9 +2076,9 @@ static void emit_gpu_perm(FILE *o, const char *pattern, const struct build *B,
           "    gpu_ns += s1_ - s0_; done += (NN);\\\n"
           "    double now_ = rt_now();\\\n"
           "    if (now_ - tlast >= PSEC) { double el_ = now_ - t0, fr_ = NALL ? (double)done / NALL : 0;\\\n"
-          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %.3g/s  eta %.0fs  busy %.0f%%\\n\",\\\n"
-          "                fr_ * 100, done, (unsigned long long)NALL, el_ > 0 ? done / el_ : 0,\\\n"
-          "                fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0, el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
+          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %s  eta %s  busy %.0f%%\\n\",\\\n"
+          "                fr_ * 100, done, (unsigned long long)NALL, rt_rate(el_ > 0 ? done / el_ : 0),\\\n"
+          "                rt_eta(fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0), el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
           "        tlast = now_; }\\\n"
           "} while (0)\n"
           "#else\n"
@@ -2299,6 +2331,7 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <CL/cl.h>\n\n", o);
     fprintf(o, "#define PSEC %d\n", psec);
     fputs("static double rt_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}\n", o);
+    fputs(RT_FMT, o);
     fputs(RXEJIT_RT, o); fputc('\n', o);
 
     fputs("static const char *KSRC =\n", o);
@@ -2334,9 +2367,9 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "    gpu_ns += s1_ - s0_; done += (NN);\\\n"
           "    double now_ = rt_now();\\\n"
           "    if (now_ - tlast >= PSEC) { double el_ = now_ - t0, fr_ = NALL ? (double)done / NALL : 0;\\\n"
-          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %.3g/s  eta %.0fs  busy %.0f%%\\n\",\\\n"
-          "                fr_ * 100, done, (unsigned long long)NALL, el_ > 0 ? done / el_ : 0,\\\n"
-          "                fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0, el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
+          "        fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %s  eta %s  busy %.0f%%\\n\",\\\n"
+          "                fr_ * 100, done, (unsigned long long)NALL, rt_rate(el_ > 0 ? done / el_ : 0),\\\n"
+          "                rt_eta(fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0), el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0);\\\n"
           "        tlast = now_; }\\\n"
           "} while (0)\n"
           "#else\n"
@@ -2643,6 +2676,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <CL/cl.h>\n\n", o);
     fprintf(o, "#define PSEC %d\n", psec);
     fputs("static double rt_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}\n", o);
+    fputs(RT_FMT, o);
     fputs(RXEJIT_RT, o); fputc('\n', o);
 
     fputs("static const char *KSRC =\n", o);
@@ -2690,9 +2724,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    if (now_ - tlast >= PSEC) { double el_ = now_ - t0, rate_ = el_ > 0 ? done / el_ : 0;\\\n"
           "        double busy_ = el_ > 0 ? (gpu_ns / 1e9) / el_ * 100 : 0;\\\n"
           "        if (NALL) { double fr_ = (double)done / NALL;\\\n"
-          "            fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %.3g/s  eta %.0fs  busy %.0f%%\\n\",\\\n"
-          "                    fr_ * 100, done, (unsigned long long)NALL, rate_, fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0, busy_);\\\n"
-          "        } else fprintf(stderr, \"gpu: %llu done  %.3g/s  busy %.0f%%\\n\", done, rate_, busy_);\\\n"
+          "            fprintf(stderr, \"gpu: %5.1f%%  %llu/%llu  %s  eta %s  busy %.0f%%\\n\",\\\n"
+          "                    fr_ * 100, done, (unsigned long long)NALL, rt_rate(rate_), rt_eta(fr_ > 0 ? el_ * (1 - fr_) / fr_ : 0), busy_);\\\n"
+          "        } else fprintf(stderr, \"gpu: %llu done  %s  busy %.0f%%\\n\", done, rt_rate(rate_), busy_);\\\n"
           "        tlast = now_; }\\\n"
           "} while (0)\n"
           "#else\n"
