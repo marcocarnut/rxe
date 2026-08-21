@@ -21,7 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
+#include <pthread.h>
 #include <gmp.h>
+
+#include "rxe.h"                 /* the librxe enumerator */
 
 /* rt_sha256(msg, len, out[32]) -- the only piece we borrow from rxejit. */
 #include "rxejit_rt.h"
@@ -843,6 +847,236 @@ static int test_verify(void)
     return ok ? 0 : 1;
 }
 
+/* ---- the cracker: librxe enumeration + pthreads ------------------------ */
+
+/* Human-readable rate: H/s, KH/s, ... (candidates are "H" here). */
+static const char *fmt_rate(double r, char *b)
+{
+    static const char *u[] = {"H/s","KH/s","MH/s","GH/s","TH/s"};
+    int i = 0;
+    while (r >= 1000.0 && i < 4) { r /= 1000.0; i++; }
+    sprintf(b, "%.3g %s", r, u[i]);
+    return b;
+}
+
+/* Human-readable ETA, largest two units, from a seconds count. */
+static const char *fmt_eta(double s, char *b)
+{
+    if (s < 0 || s > 1e18) { sprintf(b, "eons"); return b; }
+    unsigned long long t = (unsigned long long)s;
+    unsigned long long y = t/31557600ULL; t %= 31557600ULL;
+    unsigned long long d = t/86400ULL;    t %= 86400ULL;
+    unsigned long long h = t/3600ULL;     t %= 3600ULL;
+    unsigned long long m = t/60ULL;       t %= 60ULL;
+    if (y)      sprintf(b, "%lluy %llud", y, d);
+    else if (d) sprintf(b, "%llud %lluh", d, h);
+    else if (h) sprintf(b, "%lluh %llum", h, m);
+    else if (m) sprintf(b, "%llum %llus", m, t);
+    else        sprintf(b, "%llus", t);
+    return b;
+}
+
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Shared across all shards: the parsed key, the stop flag, the winning hit. */
+struct crack {
+    const struct bip38 *key;
+    volatile int        stop;        /* set once a shard verifies a hit */
+    pthread_mutex_t     mtx;
+    char                pass[512];    /* the found passphrase */
+    char                wif[64];      /* its WIF */
+    mpz_t               hit_index;
+};
+
+struct shard {
+    struct rxe        *rxe;
+    mpz_t              from, count;
+    struct crack      *cr;
+    volatile unsigned long tried;     /* candidates this shard has verified */
+};
+
+/* Per-candidate sink: BIP38-decrypt with this passphrase and verify. */
+static int crack_sink(const char *str, size_t len, const mpz_t index, void *v)
+{
+    struct shard *s = v;
+    if (s->cr->stop) return 1;                     /* another shard won */
+    s->tried++;
+
+    unsigned char priv[32];
+    bip38_privkey(s->cr->key, (const unsigned char *)str, len, priv);
+    if (address_matches(priv, s->cr->key->compressed, s->cr->key->addrhash)) {
+        pthread_mutex_lock(&s->cr->mtx);
+        if (!s->cr->stop) {
+            size_t n = len < sizeof s->cr->pass - 1 ? len : sizeof s->cr->pass - 1;
+            memcpy(s->cr->pass, str, n); s->cr->pass[n] = '\0';
+            privkey_to_wif(priv, s->cr->key->compressed, s->cr->wif);
+            mpz_set(s->cr->hit_index, index);
+            s->cr->stop = 1;
+        }
+        pthread_mutex_unlock(&s->cr->mtx);
+        return 1;
+    }
+    return 0;
+}
+
+static void *crack_worker(void *arg)
+{
+    struct shard *s = arg;
+    rxe_foreach(s->rxe, s->from, s->count, 512, crack_sink, s);
+    return NULL;
+}
+
+/* Progress monitor: prints an aggregate rate + ETA once a second on stderr. */
+struct monitor {
+    struct shard *sh;
+    int           T;
+    volatile int *done;
+    double        t0;
+    double        total;             /* candidate count, or <0 if unbounded */
+};
+
+static void *monitor_thread(void *arg)
+{
+    struct monitor *m = arg;
+    while (!*m->done) {
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+        if (*m->done) break;
+        unsigned long tried = 0;
+        for (int i = 0; i < m->T; i++) tried += m->sh[i].tried;
+        double dt = now_sec() - m->t0;
+        double rate = dt > 0 ? tried / dt : 0;
+        char rb[32], eb[32];
+        if (m->total >= 0) {
+            double rem = m->total - tried;
+            double eta = rate > 0 ? rem / rate : -1;
+            double pct = m->total > 0 ? 100.0 * tried / m->total : 0;
+            fprintf(stderr, "\rrxe38: %lu tried, %s, %.2f%%, eta %s      ",
+                    tried, fmt_rate(rate, rb), pct, fmt_eta(eta, eb));
+        } else {
+            fprintf(stderr, "\rrxe38: %lu tried, %s      ",
+                    tried, fmt_rate(rate, rb));
+        }
+    }
+    return NULL;
+}
+
+#define RXE38_THREAD_MIN 4          /* below this many candidates, one thread */
+
+/* Drive the crack. Returns 0 on a hit (prints it), 1 on exhaustion. */
+static int crack(const struct bip38 *key, const char *pattern,
+                 int jobs, int progress, long cap)
+{
+    struct rxe *rxe = rxe_parse(pattern, 0);
+    if (!rxe || rxe_error(rxe)) {
+        fprintf(stderr, "rxe38: bad passphrase regex: %s\n",
+                rxe ? rxe_error_message(rxe) : "parse failed");
+        if (rxe) rxe_free(rxe);
+        return 2;
+    }
+    int infinite = rxe_is_infinite(rxe);
+
+    /* How many candidates the walk covers, as a concrete count to divide. */
+    mpz_t nwalk; mpz_init(nwalk);
+    int bounded = 1;
+    if (infinite) {
+        if (cap > 0) mpz_set_si(nwalk, cap);
+        else { bounded = 0; mpz_set_ui(nwalk, 0); }
+    } else if (cap > 0 && mpz_cmp_si(rxe->nitems, cap) > 0) {
+        mpz_set_si(nwalk, cap);
+    } else {
+        mpz_set(nwalk, rxe->nitems);
+    }
+
+    int T = jobs > 0 ? jobs : 1;
+    if (!bounded) { /* unbounded infinite walk: single shard, no division */
+        T = 1;
+    } else if (mpz_cmp_ui(nwalk, RXE38_THREAD_MIN) < 0) {
+        T = 1;
+        if (mpz_sgn(nwalk) > 0 && mpz_cmp_ui(nwalk, (unsigned)T) < 0)
+            T = (int)mpz_get_ui(nwalk);
+    }
+    if (T < 1) T = 1;
+
+    struct crack cr;
+    cr.key = key; cr.stop = 0; cr.pass[0] = 0; cr.wif[0] = 0;
+    pthread_mutex_init(&cr.mtx, NULL);
+    mpz_init(cr.hit_index);
+
+    struct shard *sh = calloc((size_t)T, sizeof *sh);
+    if (T == 1) {
+        mpz_init_set_ui(sh[0].from, 0);
+        mpz_init(sh[0].count);
+        if (bounded) mpz_set(sh[0].count, nwalk);       /* else 0 = unlimited */
+        sh[0].rxe = rxe; sh[0].cr = &cr;
+    } else {
+        mpz_t base, off, r;
+        mpz_inits(base, off, r, NULL);
+        mpz_tdiv_qr_ui(base, r, nwalk, (unsigned long)T);
+        unsigned long rem = mpz_get_ui(r);
+        for (int t = 0; t < T; t++) {
+            mpz_init_set(sh[t].from, off);
+            mpz_init_set(sh[t].count, base);
+            if ((unsigned long)t < rem) mpz_add_ui(sh[t].count, sh[t].count, 1);
+            mpz_add(off, off, sh[t].count);
+            sh[t].rxe = (t == 0) ? rxe : rxe_deep_clone(rxe);
+            sh[t].cr  = &cr;
+        }
+        mpz_clears(base, off, r, NULL);
+    }
+
+    double t0 = now_sec();
+    volatile int mdone = 0;
+    struct monitor mon = { sh, T, &mdone, t0, bounded ? mpz_get_d(nwalk) : -1.0 };
+    pthread_t montid; int mon_on = 0;
+    if (progress)
+        mon_on = pthread_create(&montid, NULL, monitor_thread, &mon) == 0;
+
+    pthread_t *tid = calloc((size_t)T, sizeof *tid);
+    char *spun = calloc((size_t)T, 1);
+    for (int t = 1; t < T; t++)
+        if (pthread_create(&tid[t], NULL, crack_worker, &sh[t]) == 0) spun[t] = 1;
+        else crack_worker(&sh[t]);
+    crack_worker(&sh[0]);
+    for (int t = 1; t < T; t++) if (spun[t]) pthread_join(tid[t], NULL);
+    mdone = 1;
+    if (mon_on) pthread_join(montid, NULL);
+    free(tid); free(spun);
+
+    unsigned long tried = 0;
+    for (int t = 0; t < T; t++) tried += sh[t].tried;
+    double dt = now_sec() - t0;
+    if (progress) fprintf(stderr, "\n");
+
+    int rc;
+    if (cr.stop) {
+        printf("FOUND passphrase: %s\n", cr.pass);
+        printf("WIF: %s\n", cr.wif);
+        gmp_printf("index: %Zd   (%lu tried, %.1fs, %.1f cand/s)\n",
+                   cr.hit_index, tried, dt, dt > 0 ? tried / dt : 0);
+        rc = 0;
+    } else {
+        fprintf(stderr, "rxe38: not found (%lu tried, %.1fs, %.1f cand/s)\n",
+                tried, dt, dt > 0 ? tried / dt : 0);
+        rc = 1;
+    }
+
+    for (int t = 0; t < T; t++) {
+        mpz_clear(sh[t].from); mpz_clear(sh[t].count);
+        if (t != 0) rxe_free(sh[t].rxe);
+    }
+    rxe_free(rxe);
+    free(sh);
+    mpz_clear(nwalk); mpz_clear(cr.hit_index);
+    pthread_mutex_destroy(&cr.mtx);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--test-scrypt") == 0)
@@ -852,17 +1086,45 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--test-verify") == 0)
         return test_verify();
 
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <6P...bip38key>\n", argv[0]);
+    int jobs = 1, progress = 0;
+    long cap = 0;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        char c = argv[i][1];
+        if (c == 'p') { progress = 1; continue; }        /* takes no value */
+        const char *val = argv[i][2] ? argv[i] + 2       /* -j4  */
+                        : (i + 1 < argc ? argv[++i] : ""); /* -j 4 */
+        if (c == 'j')      jobs = atoi(val);
+        else if (c == 'c') cap  = atol(val);
+        else {
+            fprintf(stderr, "rxe38: unknown option -%c\n", c);
+            return 2;
+        }
+    }
+
+    if (i >= argc) {
+        fprintf(stderr,
+            "usage: %s [-j jobs] [-p] [-c count] <6P...key> [<passphrase-regex>]\n"
+            "  With a regex, tries each passphrase in the set until the key\n"
+            "  decrypts (verified against its address hash). Without one, just\n"
+            "  parses and dumps the key. no-EC-multiply keys (6PR.../6PY...) only.\n",
+            argv[0]);
         return 2;
     }
-    struct bip38 b;
-    if (bip38_parse(argv[1], &b) != 0) return 1;
 
-    printf("prefix:     0142 (no-EC-multiply)\n");
-    printf("compressed: %s\n", b.compressed ? "yes" : "no");
-    hex("addrhash:   ", b.addrhash, 4);
-    hex("enc1:       ", b.enc1, 16);
-    hex("enc2:       ", b.enc2, 16);
-    return 0;
+    struct bip38 b;
+    if (bip38_parse(argv[i], &b) != 0) return 1;
+    const char *pattern = (i + 1 < argc) ? argv[i + 1] : NULL;
+
+    if (!pattern) {                                 /* parse-and-dump mode */
+        printf("prefix:     0142 (no-EC-multiply)\n");
+        printf("compressed: %s\n", b.compressed ? "yes" : "no");
+        hex("addrhash:   ", b.addrhash, 4);
+        hex("enc1:       ", b.enc1, 16);
+        hex("enc2:       ", b.enc2, 16);
+        return 0;
+    }
+
+    if (jobs < 1) jobs = 1;
+    return crack(&b, pattern, jobs, progress, cap);
 }
