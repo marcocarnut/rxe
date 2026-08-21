@@ -1180,6 +1180,8 @@ static int gpu_run(struct gpu *g, const unsigned char *pw, const cl_uint *pwlen,
     CKG(clSetKernelArg(g->k, 5, sizeof(cl_mem), &g->mB));
     CKG(clSetKernelArg(g->k, 6, sizeof(cl_mem), &g->mY));
     CKG(clSetKernelArg(g->k, 7, sizeof(cl_uint), &N));
+    cl_uint NL = (cl_uint)n;
+    CKG(clSetKernelArg(g->k, 8, sizeof(cl_uint), &NL));
     size_t global = n;
     CKG(clEnqueueNDRangeKernel(g->q, g->k, 1, NULL, &global, NULL, 0, NULL, NULL));
     CKG(clEnqueueReadBuffer(g->q, g->mout, CL_TRUE, 0, n * 64, out, 0, NULL, NULL));
@@ -1206,6 +1208,8 @@ static int gpu_run_phased(struct gpu *g, const unsigned char *pw, const cl_uint 
     CKG(clSetKernelArg(g->kph, 5, sizeof(cl_mem), &g->mB));
     CKG(clSetKernelArg(g->kph, 6, sizeof(cl_mem), &g->mY));
     CKG(clSetKernelArg(g->kph, 8, sizeof(cl_uint), &N));
+    cl_uint NL = (cl_uint)n;
+    CKG(clSetKernelArg(g->kph, 12, sizeof(cl_uint), &NL));
     size_t global = n;
 
     #define LAUNCH(PHASE, PASS, I0, I1) do { \
