@@ -905,6 +905,37 @@ static void emit_policy_core(FILE *o, const struct build *B, int nseg,
     fprintf(o, "%s}\n", px);
 }
 
+// Emit an inline block that unranks the arrangement rank <arrExpr> (an rvalue,
+// copied to a_ so a caller's tracked arr survives) into cls[0..L-1] for segment
+// `seg` -- the arrangement half of emit_policy_core, reused by the incremental
+// GPU odometer at its three re-unrank points (start, new segment, new arr).
+// Tables SEGCV/BINOMP and locals seg,L,cls[] must be in scope.
+static void emit_pol_unrank_arr(FILE *ms, int k, int H1, const char *ind, const char *arrExpr)
+{
+    fprintf(ms, "%s{ ulong a_ = %s; int rem_[%d];\n", ind, arrExpr, k);
+    fprintf(ms, "%s  for (int t = 0; t < %d; t++) rem_[t] = SEGCV[seg*%d + t];\n", ind, k, k);
+    fprintf(ms, "%s  for (int pp = 0; pp < L; pp++)\n", ind);
+    fprintf(ms, "%s    for (int t = 0; t < %d; t++) {\n", ind, k);
+    fprintf(ms, "%s      if (rem_[t] == 0) continue;\n", ind);
+    fprintf(ms, "%s      rem_[t]--;\n", ind);
+    fprintf(ms, "%s      ulong ways = 1; int avail = L - pp - 1;\n", ind);
+    fprintf(ms, "%s      for (int u = 0; u < %d; u++) { ways *= BINOMP[avail*%d + rem_[u]]; avail -= rem_[u]; }\n", ind, k, H1);
+    fprintf(ms, "%s      if (a_ < ways) { cls[pp] = t; break; }\n", ind);
+    fprintf(ms, "%s      a_ -= ways; rem_[t]++;\n", ind);
+    fprintf(ms, "%s    }\n", ind);
+    fprintf(ms, "%s}\n", ind);
+}
+
+// Emit `<lhs> = product over classes of PSVAL[t]^SEGCV[seg][t]` -- the count of
+// character assignments for segment `seg`'s count-vector, constant within a
+// segment (the multiset of radices is fixed). Used to split loc into arr/chr.
+static void emit_pol_char_size(FILE *ms, int k, const char *ind, const char *lhs)
+{
+    fprintf(ms, "%s%s = 1;\n", ind, lhs);
+    fprintf(ms, "%sfor (int t = 0; t < %d; t++) for (int c = 0; c < SEGCV[seg*%d + t]; c++) %s *= (ulong)PSVAL[t];\n",
+            ind, k, k, lhs);
+}
+
 // The run() body for a pattern with a policy composition (A|B|...){{lo,hi!x}}.
 // Structurally the permutation body: the policy is one super-wheel of radix NPOL
 // between the pre wheels (more significant) and the post wheels (less), seeded
@@ -2097,6 +2128,13 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
     int *segL, *segCV; unsigned long long *segOFF;
     int nseg = policy_segtable(B, &segL, &segCV, &segOFF, &NPOL, &why);
     // main gates the table (>64 bits / >cap) before this, so nseg >= 0 here.
+    int k = B->policy_k, hi = B->policy_hi, H1 = hi + 1, mx = hi < 1 ? 1 : hi;
+    // The incremental odometer applies when the policy is the whole odometer
+    // (no pre/post wheels, r == j): decode a lane's run start once, then step r
+    // by +1, carrying only the character digits and re-unranking the arrangement
+    // (or segment) at the rare boundaries. With surrounding wheels the policy is
+    // already amortised by the faster post wheels, so it stays per-candidate.
+    int pol_inc = (nw == 0);
 
     int maxw = B->policy_hi;                 // width-1 union: at most hi bytes
     for (int i = 0; i < nw; i++) {
@@ -2117,8 +2155,63 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
 
     fputs("__kernel void crackP(ulong base, ulong NALL,\n"
           "                     __global const uchar *tgt, uint ntgt,\n"
-          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n"
-          "    ulong j = base + (ulong)get_global_id(0);\n    if (j >= NALL) return;\n"
+          "                     __global uint *hlen, __global uchar *hbuf, volatile __global uint *nhits)\n{\n", ms);
+    if (pol_inc) {
+        // Incremental odometer (r == j; NALL carries the tile's exclusive end).
+        // Decode the run start once, then step r by +1: carry the character
+        // digits (radix = each position's class size), re-unrank the arrangement
+        // only when the characters wrap, step to the next segment only when the
+        // arrangement wraps -- the three nested rates emit_policy_core does whole.
+        fputs("#if RUN > 1\n"
+              "    ulong r0 = base + (ulong)get_global_id(0) * RUN;\n"
+              "    if (r0 >= NALL) return;\n"
+              "    ulong rend = r0 + RUN; if (rend > NALL) rend = NALL;\n"
+              "    uchar buf[MAXW];\n", ms);
+        fprintf(ms, "    int cls[%d], ci[%d], uni[%d];\n", mx, mx, mx);
+        fputs("    int slo = 0, shi = ", ms);
+        fprintf(ms, "%d;\n", nseg - 1);
+        fputs("    while (slo < shi) { int smid = (slo + shi + 1) >> 1;\n"
+              "        if (SEGOFF[smid] <= r0) slo = smid; else shi = smid - 1; }\n"
+              "    int seg = slo, L = SEGL[seg];\n"
+              "    ulong segbase = SEGOFF[seg], segsz = SEGOFF[seg+1] - segbase;\n"
+              "    ulong char_size;\n", ms);
+        emit_pol_char_size(ms, k, "    ", "char_size");
+        fputs("    ulong loc = r0 - segbase, arr = loc / char_size, chr = loc % char_size;\n", ms);
+        emit_pol_unrank_arr(ms, k, H1, "    ", "arr");
+        fputs("    for (int pp = L - 1; pp >= 0; pp--) {\n"
+              "        int cl = cls[pp]; ci[pp] = (int)(chr % (ulong)PSVAL[cl]); chr /= (ulong)PSVAL[cl];\n"
+              "        uni[pp] = PCSTART[cl] + ci[pp]; }\n"
+              "    for (int pp = 0; pp < L; pp++) buf[pp] = PB[uni[pp]];\n", ms);
+        fprintf(ms,
+              "    for (ulong r = r0;;) {\n"
+              "        uchar dg[%d]; %s(buf, L, dg);\n"
+              "        if (cl_tgt_has(tgt, ntgt, dg)) { uint hs = atomic_inc(nhits);\n"
+              "            if (hs < MAXHITS) { hlen[hs] = L; for (int t = 0; t < L; t++) hbuf[hs*MAXW + t] = buf[t]; } }\n"
+              "        if (++r >= rend) break;\n"
+              "        if (++loc == segsz) {\n"
+              "            seg++; segbase = SEGOFF[seg]; segsz = SEGOFF[seg+1] - segbase; L = SEGL[seg]; loc = 0; arr = 0;\n",
+              HA->dglen, HA->gpu_fn);
+        emit_pol_char_size(ms, k, "            ", "char_size");
+        emit_pol_unrank_arr(ms, k, H1, "            ", "0");
+        fputs("            for (int pp = 0; pp < L; pp++) { ci[pp] = 0; uni[pp] = PCSTART[cls[pp]]; buf[pp] = PB[uni[pp]]; }\n"
+              "        } else {\n"
+              "            int carry = 1;\n"
+              "            for (int pp = L - 1; pp >= 0 && carry; pp--) {\n"
+              "                int cl = cls[pp];\n"
+              "                if (++ci[pp] == PSVAL[cl]) { ci[pp] = 0; uni[pp] = PCSTART[cl]; }\n"
+              "                else { carry = 0; uni[pp] = PCSTART[cl] + ci[pp]; }\n"
+              "                buf[pp] = PB[uni[pp]];\n"
+              "            }\n"
+              "            if (carry) {\n"
+              "                arr++;\n", ms);
+        emit_pol_unrank_arr(ms, k, H1, "                ", "arr");
+        fputs("                for (int pp = 0; pp < L; pp++) { ci[pp] = 0; uni[pp] = PCSTART[cls[pp]]; buf[pp] = PB[uni[pp]]; }\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
+              "#else\n", ms);
+    }
+    fputs("    ulong j = base + (ulong)get_global_id(0);\n    if (j >= NALL) return;\n"
           "    uchar buf[MAXW];\n    ulong f = j;\n", ms);
     // decode digits: post (nw-1..P) least significant, then r, then pre (P-1..0)
     for (int i = nw - 1; i >= P; i--)
@@ -2139,8 +2232,10 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
     fprintf(ms,
         "    uchar dg[%d]; %s(buf, p, dg);\n"
         "    if (cl_tgt_has(tgt, ntgt, dg)) { uint hs = atomic_inc(nhits);\n"
-        "        if (hs < MAXHITS) { hlen[hs] = p; for (int t = 0; t < p; t++) hbuf[hs*MAXW + t] = buf[t]; } }\n"
-        "}\n", HA->dglen, HA->gpu_fn);
+        "        if (hs < MAXHITS) { hlen[hs] = p; for (int t = 0; t < p; t++) hbuf[hs*MAXW + t] = buf[t]; } }\n",
+        HA->dglen, HA->gpu_fn);
+    if (pol_inc) fputs("#endif\n", ms);
+    fputs("}\n", ms);
     fclose(ms);
     free(segL); free(segCV); free(segOFF);
 
@@ -2209,8 +2304,12 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "#else\n"
           "    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, NULL, &e); CK(e);\n"
           "#endif\n\n"
-          "    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
-          "    char opts[64]; snprintf(opts, sizeof opts, \"-D DGLEN=%d%s\", DG, uo);\n"
+          "    int g_run = 1;\n", o);
+    if (pol_inc)
+        fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
+              "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n", o);
+    fputs("    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
+          "    char opts[96]; snprintf(opts, sizeof opts, \"-D DGLEN=%d -D RUN=%d%s\", DG, g_run, uo);\n"
           "    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e); CK(e);\n"
           "    if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
           "        size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
@@ -2237,8 +2336,11 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "    cl_event prev = NULL; cl_ulong prev_n = 0;\n"
           "    for (cl_ulong base = 0; base < NA; base += TILE) {\n"
           "        cl_ulong nn = (NA - base < TILE) ? (NA - base) : TILE;\n"
-          "        size_t global = (size_t)((nn + 255) / 256) * 256;\n"
+          "        cl_ulong hi = base + nn;\n"
+          "        cl_ulong units = ((cl_ulong)g_run > 1) ? (nn + (cl_ulong)g_run - 1) / (cl_ulong)g_run : nn;\n"
+          "        size_t global = (size_t)((units + 255) / 256) * 256;\n"
           "        CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
+          "        CK(clSetKernelArg(k, 1, sizeof hi, &hi));\n"
           "        cl_event ev;\n"
           "        CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, &ev));\n"
           "        if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
