@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <gmp.h>
 
 /* rt_sha256(msg, len, out[32]) -- the only piece we borrow from rxejit. */
 #include "rxejit_rt.h"
@@ -310,6 +311,195 @@ static void bip38_privkey(const struct bip38 *b,
     for (int i = 0; i < 16; i++) priv[16 + i] = blk[i] ^ dh1[16 + i];
 }
 
+/* ---- RIPEMD-160 -------------------------------------------------------- */
+
+static uint32_t rol32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+static uint32_t rmd_f(int g, uint32_t x, uint32_t y, uint32_t z)
+{
+    switch (g) {
+        case 0:  return x ^ y ^ z;
+        case 1:  return (x & y) | (~x & z);
+        case 2:  return (x | ~y) ^ z;
+        case 3:  return (x & z) | (y & ~z);
+        default: return x ^ (y | ~z);
+    }
+}
+
+static void ripemd160(const unsigned char *msg, size_t len, unsigned char out[20])
+{
+    static const unsigned char RL[80] = {
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+        3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+        1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+        4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13 };
+    static const unsigned char RR[80] = {
+        5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+        6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+        15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+        8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+        12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11 };
+    static const unsigned char SL[80] = {
+        11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+        7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+        11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+        11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+        9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6 };
+    static const unsigned char SR[80] = {
+        8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+        9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+        9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+        15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+        8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11 };
+    static const uint32_t KL[5] = {0,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E};
+    static const uint32_t KR[5] = {0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0};
+
+    uint32_t h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    unsigned char *buf = calloc(total, 1);
+    memcpy(buf, msg, len);
+    buf[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) buf[total - 8 + i] = (unsigned char)(bits >> (8 * i));
+
+    for (size_t off = 0; off < total; off += 64) {
+        uint32_t X[16];
+        for (int i = 0; i < 16; i++)
+            X[i] = buf[off+4*i] | (buf[off+4*i+1]<<8) |
+                   (buf[off+4*i+2]<<16) | ((uint32_t)buf[off+4*i+3]<<24);
+        uint32_t al=h0,bl=h1,cl=h2,dl=h3,el=h4;
+        uint32_t ar=h0,br=h1,cr=h2,dr=h3,er=h4;
+        for (int j = 0; j < 80; j++) {
+            int g = j / 16, gg = 4 - g;
+            uint32_t t = rol32(al + rmd_f(g,bl,cl,dl) + X[RL[j]] + KL[g], SL[j]) + el;
+            al=el; el=dl; dl=rol32(cl,10); cl=bl; bl=t;
+            t = rol32(ar + rmd_f(gg,br,cr,dr) + X[RR[j]] + KR[g], SR[j]) + er;
+            ar=er; er=dr; dr=rol32(cr,10); cr=br; br=t;
+        }
+        uint32_t t = h1 + cl + dr;
+        h1 = h2 + dl + er; h2 = h3 + el + ar;
+        h3 = h4 + al + br; h4 = h0 + bl + cr; h0 = t;
+    }
+    free(buf);
+    uint32_t h[5] = {h0,h1,h2,h3,h4};
+    for (int i = 0; i < 5; i++)
+        for (int k = 0; k < 4; k++) out[4*i+k] = (unsigned char)(h[i] >> (8*k));
+}
+
+/* hash160 = RIPEMD160(SHA256(data)), the Bitcoin pubkey/script hash. */
+static void hash160(const unsigned char *data, size_t len, unsigned char out[20])
+{
+    unsigned char sh[32];
+    rt_sha256(data, len, sh);
+    ripemd160(sh, 32, out);
+}
+
+/* ---- secp256k1 scalar multiply (affine, on gmp) ------------------------ *
+ * We need exactly one thing: privkey*G -> pubkey. Affine double-and-add with
+ * a modular inverse per step is plenty here -- one multiply per candidate is
+ * dwarfed by scrypt. */
+
+static mpz_t SP, SGX, SGY;      /* field prime, generator x/y */
+static int secp_inited = 0;
+
+static void secp_init(void)
+{
+    if (secp_inited) return;
+    mpz_init_set_str(SP,
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
+    mpz_init_set_str(SGX,
+        "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16);
+    mpz_init_set_str(SGY,
+        "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16);
+    secp_inited = 1;
+}
+
+struct pt { mpz_t x, y; int inf; };
+
+static void pt_init(struct pt *p) { mpz_init(p->x); mpz_init(p->y); p->inf = 1; }
+static void pt_clear(struct pt *p) { mpz_clear(p->x); mpz_clear(p->y); }
+static void pt_set(struct pt *d, const struct pt *s)
+{ mpz_set(d->x, s->x); mpz_set(d->y, s->y); d->inf = s->inf; }
+
+/* R = 2P (R may alias P). */
+static void pt_double(struct pt *R, const struct pt *P)
+{
+    if (P->inf || mpz_sgn(P->y) == 0) { R->inf = 1; return; }
+    mpz_t lam, t, x3, y3;
+    mpz_inits(lam, t, x3, y3, NULL);
+    mpz_mul(lam, P->x, P->x); mpz_mul_ui(lam, lam, 3);      /* 3x^2 */
+    mpz_mul_ui(t, P->y, 2); mpz_invert(t, t, SP);           /* 1/(2y) */
+    mpz_mul(lam, lam, t); mpz_mod(lam, lam, SP);
+    mpz_mul(x3, lam, lam); mpz_submul_ui(x3, P->x, 2); mpz_mod(x3, x3, SP);
+    mpz_sub(y3, P->x, x3); mpz_mul(y3, y3, lam); mpz_sub(y3, y3, P->y);
+    mpz_mod(y3, y3, SP);
+    mpz_set(R->x, x3); mpz_set(R->y, y3); R->inf = 0;
+    mpz_clears(lam, t, x3, y3, NULL);
+}
+
+/* R = P + Q (R may alias neither for simplicity; callers pass distinct). */
+static void pt_add(struct pt *R, const struct pt *P, const struct pt *Q)
+{
+    if (P->inf) { pt_set(R, Q); return; }
+    if (Q->inf) { pt_set(R, P); return; }
+    if (mpz_cmp(P->x, Q->x) == 0) {
+        if (mpz_cmp(P->y, Q->y) == 0) { pt_double(R, P); return; }
+        R->inf = 1; return;                                 /* P + (-P) */
+    }
+    mpz_t lam, t, x3, y3;
+    mpz_inits(lam, t, x3, y3, NULL);
+    mpz_sub(lam, Q->y, P->y);
+    mpz_sub(t, Q->x, P->x); mpz_invert(t, t, SP);
+    mpz_mul(lam, lam, t); mpz_mod(lam, lam, SP);
+    mpz_mul(x3, lam, lam); mpz_sub(x3, x3, P->x); mpz_sub(x3, x3, Q->x);
+    mpz_mod(x3, x3, SP);
+    mpz_sub(y3, P->x, x3); mpz_mul(y3, y3, lam); mpz_sub(y3, y3, P->y);
+    mpz_mod(y3, y3, SP);
+    mpz_set(R->x, x3); mpz_set(R->y, y3); R->inf = 0;
+    mpz_clears(lam, t, x3, y3, NULL);
+}
+
+/* Derive the (compressed or uncompressed) SEC pubkey from a 32-byte privkey.
+ * Writes 33 or 65 bytes to out and sets *outlen. */
+static void priv_to_pubkey(const unsigned char priv[32], int compressed,
+                           unsigned char *out, size_t *outlen)
+{
+    secp_init();
+    mpz_t k; mpz_init(k);
+    mpz_import(k, 32, 1, 1, 1, 0, priv);                    /* big-endian */
+
+    struct pt R, G, T;
+    pt_init(&R); pt_init(&G); pt_init(&T);
+    mpz_set(G.x, SGX); mpz_set(G.y, SGY); G.inf = 0;
+
+    for (int bit = 255; bit >= 0; bit--) {
+        struct pt D; pt_init(&D);
+        pt_double(&D, &R); pt_set(&R, &D); pt_clear(&D);
+        if (mpz_tstbit(k, bit)) { pt_add(&T, &R, &G); pt_set(&R, &T); }
+    }
+
+    unsigned char xb[32];
+    size_t cnt = 0;
+    memset(xb, 0, 32);
+    mpz_export(xb + (32 - (mpz_sizeinbase(R.x, 2) + 7) / 8), &cnt, 1, 1, 1, 0, R.x);
+    if (compressed) {
+        out[0] = mpz_tstbit(R.y, 0) ? 0x03 : 0x02;
+        memcpy(out + 1, xb, 32);
+        *outlen = 33;
+    } else {
+        unsigned char yb[32]; memset(yb, 0, 32);
+        mpz_export(yb + (32 - (mpz_sizeinbase(R.y, 2) + 7) / 8), &cnt, 1, 1, 1, 0, R.y);
+        out[0] = 0x04;
+        memcpy(out + 1, xb, 32);
+        memcpy(out + 33, yb, 32);
+        *outlen = 65;
+    }
+    mpz_clear(k);
+    pt_clear(&R); pt_clear(&G); pt_clear(&T);
+}
+
 /* ---- base58 / base58check ---------------------------------------------- */
 
 static const char B58[] =
@@ -379,6 +569,82 @@ static int b58check_decode(const char *s, unsigned char *out, size_t *outlen)
     memcpy(out, raw, n - 4);
     *outlen = n - 4;
     return 0;
+}
+
+/* base58-encode raw bytes into out (NUL-terminated). out must hold at least
+ * len*138/100 + 2 chars. Leading zero bytes become leading '1's. */
+static void b58encode(const unsigned char *data, size_t len, char *out)
+{
+    size_t zeros = 0;
+    while (zeros < len && data[zeros] == 0) zeros++;
+    size_t size = (len - zeros) * 138 / 100 + 1;
+    unsigned char *b = calloc(size, 1);
+    for (size_t i = zeros; i < len; i++) {
+        unsigned int carry = data[i];
+        for (size_t k = size; k-- > 0; ) {
+            carry += 256u * b[k];
+            b[k] = (unsigned char)(carry % 58);
+            carry /= 58;
+        }
+    }
+    size_t j = 0;
+    while (j < size && b[j] == 0) j++;
+    size_t o = 0;
+    for (size_t i = 0; i < zeros; i++) out[o++] = '1';
+    for (; j < size; j++) out[o++] = B58[b[j]];
+    out[o] = '\0';
+    free(b);
+}
+
+/* base58check-encode: append the 4-byte double-SHA256 checksum, then encode. */
+static void b58check_encode(const unsigned char *data, size_t len, char *out)
+{
+    unsigned char *buf = malloc(len + 4);
+    memcpy(buf, data, len);
+    unsigned char sum[32];
+    sha256d(data, len, sum);
+    memcpy(buf + len, sum, 4);
+    b58encode(buf, len + 4, out);
+    free(buf);
+}
+
+/* ---- address + full BIP38 verify --------------------------------------- */
+
+/* Compute the P2PKH base58 address (mainnet, version 0x00) for a private key.
+ * Writes a NUL-terminated string (<=35 chars) to addr. */
+static void privkey_to_address(const unsigned char priv[32], int compressed,
+                               char *addr)
+{
+    unsigned char pub[65];
+    size_t publen;
+    priv_to_pubkey(priv, compressed, pub, &publen);
+    unsigned char payload[21];
+    payload[0] = 0x00;
+    hash160(pub, publen, payload + 1);
+    b58check_encode(payload, 21, addr);
+}
+
+/* The only verifier in a no-EC-multiply key: the address's own double-SHA256
+ * hash, first 4 bytes, must equal addrhash. Returns 1 on a match. */
+static int address_matches(const unsigned char priv[32], int compressed,
+                           const unsigned char addrhash[4])
+{
+    char addr[40];
+    privkey_to_address(priv, compressed, addr);
+    unsigned char sum[32];
+    sha256d((const unsigned char *)addr, strlen(addr), sum);
+    return memcmp(sum, addrhash, 4) == 0;
+}
+
+/* WIF-encode a private key, for reporting a crack. */
+static void privkey_to_wif(const unsigned char priv[32], int compressed, char *wif)
+{
+    unsigned char payload[34];
+    payload[0] = 0x80;
+    memcpy(payload + 1, priv, 32);
+    size_t len = 33;
+    if (compressed) payload[33] = 0x01, len = 34;
+    b58check_encode(payload, len, wif);
 }
 
 /* ---- BIP38 (no-EC-multiply) parse -------------------------------------- */
@@ -514,12 +780,77 @@ static int test_priv(void)
     return ok ? 0 : 1;
 }
 
+/* Milestone-4 self-test: the correctness GATE. RIPEMD-160 units, then full
+ * pubkey/address derivation and addrhash verify for all four spec vectors,
+ * plus a wrong-passphrase negative check. */
+static int test_verify(void)
+{
+    int ok = 1;
+    unsigned char h[20];
+    ripemd160((const unsigned char *)"", 0, h);
+    ok &= check_hex("rmd-empty", h, 20, "9c1185a5c5e9fc54612808977ee8f548b2258d31");
+    ripemd160((const unsigned char *)"abc", 3, h);
+    ok &= check_hex("rmd-abc", h, 20, "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc");
+
+    struct { const char *pw, *key, *pub, *addr; } V[] = {
+      {"TestingOneTwoThree","6PRVWUbkzzsbcVac2qwfssoUJAN1Xhrg6bNk8J7Nzm5H7kxEbn2Nh2ZoGg",
+       "04d2ce831dd06e5c1f5b1121ef34c2af4bcb01b126e309234adbc3561b60c9360e"
+       "a7f23327b49ba7f10d17fad15f068b8807dbbc9e4ace5d4a0b40264eefaf31a4",
+       "1Jq6MksXQVWzrznvZzxkV6oY57oWXD9TXB"},
+      {"Satoshi","6PRNFFkZc2NZ6dJqFfhRoFNMR9Lnyj7dYGrzdgXXVMXcxoKTePPX1dWByq",
+       "0463b600a0bb6a2f2bef7bb9648222c3593a6ef5f7c2d81433c5193bf84b9f862b"
+       "940e55da162aeca6293cde138bcc18ba978fae399f14f258afa4f799ee61adcb",
+       "1AvKt49sui9zfzGeo8EyL8ypvAhtR2KwbL"},
+      {"TestingOneTwoThree","6PYNKZ1EAgYgmQfmNVamxyXVWHzK5s6DGhwP4J5o44cvXdoY7sRzhtpUeo",
+       "02d2ce831dd06e5c1f5b1121ef34c2af4bcb01b126e309234adbc3561b60c9360e",
+       "164MQi977u9GUteHr4EPH27VkkdxmfCvGW"},
+      {"Satoshi","6PYLtMnXvfG3oJde97zRyLYFZCYizPU5T3LwgdYJz1fRhh16bU7u6PPmY7",
+       "0363b600a0bb6a2f2bef7bb9648222c3593a6ef5f7c2d81433c5193bf84b9f862b",
+       "1HmPbwsvG5qJ3KJfxzsZRZWhbm1xBMuS8B"},
+    };
+    for (int i = 0; i < 4; i++) {
+        struct bip38 b;
+        if (bip38_parse(V[i].key, &b) != 0) { ok = 0; continue; }
+        unsigned char priv[32];
+        bip38_privkey(&b, (const unsigned char *)V[i].pw, strlen(V[i].pw), priv);
+
+        unsigned char pub[65]; size_t publen;
+        priv_to_pubkey(priv, b.compressed, pub, &publen);
+        char nm[16];
+        sprintf(nm, "pub-v%d", i + 1);
+        ok &= check_hex(nm, pub, publen, V[i].pub);
+
+        char addr[40];
+        privkey_to_address(priv, b.compressed, addr);
+        int amatch = strcmp(addr, V[i].addr) == 0;
+        int vmatch = address_matches(priv, b.compressed, b.addrhash);
+        printf("[%s] addr-v%d   %s (verify=%d)\n",
+               (amatch && vmatch) ? "PASS" : "FAIL", i + 1, addr, vmatch);
+        ok &= amatch && vmatch;
+    }
+
+    /* Negative: a wrong passphrase must NOT verify against vector 1. */
+    struct bip38 b;
+    bip38_parse("6PRVWUbkzzsbcVac2qwfssoUJAN1Xhrg6bNk8J7Nzm5H7kxEbn2Nh2ZoGg", &b);
+    unsigned char priv[32];
+    bip38_privkey(&b, (const unsigned char *)"WrongPassphrase", 15, priv);
+    int neg = address_matches(priv, b.compressed, b.addrhash);
+    printf("[%s] negative   wrong passphrase verify=%d (want 0)\n",
+           neg == 0 ? "PASS" : "FAIL", neg);
+    ok &= (neg == 0);
+
+    printf("%s\n", ok ? "verify: ALL PASS -- CORRECTNESS GATE GREEN" : "verify: FAILED");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--test-scrypt") == 0)
         return test_scrypt();
     if (argc >= 2 && strcmp(argv[1], "--test-priv") == 0)
         return test_priv();
+    if (argc >= 2 && strcmp(argv[1], "--test-verify") == 0)
+        return test_verify();
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <6P...bip38key>\n", argv[0]);
