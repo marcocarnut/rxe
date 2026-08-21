@@ -1,8 +1,23 @@
 # rxe38 — a BIP38 (no-EC-multiply) passphrase cracker
 
-**Status:** planned + oracle validated. No C written yet. Branch `rxe38`.
-Pick up at C-port milestone 1 (see below). This is its own effort and deserves
-its own context window.
+**Status: CPU implementation COMPLETE.** All five milestones built and passing
+on branch `rxe38` (`rxe38.c`, one file). `make rxe38` builds it; `make
+bip38-test` runs the self-tests. The whole cryptographic core is diff-exact
+against `bip38_oracle.py`, and the CLI cracks the BIP38 spec vectors end to end
+(recovering passphrase + WIF) at ~4–5 candidates/s/core — the scrypt-bound
+regime the plan anticipated. GPU is the open next step (a separate reassessment;
+see the note at the end).
+
+Milestone status:
+- [x] 1. base58check decode + BIP38 parse — parse byte-exact vs oracle (4/4).
+- [x] 2. scrypt(16384,8,8,64) — 3 RFC 7914 vectors + oracle dh1||dh2 (`--test-scrypt`).
+- [x] 3. AES-256 ECB decrypt + XOR — FIPS-197 + oracle privkeys (`--test-priv`).
+- [x] 4. secp256k1(gmp)+RIPEMD-160+base58 — full verify, all 4 vectors + a
+      wrong-passphrase negative (`--test-verify`, the correctness GATE).
+- [x] 5. CLI: librxe `rxe_foreach` enumeration, pthreads shard (rxe_deep_clone
+      per thread, shared first-hit stop), `-j`/`-c`/`-p` (rate+ETA monitor).
+
+The original plan, kept below for reference.
 
 ## What it is
 
