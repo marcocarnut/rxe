@@ -2294,6 +2294,18 @@ static int gpu_maxwidth(const struct build *B)
     return p;
 }
 
+// Emit the byte stores that lay fixed low wheel g's current digit d<g> into buf
+// at offset lwoff, reading the merged table AW[bb + d*L + t]. Shared by the
+// generic GPU kernel's one-shot lay and the incremental odometer's per-step
+// relay of only the digits that changed. `ind` is the indent prefix.
+static void emit_gpu_lay_fixed(FILE *ms, const struct wheel *w, int lwoff, int bb,
+                               int g, const char *ind)
+{
+    if (w->L == 1) fprintf(ms, "%sbuf[PLEN + %d] = AW[%d + d%d];\n", ind, lwoff, bb, g);
+    else for (int t = 0; t < w->L; t++)
+        fprintf(ms, "%sbuf[PLEN + %d] = AW[%d + d%d*%d + %d];\n", ind, lwoff + t, bb, g, w->L, t);
+}
+
 static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G,
                              int lowvar, const char *nmemb, int psec)
 {
@@ -2332,13 +2344,12 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
         fputs(",\n                     __global const uchar *AW", ms);
         if (nm > 0) fputs(", __global const int *AWO, __global const int *AWL", ms);
     }
-    fputs(")\n{\n"
-          "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
-    if (lowvar) fprintf(ms, "    uchar buf[%d];\n", maxw + 1);
-    else        fputs("    uchar buf[T];\n", ms);
-    fputs("    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j;\n", ms);
-    for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
+    fputs(")\n{\n", ms);
     if (lowvar) {
+        fputs("    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
+        fprintf(ms, "    uchar buf[%d];\n", maxw + 1);
+        fputs("    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j;\n", ms);
+        for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
         // compacting lay: advance p by each alternative's real length
         fputs("    int p = PLEN;\n", ms);
         for (int g = 0; g < G; g++) {
@@ -2351,15 +2362,59 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
             "        if (s < %d) { hlen[s] = p; for (int t = 0; t < p; t++) hbuf[s*%d + t] = buf[t]; } }\n"
             "}\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
     } else {
-        for (int g = 0; g < G; g++) {
-            if (lw[g].L == 1) fprintf(ms, "    buf[PLEN + %d] = AW[%d + d%d];\n", lwoff[g], bb[g], g);
-            else for (int t = 0; t < lw[g].L; t++)
-                fprintf(ms, "    buf[PLEN + %d] = AW[%d + d%d*%d + %d];\n", lwoff[g] + t, bb[g], g, lw[g].L, t);
+        // The fixed-width tail, two odometer schemes chosen at kernel-build time
+        // by -D RUN (from RXEJIT_GPU_RUN, for A/B on one binary):
+        //   RUN == 1  one candidate per lane; decode its whole odometer from the
+        //             global index every time (the baseline, grid of N lanes).
+        //   RUN > 1   each lane owns a contiguous run of RUN candidates: decode
+        //             the run's start once, then step the odometer +1 with carry,
+        //             re-laying ONLY the digits that changed (usually just the
+        //             fastest wheel -- one byte store). Amortizes the decode chain
+        //             over the run. lo_N is the tile's exclusive end (base + n).
+        fputs("#if RUN > 1\n"
+              "    ulong j0 = lo_base + (ulong)get_global_id(0) * RUN;\n"
+              "    if (j0 >= lo_N) return;\n"
+              "    ulong jend = j0 + RUN; if (jend > lo_N) jend = lo_N;\n"
+              "    uchar buf[T];\n"
+              "    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j0;\n", ms);
+        for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
+        for (int g = 0; g < G; g++) emit_gpu_lay_fixed(ms, &lw[g], lwoff[g], bb[g], g, "    ");
+        fprintf(ms,
+            "    for (ulong j = j0;;) {\n"
+            "        uchar dg[%d]; %s(buf, T, dg);\n"
+            "        if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
+            "            if (s < %d) { hlen[s] = T; for (int t = 0; t < T; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "        if (++j >= jend) break;\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
+        // step the odometer: the fastest (rightmost) wheel is g = G-1.
+        {
+            int gf = G - 1;
+            fprintf(ms, "        if (++d%d != %d) {\n", gf, lw[gf].n);
+            emit_gpu_lay_fixed(ms, &lw[gf], lwoff[gf], bb[gf], gf, "            ");
+            fputs("        } else {\n", ms);
+            fprintf(ms, "            d%d = 0;\n", gf);
+            emit_gpu_lay_fixed(ms, &lw[gf], lwoff[gf], bb[gf], gf, "            ");
+            if (G > 1) {
+                fputs("            uint cr = 1;\n", ms);
+                for (int g = gf - 1; g >= 0; g--) {          // carry into the higher wheels
+                    fprintf(ms, "            if (cr) { if (++d%d == %d) d%d = 0; else cr = 0;\n", g, lw[g].n, g);
+                    emit_gpu_lay_fixed(ms, &lw[g], lwoff[g], bb[g], g, "                ");
+                    fputs("            }\n", ms);
+                }
+            }
+            fputs("        }\n", ms);
         }
+        fputs("    }\n"
+              "#else\n"
+              "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n"
+              "    uchar buf[T];\n"
+              "    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j;\n", ms);
+        for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
+        for (int g = 0; g < G; g++) emit_gpu_lay_fixed(ms, &lw[g], lwoff[g], bb[g], g, "    ");
         fprintf(ms,
             "    uchar dg[%d]; %s(buf, T, dg);\n"
             "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
             "        if (s < %d) { hlen[s] = T; for (int t = 0; t < T; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "#endif\n"
             "}\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
     }
     fclose(ms);
@@ -2429,14 +2484,14 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     // A kernel per key, built on demand. When the low block is fixed the key is
     // the total member length T (its width and MD5 length baked); when it is
     // variable the length is per-lane, so the key is just the prefix length.
-    fprintf(o, "static cl_context ctx; static cl_device_id dev;\n"
+    fprintf(o, "static cl_context ctx; static cl_device_id dev; static int g_run = 1;\n"
                "static cl_kernel kern[MAXW + 1];\n"
                "static cl_kernel kernel_for(int key) {\n"
                "    if (kern[key]) return kern[key];\n"
                "    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
-               "    cl_int e; char opts[128]; snprintf(opts, sizeof opts, %s);\n",
-            lowvar ? "\"-D PLEN=%d -D DGLEN=%d%s\", key, DG, uo"
-                   : "\"-D T=%d -D PLEN=%d -D DGLEN=%d%s\", key, key - LOWWIDTH, DG, uo");
+               "    cl_int e; char opts[160]; snprintf(opts, sizeof opts, %s);\n",
+            lowvar ? "\"-D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, DG, g_run, uo"
+                   : "\"-D T=%d -D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, key - LOWWIDTH, DG, g_run, uo");
     fputs("    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
           "    if (clBuildProgram(pr, 1, &dev, opts, NULL, NULL) != CL_SUCCESS) {\n"
           "        size_t ls = 0; clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ls);\n"
@@ -2450,7 +2505,9 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    if (!tgt) { fprintf(stderr, \"rxejit -G: cannot read %s\\n\", argv[1]); return 2; }\n"
           "    FILE *pf = fopen(argv[2], \"rb\");\n"
           "    if (!pf) { fprintf(stderr, \"rxejit -G: cannot read %s\\n\", argv[2]); return 2; }\n"
-          "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n\n"
+          "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n"
+          "    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
+          "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n\n"
           "    cl_platform_id plat; cl_int e;\n"
           "    if (clGetPlatformIDs(1, &plat, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL platform\\n\"); return 2; }\n"
           "    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL GPU\\n\"); return 2; }\n"
@@ -2482,7 +2539,6 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "        if (plen && fread(rec, 1, plen, pf) != (size_t)plen) break;\n"
           "        cl_kernel k = kernel_for(KEY);\n"
           "        if (plen) CK(clEnqueueWriteBuffer(q, mpfx, CL_TRUE, 0, plen, rec, 0, NULL, NULL));\n"
-          "        CK(clSetKernelArg(k, 1, sizeof loN, &loN));\n"
           "        CK(clSetKernelArg(k, 2, sizeof mpfx, &mpfx));\n"
           "        CK(clSetKernelArg(k, 3, sizeof mt, &mt));\n"
           "        CK(clSetKernelArg(k, 4, sizeof ntgt, &ntgt));\n"
@@ -2501,8 +2557,11 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "        cl_event prev = NULL; cl_ulong prev_n = 0;\n"
           "        for (cl_ulong base = 0; base < loN; base += TILE) {\n"
           "            cl_ulong n = (loN - base < TILE) ? (loN - base) : TILE;\n"
-          "            size_t global = (size_t)((n + 255) / 256) * 256;\n"
+          "            cl_ulong hi = base + n;\n"
+          "            cl_ulong units = ((cl_ulong)g_run > 1) ? (n + (cl_ulong)g_run - 1) / (cl_ulong)g_run : n;\n"
+          "            size_t global = (size_t)((units + 255) / 256) * 256;\n"
           "            CK(clSetKernelArg(k, 0, sizeof base, &base));\n"
+          "            CK(clSetKernelArg(k, 1, sizeof hi, &hi));\n"
           "            cl_event ev;\n"
           "            CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, &ev));\n"
           "            if (prev) { CK(clWaitForEvents(1, &prev)); DRAIN(prev, prev_n); clReleaseEvent(prev);\n"
