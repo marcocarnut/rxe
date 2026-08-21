@@ -2357,11 +2357,15 @@ static void emit_gpu_policy(FILE *o, const char *pattern, const struct build *B,
           "    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, qp, &e); CK(e);\n"
           "#else\n"
           "    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, NULL, &e); CK(e);\n"
-          "#endif\n\n"
-          "    int g_run = 1;\n", o);
+          "#endif\n\n", o);
+    // Incremental is the DEFAULT for the pure-policy kernel (it only ever helps:
+    // ~1.9x on an RTX 4080, ~3x on an iGPU); RXEJIT_GPU_RUN=1 reverts to the
+    // per-candidate decode for diagnostics / correctness A/B. Surrounded policy
+    // has no incremental kernel, so it stays at 1.
+    fprintf(o, "    int g_run = %d;\n", pol_inc ? 16 : 1);
     if (pol_inc)
         fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
-              "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n", o);
+              "      fprintf(stderr, \"rxejit -G: odometer %s (RUN=%d)\\n\", g_run > 1 ? \"incremental\" : \"per-candidate\", g_run); }\n", o);
     fputs("    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
           "    char opts[96]; snprintf(opts, sizeof opts, \"-D DGLEN=%d -D RUN=%d%s\", DG, g_run, uo);\n"
           "    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e); CK(e);\n"
@@ -2640,12 +2644,16 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     // A kernel per key, built on demand. When the low block is fixed the key is
     // the total member length T (its width and MD5 length baked); when it is
     // variable the length is per-lane, so the key is just the prefix length.
-    fprintf(o, "static cl_context ctx; static cl_device_id dev; static int g_run = 1;\n"
+    // Incremental is the DEFAULT for the fixed-width kernel (a small win on a
+    // weak iGPU, ~neutral on a big discrete GPU); RXEJIT_GPU_RUN=1 reverts. The
+    // lowvar (variable-length) kernel has no incremental path, so it stays at 1.
+    fprintf(o, "static cl_context ctx; static cl_device_id dev; static int g_run = %d;\n"
                "static cl_kernel kern[MAXW + 1];\n"
                "static cl_kernel kernel_for(int key) {\n"
                "    if (kern[key]) return kern[key];\n"
                "    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
                "    cl_int e; char opts[160]; snprintf(opts, sizeof opts, %s);\n",
+            lowvar ? 1 : 8,
             lowvar ? "\"-D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, DG, g_run, uo"
                    : "\"-D T=%d -D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, key - LOWWIDTH, DG, g_run, uo");
     fputs("    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
@@ -2667,7 +2675,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     // its launch grid -- honour RXEJIT_GPU_RUN only when the tail is fixed.
     if (!lowvar)
         fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
-              "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n", o);
+              "      fprintf(stderr, \"rxejit -G: odometer %s (RUN=%d)\\n\", g_run > 1 ? \"incremental\" : \"per-candidate\", g_run); }\n", o);
     fputs("\n    cl_platform_id plat; cl_int e;\n"
           "    if (clGetPlatformIDs(1, &plat, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL platform\\n\"); return 2; }\n"
           "    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL GPU\\n\"); return 2; }\n"
