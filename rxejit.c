@@ -2466,6 +2466,23 @@ static void emit_gpu_lay_fixed(FILE *ms, const struct wheel *w, int lwoff, int b
         fprintf(ms, "%sbuf[PLEN + %d] = AW[%d + d%d*%d + %d];\n", ind, lwoff + t, bb, g, w->L, t);
 }
 
+// Re-lay the compacting variable-width low wheels [from..G) into buf, starting
+// at their common base pos[from] (wheels below `from` are unchanged, so pos[from]
+// still holds), recording each wheel's new start in pos[] as the variable
+// lengths shift the tail. Used by the incremental lowvar odometer: a step that
+// carries into wheel `from` re-lays only the suffix from there. emit_cl_lay
+// advances the running `p`, so pos[] tracks where each wheel landed.
+static void emit_lowvar_relay(FILE *ms, const struct wheel *lw, const int *bb,
+                              const int *mb, int from, int G)
+{
+    fprintf(ms, "            p = pos[%d];\n", from);
+    for (int g = from; g < G; g++) {
+        char dv[16]; snprintf(dv, sizeof dv, "d%d", g);
+        fprintf(ms, "            pos[%d] = p;\n", g);
+        emit_cl_lay(ms, &lw[g], bb[g], mb[g], dv);
+    }
+}
+
 static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B, int G,
                              int lowvar, const char *nmemb, int psec)
 {
@@ -2506,7 +2523,47 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     }
     fputs(")\n{\n", ms);
     if (lowvar) {
-        fputs("    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
+        // Variable-width compacting lay. Same RUN split as the fixed tail, but a
+        // stepped wheel's alternative can change LENGTH, shifting every byte after
+        // it -- so a step re-lays the whole suffix from the changed wheel, not one
+        // digit. Because the lay is left-to-right, wheel g starts at a position
+        // pos[g] fixed by the wheels below it; stepping the fastest wheel (G-1)
+        // re-lays only from pos[G-1], and a carry into wheel gc re-lays pos[gc]..end.
+        int GA = G < 1 ? 1 : G;
+        fputs("#if RUN > 1\n"
+              "    ulong j0 = lo_base + (ulong)get_global_id(0) * RUN;\n"
+              "    if (j0 >= lo_N) return;\n"
+              "    ulong jend = j0 + RUN; if (jend > lo_N) jend = lo_N;\n", ms);
+        fprintf(ms, "    uchar buf[%d];\n    int pos[%d];\n", maxw + 1, GA);
+        fputs("    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j0;\n", ms);
+        for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
+        fputs("    int p = PLEN;\n", ms);
+        for (int g = 0; g < G; g++) {                    // initial lay, record pos[]
+            char dv[16]; snprintf(dv, sizeof dv, "d%d", g);
+            fprintf(ms, "    pos[%d] = p;\n", g);
+            emit_cl_lay(ms, &lw[g], bb[g], mb[g], dv);
+        }
+        fprintf(ms,
+            "    for (ulong j = j0;;) {\n"
+            "        uchar dg[%d]; %s(buf, p, dg);\n"
+            "        if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
+            "            if (s < %d) { hlen[s] = p; for (int t = 0; t < p; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "        if (++j >= jend) break;\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
+        for (int lvl = G - 1; lvl >= 0; lvl--) {         // step: fastest wheel = G-1
+            fprintf(ms, "        if (++d%d != %d) {\n", lvl, lw[lvl].n);
+            emit_lowvar_relay(ms, lw, bb, mb, lvl, G);
+            fputs("        }\n", ms);
+            if (lvl > 0) fprintf(ms, "        else { d%d = 0;\n", lvl);
+            else {                                       // wheel 0 all-wrap (guarded by jend)
+                fputs("        else { d0 = 0;\n", ms);
+                emit_lowvar_relay(ms, lw, bb, mb, 0, G);
+                fputs("        }\n", ms);
+            }
+        }
+        for (int lvl = 1; lvl < G; lvl++) fputs("        }\n", ms);   // close the else-blocks
+        fputs("    }\n"
+              "#else\n"
+              "    ulong j = lo_base + (ulong)get_global_id(0);\n    if (j >= lo_N) return;\n", ms);
         fprintf(ms, "    uchar buf[%d];\n", maxw + 1);
         fputs("    for (int i = 0; i < PLEN; i++) buf[i] = pfx[i];\n    ulong f = j;\n", ms);
         for (int g = G - 1; g >= 0; g--) fprintf(ms, "    uint d%d = f %% %d; f /= %d;\n", g, lw[g].n, lw[g].n);
@@ -2520,6 +2577,7 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
             "    uchar dg[%d]; %s(buf, p, dg);\n"
             "    if (cl_tgt_has(tgt, ntgt, dg)) { uint s = atomic_inc(nhits);\n"
             "        if (s < %d) { hlen[s] = p; for (int t = 0; t < p; t++) hbuf[s*%d + t] = buf[t]; } }\n"
+            "#endif\n"
             "}\n", HA->dglen, HA->gpu_fn, 1 << 20, maxw);
     } else {
         // The fixed-width tail, two odometer schemes chosen at kernel-build time
@@ -2644,16 +2702,17 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
     // A kernel per key, built on demand. When the low block is fixed the key is
     // the total member length T (its width and MD5 length baked); when it is
     // variable the length is per-lane, so the key is just the prefix length.
-    // Incremental is the DEFAULT for the fixed-width kernel (a small win on a
-    // weak iGPU, ~neutral on a big discrete GPU); RXEJIT_GPU_RUN=1 reverts. The
-    // lowvar (variable-length) kernel has no incremental path, so it stays at 1.
+    // Incremental is the DEFAULT for both generic kernels: the fixed-width tail
+    // (RUN=8; a small iGPU win, ~neutral on a big GPU) and the lowvar
+    // variable-length lay (RUN=16; ~1.25x on an iGPU diceware dict, its suffix
+    // re-lay cheaper than a full decode+lay). RXEJIT_GPU_RUN=1 reverts either.
     fprintf(o, "static cl_context ctx; static cl_device_id dev; static int g_run = %d;\n"
                "static cl_kernel kern[MAXW + 1];\n"
                "static cl_kernel kernel_for(int key) {\n"
                "    if (kern[key]) return kern[key];\n"
                "    const char *uo = getenv(\"RXEJIT_NO_UNROLL\") ? \" -D RXEJIT_UNROLL=0\" : \"\";\n"
                "    cl_int e; char opts[160]; snprintf(opts, sizeof opts, %s);\n",
-            lowvar ? 1 : 8,
+            lowvar ? 16 : 8,
             lowvar ? "\"-D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, DG, g_run, uo"
                    : "\"-D T=%d -D PLEN=%d -D DGLEN=%d -D RUN=%d%s\", key, key - LOWWIDTH, DG, g_run, uo");
     fputs("    cl_program pr = clCreateProgramWithSource(ctx, 1, &KSRC, NULL, &e);\n"
@@ -2672,11 +2731,11 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n", o);
     // The incremental odometer exists only in the fixed-width kernel; the lowvar
     // (variable-length) lay stays one candidate per lane, so RUN must not shrink
-    // its launch grid -- honour RXEJIT_GPU_RUN only when the tail is fixed.
-    if (!lowvar)
-        fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
-              "      fprintf(stderr, \"rxejit -G: odometer %s (RUN=%d)\\n\", g_run > 1 ? \"incremental\" : \"per-candidate\", g_run); }\n", o);
-    fputs("\n    cl_platform_id plat; cl_int e;\n"
+    // its launch grid. Both the fixed-width and lowvar kernels now have a #if
+    // RUN>1 incremental path, so RXEJIT_GPU_RUN applies to either.
+    fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
+          "      fprintf(stderr, \"rxejit -G: odometer %s (RUN=%d)\\n\", g_run > 1 ? \"incremental\" : \"per-candidate\", g_run); }\n"
+          "\n    cl_platform_id plat; cl_int e;\n"
           "    if (clGetPlatformIDs(1, &plat, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL platform\\n\"); return 2; }\n"
           "    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL GPU\\n\"); return 2; }\n"
           "    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &e); CK(e);\n"
