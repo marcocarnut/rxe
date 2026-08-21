@@ -39,8 +39,10 @@ dictionaries, backreferences, ordered and unordered combinations
 .RB ( re ){{ ... }},
 and policy compositions
 .RB ( A | B | ... ){{ n , m ! floors }}.
-Only an unbounded (infinite) repeat, or a set too large to unroll within the
-limits below, is declined \-\- with a printed reason.
+Only an unbounded (infinite) repeat, a keyed shuffle (see
+.B LIMITATIONS AND CAVEATS
+below), or a set too large to unroll within the limits below, is declined \-\-
+with a printed reason.
 .PP
 As regular expressions often contain characters special to the shell, enclose
 .I regex
@@ -305,6 +307,24 @@ forces the scalar path for an A/B on the same machine. AVX2 all-core runs at a
 lower clock than scalar, so throughput can scale below the core count while the
 part stays cool and power-limited; SHA-NI scales best.
 .SH LIMITATIONS AND CAVEATS
+.TP
+.B No keyed shuffles
+A keyed-shuffle group,
+.BI (?~ key : re ),
+is declined outright \-\- on
+.B both
+the CPU and GPU backends, with "it has a shuffle" and a nonzero exit. The whole
+JIT rests on the +1 odometer, where consecutive indices produce adjacent
+members and one member is a small delta from the last. A shuffle deliberately
+breaks that: its key permutes which member sits at which index, so consecutive
+outputs are unrelated. The grid-stride GPU model
+.I could
+in principle honour a shuffle \-\- each lane would unrank its own index through
+the shuffle permutation, needing no adjacency \-\- but the incremental odometer,
+now the default, cannot. Grid-stride support is conceivable and may come later,
+though the case for it is thin. To walk a shuffled set today, use the
+interpreter,
+.BR rxenum (1).
 .TP
 .B One hash block per candidate
 A candidate must fit a single hash block (under 56 bytes for MD5/SHA-1/SHA-256;
