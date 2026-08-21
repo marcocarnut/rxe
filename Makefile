@@ -145,21 +145,25 @@ clean:
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
 # Override PREFIX to relocate, DESTDIR to stage into a package root.
-install: rxenum librxe.a
+install: rxenum rxejit librxe.a
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -d $(DESTDIR)$(PREFIX)/include
 	install -d $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 755 rxenum    $(DESTDIR)$(PREFIX)/bin
+	install -m 755 rxejit    $(DESTDIR)$(PREFIX)/bin
 	install -m 644 librxe.a  $(DESTDIR)$(PREFIX)/lib
 	install -m 644 rxe.h     $(DESTDIR)$(PREFIX)/include
 	install -m 644 rxenum.1  $(DESTDIR)$(PREFIX)/share/man/man1
+	install -m 644 rxejit.1  $(DESTDIR)$(PREFIX)/share/man/man1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/rxenum
+	rm -f $(DESTDIR)$(PREFIX)/bin/rxejit
 	rm -f $(DESTDIR)$(PREFIX)/lib/librxe.a
 	rm -f $(DESTDIR)$(PREFIX)/include/rxe.h
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxejit.1
 
 .PHONY: all test test-asan bench clean install uninstall
 

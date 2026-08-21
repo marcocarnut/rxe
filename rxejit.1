@@ -1,0 +1,418 @@
+.TH RXEJIT 1 "Aug 2026" Linux "User Manuals"
+.SH NAME
+rxejit \- JIT-compile a regular-expression set into native code and run it: enumerate, count, keycrack (CPU or GPU), or find duplicates
+.SH SYNOPSIS
+.B rxejit
+[\fB-S\fR]
+[\fB-n\fR | \fB-m\fR \fIfile\fR [\fB-H\fR \fImd5\fR|\fIntlm\fR|\fIsha1\fR|\fIsha256\fR] | \fB-d\fR [\fB-v\fR]]
+[\fB-G\fR]
+[\fB-C\fR]
+[\fB-j\fR \fIjobs\fR]
+[\fB-p\fR \fIsec\fR]
+[\fB-D\fR \fIdir\fR]
+.I regex
+.SH DESCRIPTION
+.B rxejit
+takes the (mostly Perl-compatible) regular expression in
+.I regex
+as the specification of a finite set, and instead of interpreting it,
+.B compiles
+it: it emits a purpose-built C program (for the GPU, an OpenCL program) whose
+core is an unrolled odometer over fixed character buffers, one wheel per varying
+position, delta-patched as the odometer turns. That program is then built with
+the system C compiler and run. The regex is the machine; the emitted code is a
+straight-line enumerator with no interpreter left in the inner loop.
+.PP
+This makes the walk very fast, which matters because the interesting jobs are
+per-member: sift a set against a target list, hash every member and look for a
+match (keycracking), or hash every member into a set and report collisions
+(deduplication). See
+.BR rxenum (1)
+for the set language itself and the counting/enumeration semantics;
+.B rxejit
+shares the parser and the enumeration order but trades startup (a compile step)
+for a much faster inner loop.
+.PP
+.B rxejit
+handles any finite pattern \-\- masks, alternations, bounded repeats,
+dictionaries, backreferences, ordered and unordered combinations
+.RB ( re ){{ ... }},
+and policy compositions
+.RB ( A | B | ... ){{ n , m ! floors }}.
+Only an unbounded (infinite) repeat, or a set too large to unroll within the
+limits below, is declined \-\- with a printed reason.
+.PP
+As regular expressions often contain characters special to the shell, enclose
+.I regex
+in single quotes.
+.SH OPTIONS
+With no sink switch,
+.B rxejit
+enumerates and prints every member (the compiled equivalent of
+.BR "rxenum -n" ).
+.TP
+.B \-n
+Count the members rather than print them. Times the walk with no I/O \-\- useful
+to measure raw throughput.
+.TP
+.B \-m \fIfile\fR
+Sift: print only the members that appear in
+.IR file
+(one target per line). The pattern is a keyspace and
+.I file
+is the set to match it against.
+.TP
+.B \-H \fIalg\fR
+With
+.BR -m ,
+.I file
+holds hex digests of one hash and each candidate is hashed and compared \-\- this
+is keycracking. Output is
+.IR digest : plaintext
+per hit.
+.I alg
+is one of
+.BR md5 ", " ntlm ", " sha1 ", " sha256 .
+.B ntlm
+is MD4 of the UTF-16LE encoding (the Windows password hash).
+.TP
+.B \-d
+Report duplicate members: hash each into a per-thread set and merge at the join.
+Exit status 0 if all members are distinct, 1 if any repeats.
+.TP
+.B \-v
+With
+.BR -d ,
+list the repeated members and their counts.
+.TP
+.B \-G
+Run the keycrack on the GPU via OpenCL (see
+.B THE GPU BACKEND
+below). Requires
+.B \-m
+.I file
+.B \-H
+.IR alg .
+One OpenCL program is generated per pattern shape and built at run time.
+.TP
+.B \-j \fIjobs\fR
+Number of CPU threads for the
+.BR -n ", " -m " and " -d
+runs (default: one per CPU). Printing stays single-threaded and ordered.
+.TP
+.B \-p \fIsec\fR
+Every
+.I sec
+seconds, print progress to stderr: percent done, rate, elapsed and ETA. The
+threaded
+.BR -n / -m
+runs and
+.B -G
+report it;
+.B -G
+also reports GPU occupancy (the fraction of wall time the device was busy).
+.TP
+.B \-C
+Force the scalar hash path (no AVX2 md5/md4, no SHA-NI) for this run, for an
+A/B against the accelerated path on the same machine. Sets
+.BR RXEJIT_NOACCEL ,
+which any generated binary (see
+.BR -S )
+also honours.
+.TP
+.B \-D \fIdir\fR
+Also look in
+.I dir
+for a
+.BI [: name :]
+dictionary's
+.IB name .dict
+file (one word per line). May be given more than once.
+.TP
+.B \-S
+Print the generated C (or, with
+.BR -G ,
+OpenCL host + kernel) to stdout instead of compiling and running it. The
+device kernel source is the
+.B KSRC
+C string in the output. Invaluable for inspecting exactly what a pattern
+compiles to.
+.SH KEYCRACKING
+The core keycrack workflow is:
+.RS
+rxejit \-m \fIhashes.txt\fR \-H md5 '[a-z]{8}'
+.RE
+which hashes every member of the mask, looks each digest up in the sorted target
+set, and prints
+.IR digest : plaintext
+for every hit. Add
+.B \-G
+to run it on the GPU, and
+.B \-p 1
+to watch the rate. A target that is not a member makes the run sweep the whole
+keyspace (a throughput measurement); the run stops early once every distinct
+target has been cracked.
+.SH THE GPU BACKEND
+With
+.BR -G ,
+.B rxejit
+splits the work between itself (the host, which owns the enumerator) and a
+generated OpenCL program (the device half). For a pattern with a fixed-class
+tail, the host stride-seeks the head \-\- alternations, dictionaries, head-side
+backreferences, anything
+.B rxe
+enumerates \-\- and streams each high prefix to the device, which sweeps the low
+block for it. For a pattern that is wholly a choice or a policy, one grid covers
+the entire index space. The device tiles the sweep and double-buffers launches
+so it never idles on the host between tiles. Hits are recorded as plaintext and
+re-hashed on the host.
+.PP
+Which kernel a pattern compiles to is decided at build time from its shape.
+Inspect the choice, and the generated code, with
+.BR "-S -G" .
+.SS The kernels
+.TP
+.B fixed-mask (generic, crackG)
+A run of independent fixed character classes \-\- a plain mask like
+.BR [a-z]{8} ,
+or the fixed-class tail of a structured pattern. Each lane decodes its index
+into the per-position digits and lays the bytes from a merged wheel table; the
+member width and hash length are baked in, so the sweep runs at full speed. This
+is the common case and the fastest per candidate.
+.TP
+.B variable-length (lowvar, crackG)
+A dictionary or an uneven alternation with no fixed tail worth splitting \-\-
+e.g.
+.BR [:efflarge:]{6} .
+Each lane lays each chosen word's real bytes compactly, advancing a running
+length, then hashes that length. One hash block covers any member under the
+block size, so only the byte-copy diverges between lanes.
+.TP
+.B permutation / combination (crackP)
+An ordered
+.RB ( re ){{ n , m ! }}
+or unordered
+.RB ( re ){{ n , m }}
+choice from a pool. Each lane unranks its index into the chosen items \-\-
+factorial number system for a permutation, colex/binomial for a combination \-\-
+tracking only the k picks, so nothing pool-wide sits in private memory. The pool
+is a
+.B __global
+buffer, so a large dictionary pool is fine.
+.TP
+.B policy (crackP)
+A policy composition
+.RB ( A | B | ... ){{ n , m ! floors }}
+\-\- the password-policy operator (at least so many characters of each class).
+Each lane decodes its index into a segment (a length + class-count vector,
+minimal-compliance first), an arrangement (which class fills each position) and
+the character values, then lays the member.
+.TP
+.B loop-repeat (hybrid, crackL)
+A bare single-wheel bounded repeat like
+.BR [a-z]{1,8} ,
+swept split by length. Surrounding or multi-wheel structure is not handled by
+this kernel and stays on the CPU.
+.SS The incremental odometer (RXEJIT_GPU_RUN)
+By default each lane cracks one candidate: it decodes that candidate's whole
+odometer from its global index every time. The
+.B incremental odometer
+instead gives each lane a contiguous run of
+.B RUN
+candidates: it decodes the run's start once, then steps the odometer by +1 with
+carry, re-laying only what changed. It amortises the per-candidate
+.B decode
+over the run. Whether that is a win depends entirely on how much the decode
+cost \-\- as opposed to the hash \-\- bottlenecks the kernel, and on whether the
++1 step stays coalesced and branch-light.
+.PP
+The environment variable
+.B RXEJIT_GPU_RUN
+controls it:
+.B RXEJIT_GPU_RUN=1
+forces the per-candidate decode (the baseline), for diagnostics, correctness
+A/B, or a device where incremental does not help;
+.BI RXEJIT_GPU_RUN= N
+for
+.IR N " > 1"
+sets the run length. Every
+.B -G
+run prints which mode is active, e.g.
+.RS
+rxejit -G: odometer incremental (RUN=16)
+.RE
+The default per kernel, and the measured effect:
+.TP
+.B fixed-mask \-\- incremental by default (RUN=8)
+The decode is trivial (a chain of divides), so there is little to amortise. A
+small win on a weak integrated GPU (~1.3x), roughly neutral on a big discrete
+GPU. Reverting costs nothing there.
+.TP
+.B policy \-\- incremental by default (RUN=16)
+The decode is expensive (a segment search, a multiset-arrangement unrank, a
+character unrank), so amortising it is a clear win: ~1.9x on an RTX 4080 and
+~3x on an integrated GPU, converging the kernel on the fixed-mask ceiling. This
+is the biggest gain.
+.TP
+.B variable-length \-\- incremental by default (RUN=16)
+A stepped word can change length and shift the tail, so a step re-lays the
+suffix from the changed wheel rather than one byte; still cheaper than a full
+decode-and-lay. A modest win (~1.25x on an integrated GPU diceware dictionary).
+.TP
+.B permutation / combination \-\- per-candidate by default
+Grid-stride wins here and incremental is
+.B not
+the default. The unrank is already cheap (a few cached table reads, not the
+policy's heavy decode), so there is little to save; and the data-dependent
+next-combination step diverges while the contiguous run loses the grid-stride's
+coalesced adjacent-lane/adjacent-index sweep. Measured, it
+.B regresses
+(~0.6x). It can still be selected with
+.B RXEJIT_GPU_RUN
+for experiments, but expect it to be slower.
+.TP
+.B loop-repeat \-\- per-candidate (no incremental path)
+.PP
+Correctness is independent of
+.BR RUN :
+every kernel returns the identical hit set at any run length, verified against
+the per-candidate baseline. The knob is a performance choice only.
+.SH THE CPU BACKEND
+Without
+.BR -G ,
+the hash sinks use tuned CPU paths: an 8-way AVX2 core for MD5 and MD4/NTLM, and
+SHA-NI instructions for SHA-1 and SHA-256, where the hardware has them, with a
+first-word probe filter. A run distributes over
+.B -j
+threads.
+.B -C
+(or
+.BR RXEJIT_NOACCEL )
+forces the scalar path for an A/B on the same machine. AVX2 all-core runs at a
+lower clock than scalar, so throughput can scale below the core count while the
+part stays cool and power-limited; SHA-NI scales best.
+.SH LIMITATIONS AND CAVEATS
+.TP
+.B One hash block per candidate
+A candidate must fit a single hash block (under 56 bytes for MD5/SHA-1/SHA-256;
+NTLM's UTF-16LE encoding halves that budget). Wider patterns are declined for
+.BR -G .
+.TP
+.B 64-bit odometer
+The member count must fit 64 bits; a larger set is declined ("more members than
+fit 64 bits"). This also bounds
+.BR -p 's
+percent/ETA display.
+.TP
+.B Recorded-hit cap
+.B -G
+records at most 2^20 (1,048,576) hits; beyond that it reports the true hit
+count but only the first 1,048,576 plaintexts, and \-\- because lanes fill the
+buffer in a nondeterministic order \-\- which ones are kept can differ run to
+run. This only affects sets where more than a million members are targets (for
+example, hashing a whole keyspace back against itself); a normal crack of a real
+target list is far under the cap. A full-set A/B between two runs must therefore
+use a keyspace with fewer than 1,048,576 members to be byte-exact.
+.TP
+.B GPU policy bounds
+A policy is declined for
+.B -G
+if it needs more than 32 classes, is wider than 40 positions, or its segment
+table would exceed 48 KB.
+.TP
+.B Unordered-choice table
+An unordered choice is declined for
+.B -G
+if its Pascal (binomial) table would exceed 2^20 entries.
+.TP
+.B NVIDIA constant memory
+NVIDIA's OpenCL caps the number of program-scope
+.B __constant
+arrays (about 7 including the runtime's own) and the constant bank at 64 KB.
+.B rxejit
+merges all wheel byte tables into one array to stay under the count, and spills
+a large dictionary's tables to
+.B __global
+past ~48 KB; small tables stay cached in
+.BR __constant .
+.TP
+.B Early exit
+.B -G
+stops once every distinct target has been cracked (checked at each tile drain).
+A target that is not a member, or duplicate target lines, never trips it, so the
+run sweeps fully \-\- which is what you want for a throughput measurement.
+.SH ENVIRONMENT
+.TP
+.B RXEJIT_GPU_RUN
+Incremental-odometer run length for
+.BR -G .
+1 = per-candidate (baseline);
+.I N
+> 1 = incremental with run length
+.IR N .
+Overrides the per-kernel default. See
+.B THE GPU BACKEND
+above.
+.TP
+.B RXEJIT_NOACCEL
+Force the scalar hash path (equivalent to
+.BR -C ).
+Honoured by
+.B rxejit
+and by any binary it generated.
+.TP
+.B RXEJIT_NO_UNROLL
+Build the OpenCL kernel with
+.B -D RXEJIT_UNROLL=0
+(disable manual loop unrolling), for an A/B on the device compiler.
+.TP
+.B CC
+The C compiler used to build the generated program (default
+.BR cc ).
+.SH EXIT STATUS
+.B 0
+on success (for
+.BR -d ,
+also "no duplicates").
+.B 1
+from
+.B -d
+when a duplicate exists.
+.B 2
+on a usage, compile, or run error (including a pattern declined for the chosen
+backend, with a printed reason).
+.SH EXAMPLES
+Crack a list of MD5 digests over an 8-lowercase-letter keyspace on the GPU,
+watching the rate:
+.RS
+rxejit \-G \-p 1 \-m hashes.txt \-H md5 '[a-z]{8}'
+.RE
+.PP
+Crack a six-word EFF diceware passphrase, dictionaries in ./dicts:
+.RS
+rxejit \-G \-D dicts \-m hashes.txt \-H sha256 '[:efflarge:]{6}'
+.RE
+.PP
+Crack an eight-character password-policy keyspace (at least two of each class):
+.RS
+rxejit \-G \-m hashes.txt \-H ntlm '([a-z]|[A-Z]|[0-9]){{8!2,2,2}}'
+.RE
+.PP
+Inspect the generated OpenCL for a pattern without running it:
+.RS
+rxejit \-S \-G \-H md5 \-m /dev/null '[a-z]{8}'
+.RE
+.PP
+A/B the incremental odometer against the per-candidate baseline for a policy
+crack on the same GPU:
+.RS
+RXEJIT_GPU_RUN=1  rxejit \-G \-p 1 \-m hashes.txt \-H md5 '([a-z]|[0-9]){{8!3,3}}'
+.br
+RXEJIT_GPU_RUN=16 rxejit \-G \-p 1 \-m hashes.txt \-H md5 '([a-z]|[0-9]){{8!3,3}}'
+.RE
+.SH SEE ALSO
+.BR rxenum (1),
+.BR rxedot (1),
+.BR rxerank (1)
+.SH AUTHOR
+Marco Carnut and the rxe project.
