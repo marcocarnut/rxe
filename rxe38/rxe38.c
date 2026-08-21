@@ -1077,6 +1077,189 @@ static int crack(const struct bip38 *key, const char *pattern,
     return rc;
 }
 
+/* ---- GPU backend (OpenCL): scrypt on the device, verify on the host ----- *
+ * Compiled only into the -gpu build (RXE38_GPU). scrypt is ~99.99% of the
+ * per-candidate cost, so the kernel does just that; the host finishes AES +
+ * secp256k1 + address-verify with the code above. */
+#ifdef RXE38_GPU
+#define CL_TARGET_OPENCL_VERSION 120  /* pin to 1.2: portable, clCreateCommandQueue */
+#include <CL/cl.h>
+#include "scrypt_cl_embed.h"          /* SCRYPT_CL: the kernel source string */
+
+#define GPU_N     16384                 /* BIP38 scrypt parameters */
+#define GPU_R     8
+#define GPU_P     8
+#define GPU_MAXPW 64                  /* GPU passphrases up to this many bytes */
+#define GPU_BLK   (128 * GPU_R)       /* 1024 */
+
+struct gpu {
+    cl_device_id     dev;
+    cl_context       ctx;
+    cl_command_queue q;
+    cl_kernel        k;
+    cl_mem           mpw, mlen, mout, mV, mB, mY;
+    size_t           cap;             /* lanes the buffers are sized for */
+    char             devname[128];
+};
+
+#define CKG(e) do { cl_int _e = (e); if (_e != CL_SUCCESS) { \
+    fprintf(stderr, "rxe38 gpu: OpenCL error %d at %s:%d\n", _e, __FILE__, __LINE__); \
+    return -1; } } while (0)
+
+/* Build the program and allocate the per-lane buffers for `cap` lanes. The V
+ * scratchpad is 16 MB/lane, so `cap` is bounded by device memory. */
+static int gpu_setup(struct gpu *g, size_t cap)
+{
+    cl_platform_id plat;
+    cl_int e;
+    CKG(clGetPlatformIDs(1, &plat, NULL));
+    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &g->dev, NULL) != CL_SUCCESS) {
+        fprintf(stderr, "rxe38 gpu: no OpenCL GPU device\n");
+        return -1;
+    }
+    clGetDeviceInfo(g->dev, CL_DEVICE_NAME, sizeof g->devname, g->devname, NULL);
+    g->ctx = clCreateContext(NULL, 1, &g->dev, NULL, NULL, &e); CKG(e);
+    g->q   = clCreateCommandQueue(g->ctx, g->dev, 0, &e); CKG(e);
+
+    const char *src = SCRYPT_CL;
+    cl_program pr = clCreateProgramWithSource(g->ctx, 1, &src, NULL, &e); CKG(e);
+    char opts[128];
+    const char *dbg = getenv("RXE38_GPU_DBG");
+    snprintf(opts, sizeof opts, "-D SN=%d -D SR=%d -D SP=%d -D MAXPW=%d -D DBG=%d",
+             GPU_N, GPU_R, GPU_P, GPU_MAXPW, dbg ? atoi(dbg) : 0);
+    if (clBuildProgram(pr, 1, &g->dev, opts, NULL, NULL) != CL_SUCCESS) {
+        size_t ln = 0;
+        clGetProgramBuildInfo(pr, g->dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ln);
+        char *log = malloc(ln + 1);
+        clGetProgramBuildInfo(pr, g->dev, CL_PROGRAM_BUILD_LOG, ln, log, NULL);
+        log[ln] = 0;
+        fprintf(stderr, "rxe38 gpu: build failed:\n%s\n", log);
+        free(log);
+        return -1;
+    }
+    g->k = clCreateKernel(pr, "scrypt_kdf", &e); CKG(e);
+    clReleaseProgram(pr);
+
+    g->cap = cap;
+    g->mpw  = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY,  cap * GPU_MAXPW, NULL, &e); CKG(e);
+    g->mlen = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY,  cap * sizeof(cl_uint), NULL, &e); CKG(e);
+    g->mout = clCreateBuffer(g->ctx, CL_MEM_WRITE_ONLY, cap * 64, NULL, &e); CKG(e);
+    g->mV   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK * GPU_N, NULL, &e); CKG(e);
+    g->mB   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK * GPU_P, NULL, &e); CKG(e);
+    g->mY   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK, NULL, &e); CKG(e);
+    return 0;
+}
+
+/* Run one batch of `n` (<= cap) passphrases with a shared salt, returning the
+ * 64-byte dh1||dh2 for each into out. */
+static int gpu_run(struct gpu *g, const unsigned char *pw, const cl_uint *pwlen,
+                   size_t n, const unsigned char salt[4], cl_uint N, unsigned char *out)
+{
+    CKG(clEnqueueWriteBuffer(g->q, g->mpw, CL_FALSE, 0, n * GPU_MAXPW, pw, 0, NULL, NULL));
+    CKG(clEnqueueWriteBuffer(g->q, g->mlen, CL_FALSE, 0, n * sizeof(cl_uint), pwlen, 0, NULL, NULL));
+    cl_uint saltw = salt[0] | ((cl_uint)salt[1]<<8) | ((cl_uint)salt[2]<<16) | ((cl_uint)salt[3]<<24);
+    CKG(clSetKernelArg(g->k, 0, sizeof(cl_mem), &g->mpw));
+    CKG(clSetKernelArg(g->k, 1, sizeof(cl_mem), &g->mlen));
+    CKG(clSetKernelArg(g->k, 2, sizeof(cl_uint), &saltw));
+    CKG(clSetKernelArg(g->k, 3, sizeof(cl_mem), &g->mout));
+    CKG(clSetKernelArg(g->k, 4, sizeof(cl_mem), &g->mV));
+    CKG(clSetKernelArg(g->k, 5, sizeof(cl_mem), &g->mB));
+    CKG(clSetKernelArg(g->k, 6, sizeof(cl_mem), &g->mY));
+    CKG(clSetKernelArg(g->k, 7, sizeof(cl_uint), &N));
+    size_t global = n;
+    CKG(clEnqueueNDRangeKernel(g->q, g->k, 1, NULL, &global, NULL, 0, NULL, NULL));
+    CKG(clEnqueueReadBuffer(g->q, g->mout, CL_TRUE, 0, n * 64, out, 0, NULL, NULL));
+    return 0;
+}
+
+static void gpu_teardown(struct gpu *g)
+{
+    clReleaseMemObject(g->mpw); clReleaseMemObject(g->mlen);
+    clReleaseMemObject(g->mout); clReleaseMemObject(g->mV);
+    clReleaseMemObject(g->mB); clReleaseMemObject(g->mY);
+    clReleaseKernel(g->k); clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
+}
+
+/* --gpu-scrypt-test: run spec-vector passphrases through the kernel in a batch
+ * and diff each lane's dh1||dh2 against the CPU scrypt. */
+static int gpu_scrypt_test(cl_uint tn)
+{
+    struct gpu g;
+    if (gpu_setup(&g, 8) != 0) return 1;
+    printf("rxe38 gpu: device = %s (test N=%u; tool uses N=%d)\n",
+           g.devname, tn, GPU_N);
+    if (tn == GPU_N)
+        fprintf(stderr, "rxe38 gpu: note -- N=%d takes seconds/lane; a display GPU's "
+                        "watchdog may reset it. Use a smaller N here, or a headless GPU.\n", GPU_N);
+
+    /* All lanes share vector 1's salt (e957a24a); mix real + junk passphrases. */
+    unsigned char salt[4] = { 0xe9, 0x57, 0xa2, 0x4a };
+    const char *pws[] = { "TestingOneTwoThree", "Satoshi", "hunter2", "",
+                          "correct horse", "TestingOneTwoThre", "z", "A longer one!!" };
+    size_t n = 8;
+    unsigned char pwbuf[8 * GPU_MAXPW];
+    cl_uint lens[8];
+    memset(pwbuf, 0, sizeof pwbuf);
+    for (size_t i = 0; i < n; i++) {
+        size_t l = strlen(pws[i]);
+        lens[i] = (cl_uint)l;
+        memcpy(pwbuf + i * GPU_MAXPW, pws[i], l);
+    }
+    unsigned char gout[8 * 64];
+    if (gpu_run(&g, pwbuf, lens, n, salt, tn, gout) != 0) { gpu_teardown(&g); return 1; }
+
+    const char *dbg = getenv("RXE38_GPU_DBG");
+    int stage = dbg ? atoi(dbg) : 0;
+
+    int ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char cpu[64];
+        if (stage == 1) {                 /* CPU PBKDF2-1 first 64 bytes */
+            unsigned char B[GPU_BLK * GPU_P];
+            pbkdf2_hmac_sha256_c1((const unsigned char *)pws[i], strlen(pws[i]),
+                                  salt, 4, B, sizeof B);
+            memcpy(cpu, B, 64);
+        } else if (stage == 2) {          /* CPU: PBKDF2-1 then romix block 0 */
+            unsigned char B[GPU_BLK * GPU_P];
+            pbkdf2_hmac_sha256_c1((const unsigned char *)pws[i], strlen(pws[i]),
+                                  salt, 4, B, sizeof B);
+            uint32_t *V = malloc((size_t)GPU_BLK * tn);
+            uint32_t *Y = malloc(GPU_BLK);
+            romix((uint32_t *)B, GPU_R, tn, V, Y);
+            free(V); free(Y);
+            memcpy(cpu, B, 64);
+        } else if (stage == 3) {          /* CPU: PBKDF2-1 then one blockmix */
+            unsigned char B[GPU_BLK * GPU_P];
+            pbkdf2_hmac_sha256_c1((const unsigned char *)pws[i], strlen(pws[i]),
+                                  salt, 4, B, sizeof B);
+            uint32_t Y[GPU_BLK / 4];
+            blockmix((uint32_t *)B, Y, GPU_R);
+            memcpy(cpu, B, 64);
+        } else if (stage == 4) {          /* CPU: PBKDF2-1 then N blockmixes */
+            unsigned char B[GPU_BLK * GPU_P];
+            pbkdf2_hmac_sha256_c1((const unsigned char *)pws[i], strlen(pws[i]),
+                                  salt, 4, B, sizeof B);
+            uint32_t Y[GPU_BLK / 4];
+            for (cl_uint it = 0; it < tn; it++) blockmix((uint32_t *)B, Y, GPU_R);
+            memcpy(cpu, B, 64);
+        } else {                          /* full scrypt (stage 0) */
+            scrypt_kdf((const unsigned char *)pws[i], strlen(pws[i]), salt, 4,
+                       tn, GPU_R, GPU_P, cpu, 64);
+        }
+        int match = memcmp(cpu, gout + i * 64, 64) == 0;
+        ok &= match;
+        printf("[%s] lane %zu %-20s gpu=%02x%02x%02x%02x%02x%02x%02x%02x cpu=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+               match ? "PASS" : "FAIL", i, pws[i],
+               gout[i*64],gout[i*64+1],gout[i*64+2],gout[i*64+3],gout[i*64+4],gout[i*64+5],gout[i*64+6],gout[i*64+7],
+               cpu[0],cpu[1],cpu[2],cpu[3],cpu[4],cpu[5],cpu[6],cpu[7]);
+    }
+    gpu_teardown(&g);
+    printf("%s\n", ok ? "gpu scrypt: ALL PASS -- matches CPU byte-exact"
+                      : "gpu scrypt: FAILED");
+    return ok ? 0 : 1;
+}
+#endif /* RXE38_GPU */
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--test-scrypt") == 0)
@@ -1085,6 +1268,10 @@ int main(int argc, char **argv)
         return test_priv();
     if (argc >= 2 && strcmp(argv[1], "--test-verify") == 0)
         return test_verify();
+#ifdef RXE38_GPU
+    if (argc >= 2 && strcmp(argv[1], "--gpu-scrypt-test") == 0)
+        return gpu_scrypt_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512);
+#endif
 
     int jobs = 1, progress = 0;
     long cap = 0;

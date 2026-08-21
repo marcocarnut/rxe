@@ -69,6 +69,20 @@ rxe38-test: rxe38
 	./rxe38/rxe38 --test-priv
 	./rxe38/rxe38 --test-verify
 
+# The GPU build: the same tool with the OpenCL scrypt backend compiled in
+# (RXE38_GPU) and the device kernel embedded as a C string. Links -lOpenCL.
+rxe38/scrypt_cl_embed.h: rxe38/scrypt.cl
+	@printf 'static const char SCRYPT_CL[] =\n' > $@
+	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
+	@printf ';\n' >> $@
+
+rxe38-gpu: rxe38/rxe38.c rxe38/scrypt_cl_embed.h librxe.a rxe.h rxejit_rt.h
+	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -DRXE38_GPU -I. -Irxe38 \
+	    rxe38/rxe38.c librxe.a -lgmp -lm -lpthread -lOpenCL -o rxe38/rxe38-gpu
+
+rxe38-gpu-test: rxe38-gpu
+	./rxe38/rxe38-gpu --gpu-scrypt-test
+
 rxenum.o: rxenum.c rxe.h
 
 rxe.o: rxe.c rxe.h parse.h repeat.h pair.h lens.h
@@ -153,7 +167,7 @@ bench: rxenum rxedup
 	RXENUM=./rxenum RXEDUP=./rxedup bash tests/bench.sh
 
 clean:
-	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h rxejit_cl_embed.h tests/api tests/api-asan rxe38/rxe38
+	rm -f *~ *.o *.a rxenum rxenum-asan rxedot rxedot-asan rxerank rxerank-asan rxedup rxedup-asan rxejit rxejit-asan rxejit_rt_embed.h rxejit_cl_embed.h tests/api tests/api-asan rxe38/rxe38 rxe38/rxe38-gpu rxe38/scrypt_cl_embed.h
 
 # librxe.a and rxe.h are installed too: the library is the deliverable, and
 # until now only the demo program and its manual page were ever installed.
@@ -178,5 +192,5 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxejit.1
 
-.PHONY: all test test-asan bench clean install uninstall rxe38 rxe38-test
+.PHONY: all test test-asan bench clean install uninstall rxe38 rxe38-test rxe38-gpu rxe38-gpu-test
 

@@ -34,6 +34,33 @@ trying passphrases from a regex-described keyspace.
   the enumeration like rxejit's -j sinks), reuse `rt_sha256` (SHA-NI) from
   rxejit_rt.h for the PBKDF2/HMAC-SHA256, and link `-lgmp` for the EC field math.
 
+## GPU port (OpenCL) — the practical-tool phase
+
+The CPU tool proves correctness at ~4–5 candidates/s/core. The GPU is where it
+becomes usable. scrypt(N=16384,r=8,p=8) needs a **16 MB scratchpad per lane**,
+so *memory*, not ALUs, caps occupancy — a 28 GB card fits ~1800 lanes, an 8 GB
+card ~500. Throughput is memory-bandwidth bound (~2·N·1 KB ≈ 32 MB of traffic
+per candidate), so expect low-thousands to tens-of-thousands cand/s depending on
+the card — still 100–1000× the CPU. Staged:
+
+- **G1 — GPU scrypt, CPU verify (hybrid).** Port ONLY scrypt to OpenCL (SHA-256
+  + Salsa20/8 + BlockMix + ROMix over a global scratchpad). Host enumerates the
+  regex, batches passphrases to the device, gets back `dh1‖dh2` per candidate,
+  and finishes AES + secp256k1 + address-verify on the CPU (the code already
+  written, threaded). Since scrypt is ~99.99% of the per-candidate cost, this
+  captures essentially all the win with the least new GPU code. Milestones:
+  G1a scrypt.cl validated byte-exact vs CPU on the spec vectors; G1b batched
+  crack path + host verify; G1c measure (Arc + 4080).
+- **G2 — verify on GPU**, *only if* host EC becomes the bottleneck after G1c.
+  Needs a fixed 256-bit secp256k1 (field mul/inverse mod p, group law,
+  double-and-add), plus RIPEMD-160, base58 encode, and AES-256 in-kernel — no
+  gmp on the device. Decide by measurement, not up front.
+
+Reuse rxejit's `-G` host boilerplate (clGetPlatformIDs → clBuildProgram →
+NDRange) as the pattern; the kernel is fixed here (not JIT'd), so it lives in a
+real `rxe38/scrypt.cl` file. Real GPUs on hand: Intel Arc (0x7d55, 28.6 GB,
+128 CU) locally and an RTX 4080 via SSH.
+
 ## Why separate, and the cost regime (agreed with Kiko)
 
 BIP38 is deliberately expensive: scrypt(N=16384, r=8, p=8) is memory-hard
