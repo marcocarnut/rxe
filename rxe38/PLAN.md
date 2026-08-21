@@ -46,11 +46,21 @@ the card — still 100–1000× the CPU. Staged:
 - **G1 — GPU scrypt, CPU verify (hybrid).** Port ONLY scrypt to OpenCL (SHA-256
   + Salsa20/8 + BlockMix + ROMix over a global scratchpad). Host enumerates the
   regex, batches passphrases to the device, gets back `dh1‖dh2` per candidate,
-  and finishes AES + secp256k1 + address-verify on the CPU (the code already
-  written, threaded). Since scrypt is ~99.99% of the per-candidate cost, this
-  captures essentially all the win with the least new GPU code. Milestones:
-  G1a scrypt.cl validated byte-exact vs CPU on the spec vectors; G1b batched
-  crack path + host verify; G1c measure (Arc + 4080).
+  and finishes AES + secp256k1 + address-verify on the CPU. Since scrypt is
+  ~99.99% of the per-candidate cost, this captures essentially all the win with
+  the least new GPU code.
+  - [x] **G1a** `scrypt.cl` validated byte-exact vs CPU (`--gpu-scrypt-test N`,
+        N=512 across 8 diverse passphrases). Runtime N arg; V sized for the
+        compile-time max SN. Two findings: block buffers must be a single uchar
+        view (uchar/uint aliasing miscompiled ROMix on Intel), and the real
+        N=16384 trips a DISPLAY GPU's watchdog (i915 GPU HANG/reset, in dmesg).
+  - [x] **G1b** batched crack path `rxe38 -G [-b batch]`: host enumerates →
+        fills a batch → GPU scrypt → host AES+EC+verify → early-exit. Proven
+        end-to-end on a synthetic N=512 key (recovered passphrase+WIF+index).
+  - [ ] **G1c** run real N=16384 on the headless RTX 4080 (no watchdog);
+        measure candidates/s. Add chunked launches so display GPUs work too
+        (bound each launch < watchdog; also enables progress/early-exit).
+        Then decide if host EC is the bottleneck (→ G2).
 - **G2 — verify on GPU**, *only if* host EC becomes the bottleneck after G1c.
   Needs a fixed 256-bit secp256k1 (field mul/inverse mod p, group law,
   double-and-add), plus RIPEMD-160, base58 encode, and AES-256 in-kernel — no
