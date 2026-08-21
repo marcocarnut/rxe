@@ -2661,10 +2661,14 @@ static void emit_gpu_generic(FILE *o, const char *pattern, const struct build *B
           "    if (!tgt) { fprintf(stderr, \"rxejit -G: cannot read %s\\n\", argv[1]); return 2; }\n"
           "    FILE *pf = fopen(argv[2], \"rb\");\n"
           "    if (!pf) { fprintf(stderr, \"rxejit -G: cannot read %s\\n\", argv[2]); return 2; }\n"
-          "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n"
-          "    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
-          "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n\n"
-          "    cl_platform_id plat; cl_int e;\n"
+          "    if (ntgt == 0) { fprintf(stderr, \"0 matches\\n\"); return 0; }\n", o);
+    // The incremental odometer exists only in the fixed-width kernel; the lowvar
+    // (variable-length) lay stays one candidate per lane, so RUN must not shrink
+    // its launch grid -- honour RXEJIT_GPU_RUN only when the tail is fixed.
+    if (!lowvar)
+        fputs("    { const char *rs = getenv(\"RXEJIT_GPU_RUN\"); if (rs) { int v = atoi(rs); if (v >= 1) g_run = v; }\n"
+              "      if (g_run > 1) fprintf(stderr, \"rxejit -G: incremental odometer, RUN=%d\\n\", g_run); }\n", o);
+    fputs("\n    cl_platform_id plat; cl_int e;\n"
           "    if (clGetPlatformIDs(1, &plat, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL platform\\n\"); return 2; }\n"
           "    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS) { fprintf(stderr, \"rxejit -G: no OpenCL GPU\\n\"); return 2; }\n"
           "    ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &e); CK(e);\n"
