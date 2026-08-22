@@ -18,3 +18,7 @@ tests/api-asan
 rxe38/rxe38
 rxe38/rxe38-gpu
 rxe38/scrypt_cl_embed.h
+
+# internal working docs -- never publish
+*-NOTES.md
+rxe38/*-NOTES.md
