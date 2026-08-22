@@ -1112,6 +1112,7 @@ struct gpu {
     cl_kernel        k;               /* scrypt_kdf, monolithic (the test) */
     cl_kernel        kph;             /* scrypt_phase, chunked (the cracker) */
     cl_kernel        kco;             /* scrypt_romix_coop (cooperative prototype) */
+    cl_kernel        kro;             /* scrypt_romix_only (perf isolation) */
     cl_mem           mpw, mlen, mout, mV, mB, mY, mT;
     size_t           cap;             /* lanes the buffers are sized for */
     cl_uint          gap;             /* TMTO lookup-gap (1 = store every block) */
@@ -1143,14 +1144,17 @@ static int gpu_setup(struct gpu *g, size_t cap)
 
     const char *src = SCRYPT_CL;
     cl_program pr = clCreateProgramWithSource(g->ctx, 1, &src, NULL, &e); CKG(e);
-    char opts[160];
+    char opts[256];
     const char *dbg = getenv("RXE38_GPU_DBG");
     /* Pin to OpenCL 1.2: no generic address space, so unqualified pointer
      * function params default to private on every vendor. Without this the
      * NVIDIA compiler makes struct-member pointers __generic and rejects the
      * calls (Intel's compiler is lenient). */
-    snprintf(opts, sizeof opts, "-cl-std=CL1.2 -D SN=%d -D SR=%d -D SP=%d -D MAXPW=%d -D DBG=%d",
-             GPU_N, GPU_R, GPU_P, GPU_MAXPW, dbg ? atoi(dbg) : 0);
+    /* RXE38_CL_OPTS appends extra build flags (e.g. NVIDIA's -cl-nv-opt-level=3,
+     * -cl-nv-maxrregcount=N) for codegen experiments on new archs. */
+    const char *xopts = getenv("RXE38_CL_OPTS");
+    snprintf(opts, sizeof opts, "-cl-std=CL1.2 -D SN=%d -D SR=%d -D SP=%d -D MAXPW=%d -D DBG=%d %s",
+             GPU_N, GPU_R, GPU_P, GPU_MAXPW, dbg ? atoi(dbg) : 0, xopts ? xopts : "");
     if (clBuildProgram(pr, 1, &g->dev, opts, NULL, NULL) != CL_SUCCESS) {
         size_t ln = 0;
         clGetProgramBuildInfo(pr, g->dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &ln);
@@ -1164,6 +1168,7 @@ static int gpu_setup(struct gpu *g, size_t cap)
     g->k   = clCreateKernel(pr, "scrypt_kdf", &e); CKG(e);
     g->kph = clCreateKernel(pr, "scrypt_phase", &e); CKG(e);
     g->kco = clCreateKernel(pr, "scrypt_romix_coop", &e); CKG(e);
+    g->kro = clCreateKernel(pr, "scrypt_romix_only", &e); CKG(e);
     clReleaseProgram(pr);
 
     /* cap == 0 -> auto-size the batch to fill the card. The scratchpad is the
@@ -1191,7 +1196,14 @@ static int gpu_setup(struct gpu *g, size_t cap)
                        + (size_t)GPU_BLK                /* Y scratch            */
                        + (size_t)GPU_BLK                /* T recompute scratch  */
                        + GPU_MAXPW + sizeof(cl_uint) + 64;
-        size_t lanes = gmem ? (size_t)((double)gmem * 0.80 / perlane) : 512;
+        /* Target fraction of global memory. Default 0.85 -- on a 32 GB card the
+         * romix sweet spot is ~86% of VRAM (measured on the 5090D: throughput
+         * rises with lanes-in-flight up to there, then VRAM pressure drops it).
+         * RXE38_GPU_VRAM_FRAC overrides. */
+        const char *vf = getenv("RXE38_GPU_VRAM_FRAC");
+        double frac = vf ? atof(vf) : 0.85;
+        if (frac <= 0 || frac >= 1) frac = 0.85;
+        size_t lanes = gmem ? (size_t)((double)gmem * frac / perlane) : 512;
         lanes &= ~(size_t)31;                          /* warp multiple */
         if (lanes < 32) lanes = 32;
         cap = lanes;
@@ -1298,7 +1310,7 @@ static void gpu_teardown(struct gpu *g)
     clReleaseMemObject(g->mpw); clReleaseMemObject(g->mlen);
     clReleaseMemObject(g->mout); clReleaseMemObject(g->mV);
     clReleaseMemObject(g->mB); clReleaseMemObject(g->mY); clReleaseMemObject(g->mT);
-    clReleaseKernel(g->k); clReleaseKernel(g->kph); clReleaseKernel(g->kco);
+    clReleaseKernel(g->k); clReleaseKernel(g->kph); clReleaseKernel(g->kco); clReleaseKernel(g->kro);
     clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
 }
 
@@ -1494,6 +1506,86 @@ static int coop_test(cl_uint N)
     printf("coop ROMix: %s | %.2fs | %.1f passes/s | %.1f cand-equiv/s (/%u) | baseline full-scrypt ~525 cand/s\n",
            ok ? "BYTE-EXACT vs scalar romix" : "FAILED", dt,
            passes/dt, (double)ncand/dt, PP);
+    return ok ? 0 : 1;
+}
+
+/* --romix-test [N] [gap]: run the SCALAR ROMix (scrypt_romix_only) standalone --
+ * romix_p only, ZERO PBKDF2/HMAC/SHA in the kernel's call graph -- over a batch
+ * of candidate slots (PP=GPU_P passes each), byte-exact-check vs rxe38.c's scalar
+ * romix, and time it. Isolates the CUDA-vs-OpenCL Blackwell gap: if this hits the
+ * CUDA romix rate (~1123), the full-kernel deficit was PBKDF2 register pressure
+ * (fix ships in OpenCL); if it stays ~885, it's a genuine OpenCL-JIT deficiency.
+ * WG via RXE38_GPU_WG (default 32), candidate count via RXE38_ROMIX_NC. */
+static int romix_test(cl_uint N, cl_uint gap)
+{
+    struct gpu g;
+    if (gpu_setup(&g, 8) != 0) return 1;
+    const cl_uint PP = GPU_P, W = GPU_BLK / 4;             /* 256 words/block */
+    if (gap < 1) gap = 1;
+    cl_uint vslots = (N + gap - 1) / gap;
+
+    cl_ulong gmem = 0;
+    clGetDeviceInfo(g.dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof gmem, &gmem, NULL);
+    size_t vbytes = (size_t)vslots * (W/4) * 16;           /* V per candidate (uint4) */
+    size_t ncand = (size_t)((double)gmem * 0.80 / vbytes);
+    if (getenv("RXE38_ROMIX_NC")) ncand = strtoul(getenv("RXE38_ROMIX_NC"),0,0);
+    cl_uint wg = 32;
+    if (getenv("RXE38_GPU_WG")) wg = (cl_uint)strtoul(getenv("RXE38_GPU_WG"),0,0);
+    ncand -= ncand % wg; if (ncand < wg) ncand = wg;
+    printf("rxe38 romix-only: device=%s  N=%u gap=%u  candidates=%zu (%.1f GB V)  WG=%u PP=%u\n",
+           g.devname, N, gap, ncand, ncand * (double)vbytes / 1e9, wg, PP);
+
+    size_t iowords = ncand * PP * W;
+    uint32_t *hin = malloc(iowords * 4), *hout = malloc(iowords * 4);
+    uint32_t seed = 0x1234567u;
+    for (size_t i = 0; i < iowords; i++) { seed = seed*1664525u+1013904223u; hin[i] = seed; }
+
+    cl_int e;
+    cl_mem bB = clCreateBuffer(g.ctx, CL_MEM_READ_WRITE, iowords*4, NULL, &e); CKG(e);
+    cl_mem bV = clCreateBuffer(g.ctx, CL_MEM_READ_WRITE, ncand*vbytes, NULL, &e); CKG(e);
+    cl_uint nl = (cl_uint)ncand;
+    CKG(clSetKernelArg(g.kro,0,sizeof(cl_mem),&bB));
+    CKG(clSetKernelArg(g.kro,1,sizeof(cl_mem),&bV));
+    CKG(clSetKernelArg(g.kro,2,sizeof(cl_uint),&N));
+    CKG(clSetKernelArg(g.kro,3,sizeof(cl_uint),&gap));
+    CKG(clSetKernelArg(g.kro,4,sizeof(cl_uint),&nl));
+    CKG(clSetKernelArg(g.kro,5,sizeof(cl_uint),&PP));
+    size_t global = ncand, local = wg;
+
+    /* warmup (also fills gB), then time a fresh fill+run */
+    CKG(clEnqueueWriteBuffer(g.q, bB, CL_TRUE, 0, iowords*4, hin, 0, NULL, NULL));
+    CKG(clEnqueueNDRangeKernel(g.q, g.kro, 1, NULL, &global, &local, 0, NULL, NULL));
+    CKG(clFinish(g.q));
+    CKG(clEnqueueWriteBuffer(g.q, bB, CL_TRUE, 0, iowords*4, hin, 0, NULL, NULL));
+    double t0 = now_sec();
+    CKG(clEnqueueNDRangeKernel(g.q, g.kro, 1, NULL, &global, &local, 0, NULL, NULL));
+    CKG(clFinish(g.q));
+    double dt = now_sec() - t0;
+    CKG(clEnqueueReadBuffer(g.q, bB, CL_TRUE, 0, iowords*4, hout, 0, NULL, NULL));
+
+    size_t CHK = ncand < 8 ? ncand : 8;
+    uint32_t *V = malloc((size_t)N*W*4), *Y = malloc(W*4), B[256];
+    int ok = 1;
+    for (size_t c = 0; c < CHK && ok; c++)
+        for (cl_uint pass = 0; pass < PP; pass++) {
+            /* lane-interleaved: word w of (pass,c) at [(pass*W+w)*nl + c] */
+            for (cl_uint w = 0; w < W; w++) B[w] = hin[((size_t)(pass*W+w))*nl + c];
+            romix(B, GPU_R, N, V, Y);
+            for (cl_uint w = 0; w < W; w++)
+                if (B[w] != hout[((size_t)(pass*W+w))*nl + c]) {
+                    printf("[FAIL] cand %zu pass %u word %u: cpu %08x gpu %08x\n",
+                           c, pass, w, B[w], hout[((size_t)(pass*W+w))*nl + c]);
+                    ok = 0; break;
+                }
+            if (!ok) break;
+        }
+    free(V); free(Y); free(hin); free(hout);
+    clReleaseMemObject(bB); clReleaseMemObject(bV);
+    gpu_teardown(&g);
+
+    printf("romix-only: %s | %.3fs | %.1f passes/s | %.1f cand-equiv/s (/%u) | 5090D OpenCL-full ~885, CUDA-romix ~1123\n",
+           ok ? "BYTE-EXACT vs scalar romix" : "FAILED", dt,
+           ncand*(double)PP/dt, (double)ncand/dt, PP);
     return ok ? 0 : 1;
 }
 
@@ -1790,6 +1882,9 @@ int main(int argc, char **argv)
                               argc >= 4 ? (cl_uint)strtoul(argv[3], 0, 0) : 0);
     if (argc >= 2 && strcmp(argv[1], "--coop-test") == 0)
         return coop_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512);
+    if (argc >= 2 && strcmp(argv[1], "--romix-test") == 0)
+        return romix_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512,
+                          argc >= 4 ? (cl_uint)strtoul(argv[3], 0, 0) : 1);
 #endif
 
     int jobs = 1, progress = 0, use_gpu = 0;

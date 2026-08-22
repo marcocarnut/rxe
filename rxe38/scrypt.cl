@@ -264,6 +264,23 @@ static void romix_p(__global uint *gB, __global uint4 *gV,
     }
 }
 
+/* ---- pure-ROMix kernel (perf isolation: --romix-test) ------------------
+ * Calls ONLY romix_p (-> blockmix_p -> salsa20_8). No PBKDF2/HMAC/SHA in its
+ * call graph, so the OpenCL JIT allocates registers for the ROMix inner loop
+ * ALONE -- unlike scrypt_kdf, which carries the PBKDF2/HMAC code and may spill
+ * ROMix registers. This isolates whether the CUDA-vs-OpenCL gap on Blackwell is
+ * codegen or bundling register-pressure. gB holds PP passes/candidate; result
+ * is written back in place. Byte-identical to romix_p in the full kernel. */
+__kernel void scrypt_romix_only(
+    __global uint *gB, __global uint4 *gV,
+    const uint N, const uint gap, const uint NL, const uint PP)
+{
+    uint gid = get_global_id(0);
+    if (gid >= NL) return;
+    for (uint pass = 0; pass < PP; pass++)
+        romix_p(gB, gV, pass, N, gap, NL, gid);
+}
+
 /* ---- monolithic kernel (validation / no-watchdog cards) ---------------- */
 
 __kernel void scrypt_kdf(
