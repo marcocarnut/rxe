@@ -1498,54 +1498,78 @@ static int coop_test(cl_uint N)
 }
 
 /* Batched GPU crack: enumerate the regex on the host, fill a batch of
- * passphrases, run scrypt on the device, finish + verify on the host. */
+ * passphrases, run scrypt on the device, finish + verify on the host.
+ *
+ * Double-buffered: two batch slots. When a slot fills we run its scrypt on the
+ * GPU (blocking) then spawn its host verify ASYNC and immediately move on to
+ * fill+launch the next slot -- so batch N's verify (CPU, secp256k1) overlaps
+ * batch N+1's GPU compute instead of leaving the device idle. A slot's verify
+ * threads are joined before the slot's buffers are reused, and both slots are
+ * joined at end-of-run. The recorded hit is the LOWEST GLOBAL INDEX match
+ * (mpz compare), which is order-independent -- correct no matter which slot's
+ * async verify finishes first. RXE38_GPU_DBLBUF=0 forces the old serial path
+ * (join each slot immediately after spawning). */
+struct gpu_slot {
+    unsigned char      *pwbuf;       /* cap * GPU_MAXPW */
+    cl_uint            *lens;
+    mpz_t              *idxs;        /* member index per lane, for reporting */
+    unsigned char      *gout;        /* cap * 64 */
+    size_t              count;       /* lanes filled in this slot */
+    pthread_t           tid[64];     /* outstanding verify workers */
+    struct vjob        *jobs;        /* [64], allocated in crack_gpu */
+    int                 nspawn;      /* verify threads spawned (to join) */
+    int                 busy;        /* has an outstanding verify to join */
+};
+
 struct gpu_crack {
     struct gpu         *g;
     const struct bip38 *key;
     cl_uint             N;
     cl_uint             chunk;       /* ROMix iterations per kernel launch */
     size_t              cap;         /* lanes per batch */
-    unsigned char      *pwbuf;       /* cap * GPU_MAXPW */
-    cl_uint            *lens;
-    mpz_t              *idxs;        /* member index per lane, for reporting */
-    unsigned char      *gout;        /* cap * 64 */
-    size_t              count;       /* lanes filled in the current batch */
+    struct gpu_slot     slot[2];
+    int                 cur;         /* slot being filled */
+    int                 dblbuf;      /* overlap verify with next GPU batch */
     unsigned long       tried;
     unsigned long       toolong;     /* skipped: passphrase > GPU_MAXPW */
     int                 found;
-    size_t              hitlane;     /* lane of the recorded hit (lowest wins) */
     int                 vthreads;    /* host verify worker threads */
     pthread_mutex_t     vmtx;
     char                pass[512];
     char                wif[64];
-    mpz_t               hitidx;
-    double              t_gpu;       /* seconds spent in gpu_run */
-    double              t_verify;    /* seconds spent in host verify */
+    mpz_t               hitidx;      /* global index of the recorded hit */
+    int                 hitset;      /* hitidx holds a valid hit */
+    double              t_gpu;       /* seconds spent in gpu_run (blocking) */
+    double              t_verify;    /* seconds spent EXPOSED (joining) verify */
 };
 
-/* One host verify worker: BIP38-finish + address-verify lanes [lo,hi). On a
- * match it records the hit (lowest lane wins) under the mutex. The whole verify
- * path (AES, secp256k1 on gmp, hashes, base58) is thread-safe once secp_init()
- * has run on the main thread -- SP/SGX/SGY are read-only after that and every
- * temporary is stack-local. */
-struct vjob { struct gpu_crack *c; size_t lo, hi; };
+/* One host verify worker: BIP38-finish + address-verify lanes [lo,hi) of slot
+ * s. On a match it records the hit (lowest GLOBAL index wins) under the mutex.
+ * The whole verify path (AES, secp256k1 on gmp, hashes, base58) is thread-safe
+ * once secp_init() has run on the main thread -- SP/SGX/SGY are read-only after
+ * that and every temporary is stack-local. */
+struct vjob { struct gpu_crack *c; struct gpu_slot *s; size_t lo, hi; };
 
 static void *verify_worker(void *arg)
 {
     struct vjob *j = arg;
     struct gpu_crack *c = j->c;
+    struct gpu_slot  *s = j->s;
+    /* Scan the whole assigned range: with two slots verifying concurrently a
+     * bare `found` flag can't gate the scan (this range may hold a lower index
+     * than another slot's hit). Matches are rare, so the full scan costs at most
+     * one extra batch's finishes, once. Lowest GLOBAL index wins. */
     for (size_t l = j->lo; l < j->hi; l++) {
-        if (c->found && l > c->hitlane) break;         /* cheap early-out */
         unsigned char priv[32];
-        bip38_finish(c->key, c->gout + l * 64, priv);
+        bip38_finish(c->key, s->gout + l * 64, priv);
         if (address_matches(priv, c->key->compressed, c->key->addrhash)) {
             pthread_mutex_lock(&c->vmtx);
-            if (!c->found || l < c->hitlane) {
-                c->found = 1; c->hitlane = l;
-                size_t n = c->lens[l] < sizeof c->pass - 1 ? c->lens[l] : sizeof c->pass - 1;
-                memcpy(c->pass, c->pwbuf + l * GPU_MAXPW, n); c->pass[n] = '\0';
+            if (!c->hitset || mpz_cmp(s->idxs[l], c->hitidx) < 0) {
+                c->hitset = 1; c->found = 1;
+                size_t n = s->lens[l] < sizeof c->pass - 1 ? s->lens[l] : sizeof c->pass - 1;
+                memcpy(c->pass, s->pwbuf + l * GPU_MAXPW, n); c->pass[n] = '\0';
                 privkey_to_wif(priv, c->key->compressed, c->wif);
-                mpz_set(c->hitidx, c->idxs[l]);
+                mpz_set(c->hitidx, s->idxs[l]);
             }
             pthread_mutex_unlock(&c->vmtx);
         }
@@ -1553,66 +1577,84 @@ static void *verify_worker(void *arg)
     return NULL;
 }
 
-/* Run the current batch through the GPU and verify each lane. Returns 1 if a
- * hit was recorded (caller should stop). */
-static int gpu_flush(struct gpu_crack *c)
+/* Join a slot's outstanding verify threads (idempotent). */
+static void slot_join(struct gpu_slot *s)
 {
-    if (c->count == 0) return 0;
+    if (!s->busy) return;
+    for (int t = 0; t < s->nspawn; t++) pthread_join(s->tid[t], NULL);
+    s->nspawn = 0;
+    s->busy = 0;
+}
+
+/* Run one filled slot through the GPU (blocking), then SPAWN its host verify
+ * across vthreads workers. In double-buffer mode the workers are left running
+ * (joined later, before the slot is reused) so they overlap the next batch's
+ * GPU compute; otherwise they are joined immediately (serial fallback). Returns
+ * 1 if a hit has been recorded so far (by this or an earlier completed verify).*/
+static int gpu_flush_slot(struct gpu_crack *c, struct gpu_slot *s)
+{
+    if (s->count == 0) return c->found;
     double t0 = now_sec();
     /* Default: the chunked/phased path (watchdog-safe, implements the gap too).
      * RXE38_GPU_MONO forces the monolithic private-block kernel -- one launch
      * per batch, headless-only, but the working block stays in L1 the whole
      * ROMix pass instead of round-tripping __global. */
     int rc = c->g->mono
-        ? gpu_run(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash, c->N, c->gout)
-        : gpu_run_phased(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash,
-                         c->N, c->chunk, c->gout);
-    if (rc != 0) return 0;
+        ? gpu_run(c->g, s->pwbuf, s->lens, s->count, c->key->addrhash, c->N, s->gout)
+        : gpu_run_phased(c->g, s->pwbuf, s->lens, s->count, c->key->addrhash,
+                         c->N, c->chunk, s->gout);
+    if (rc != 0) return c->found;
     c->t_gpu += now_sec() - t0;
-    c->tried += c->count;
+    c->tried += s->count;
 
-    /* Host-side finish + verify, fanned out across vthreads workers. At the GPU
-     * rates the private/uint4 kernel now hits, a single-threaded secp256k1 pass
-     * per batch is a real serial tax (GPU idle meanwhile); splitting the lanes
-     * keeps the host ahead of the device. */
-    double tv = now_sec();
+    /* Fan out host finish + verify across vthreads workers. At the GPU rates the
+     * private/uint4 kernel hits, a serial secp256k1 pass would idle the device;
+     * splitting the lanes AND overlapping with the next batch keeps host ahead. */
     int T = c->vthreads;
-    if (T > (int)c->count) T = (int)c->count ? (int)c->count : 1;
-    if (T <= 1) {
-        struct vjob j = { c, 0, c->count };
-        verify_worker(&j);
-    } else {
-        if (T > 64) T = 64;
-        pthread_t tid[64]; struct vjob jobs[64];
-        size_t per = (c->count + T - 1) / T;
-        int spun = 0;
-        for (int t = 0; t < T; t++) {
-            size_t lo = (size_t)t * per, hi = lo + per;
-            if (lo >= c->count) break;
-            if (hi > c->count) hi = c->count;
-            jobs[spun].c = c; jobs[spun].lo = lo; jobs[spun].hi = hi;
-            if (pthread_create(&tid[spun], NULL, verify_worker, &jobs[spun]) == 0)
-                spun++;
-            else { struct vjob j = { c, lo, hi }; verify_worker(&j); }  /* inline */
-        }
-        for (int t = 0; t < spun; t++) pthread_join(tid[t], NULL);
+    if (T > (int)s->count) T = (int)s->count ? (int)s->count : 1;
+    if (T > 64) T = 64;
+    size_t per = (s->count + T - 1) / T;
+    int spun = 0;
+    for (int t = 0; t < T; t++) {
+        size_t lo = (size_t)t * per, hi = lo + per;
+        if (lo >= s->count) break;
+        if (hi > s->count) hi = s->count;
+        s->jobs[spun].c = c; s->jobs[spun].s = s; s->jobs[spun].lo = lo; s->jobs[spun].hi = hi;
+        if (pthread_create(&s->tid[spun], NULL, verify_worker, &s->jobs[spun]) == 0)
+            spun++;
+        else verify_worker(&s->jobs[spun]);            /* inline on spawn failure */
     }
-    c->t_verify += now_sec() - tv;
-
-    c->count = 0;
-    return c->found ? 1 : 0;
+    s->nspawn = spun;
+    s->busy = 1;
+    if (!c->dblbuf) {                                  /* serial fallback */
+        double tv = now_sec();
+        slot_join(s);
+        c->t_verify += now_sec() - tv;
+    }
+    return c->found;
 }
 
 static int gpu_crack_sink(const char *str, size_t len, const mpz_t index, void *v)
 {
     struct gpu_crack *c = v;
+    if (c->found) return 1;                            /* stop (async hit seen) */
     if (len > GPU_MAXPW) { c->toolong++; return 0; }   /* GPU handles <= MAXPW */
-    size_t l = c->count;
-    memcpy(c->pwbuf + l * GPU_MAXPW, str, len);
-    c->lens[l] = (cl_uint)len;
-    mpz_set(c->idxs[l], index);
-    c->count++;
-    if (c->count == c->cap) return gpu_flush(c);       /* full -> run + verify */
+    struct gpu_slot *s = &c->slot[c->cur];
+    size_t l = s->count;
+    memcpy(s->pwbuf + l * GPU_MAXPW, str, len);
+    s->lens[l] = (cl_uint)len;
+    mpz_set(s->idxs[l], index);
+    s->count++;
+    if (s->count == c->cap) {
+        int found = gpu_flush_slot(c, s);              /* GPU + spawn verify */
+        c->cur ^= 1;                                   /* fill the other slot */
+        struct gpu_slot *ns = &c->slot[c->cur];
+        double tv = now_sec();
+        slot_join(ns);                                 /* free it before reuse */
+        c->t_verify += now_sec() - tv;                 /* time EXPOSED (~0 overlapped) */
+        ns->count = 0;
+        return found || c->found;
+    }
     return 0;
 }
 
@@ -1658,11 +1700,18 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
     struct gpu_crack c;
     memset(&c, 0, sizeof c);
     c.g = &g; c.key = key; c.N = N; c.chunk = chunk; c.cap = batch;
-    c.pwbuf = calloc(batch, GPU_MAXPW);
-    c.lens  = calloc(batch, sizeof *c.lens);
-    c.gout  = calloc(batch, 64);
-    c.idxs  = calloc(batch, sizeof *c.idxs);
-    for (size_t i = 0; i < batch; i++) mpz_init(c.idxs[i]);
+    /* Two batch slots for verify/compute overlap (RXE38_GPU_DBLBUF=0 disables). */
+    const char *db = getenv("RXE38_GPU_DBLBUF");
+    c.dblbuf = db ? atoi(db) != 0 : 1;
+    for (int sl = 0; sl < 2; sl++) {
+        struct gpu_slot *s = &c.slot[sl];
+        s->pwbuf = calloc(batch, GPU_MAXPW);
+        s->lens  = calloc(batch, sizeof *s->lens);
+        s->gout  = calloc(batch, 64);
+        s->idxs  = calloc(batch, sizeof *s->idxs);
+        s->jobs  = calloc(64, sizeof *s->jobs);
+        for (size_t i = 0; i < batch; i++) mpz_init(s->idxs[i]);
+    }
     mpz_init(c.hitidx);
     pthread_mutex_init(&c.vmtx, NULL);
 
@@ -1687,7 +1736,10 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
     mpz_t from, cnt; mpz_init_set_ui(from, 0);
     mpz_init_set_ui(cnt, count > 0 ? (unsigned long)count : 0);  /* 0 = whole set */
     rxe_foreach(rxe, from, cnt, GPU_MAXPW + 1, gpu_crack_sink, &c);
-    if (!c.found) gpu_flush(&c);                        /* trailing partial batch */
+    if (!c.found) gpu_flush_slot(&c, &c.slot[c.cur]);   /* trailing partial batch */
+    double tj = now_sec();                              /* drain both slots' verify */
+    slot_join(&c.slot[0]); slot_join(&c.slot[1]);
+    c.t_verify += now_sec() - tj;
     double dt = now_sec() - t0;
     mpz_clear(from); mpz_clear(cnt);
 
@@ -1709,10 +1761,13 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
         fprintf(stderr, "rxe38 gpu: skipped %lu candidate(s) longer than %d bytes\n",
                 c.toolong, GPU_MAXPW);
 
-    for (size_t i = 0; i < batch; i++) mpz_clear(c.idxs[i]);
+    for (int sl = 0; sl < 2; sl++) {
+        struct gpu_slot *s = &c.slot[sl];
+        for (size_t i = 0; i < batch; i++) mpz_clear(s->idxs[i]);
+        free(s->pwbuf); free(s->lens); free(s->gout); free(s->idxs); free(s->jobs);
+    }
     mpz_clear(c.hitidx);
     pthread_mutex_destroy(&c.vmtx);
-    free(c.pwbuf); free(c.lens); free(c.gout); free(c.idxs);
     gpu_teardown(&g);
     rxe_free(rxe);
     return rc;
