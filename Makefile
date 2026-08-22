@@ -193,6 +193,7 @@ install: rxenum rxejit librxe.a
 	install -m 644 rxe.h     $(DESTDIR)$(PREFIX)/include
 	install -m 644 rxenum.1  $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 644 rxejit.1  $(DESTDIR)$(PREFIX)/share/man/man1
+	install -m 644 rxe38/rxe38.1 $(DESTDIR)$(PREFIX)/share/man/man1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/rxenum
@@ -201,6 +202,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/rxe.h
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxejit.1
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxe38.1
 
 .PHONY: all test test-asan bench clean install uninstall rxe38 rxe38-test rxe38-gpu rxe38-gpu-test
 

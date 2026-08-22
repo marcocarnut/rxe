@@ -1,0 +1,278 @@
+.TH RXE38 1 "August 2026" "rxe" "User Commands"
+.SH NAME
+rxe38 \- crack a BIP38-encrypted Bitcoin private key from a regex keyspace
+.SH SYNOPSIS
+.B rxe38
+.RI [ options ]
+.I 6P...key
+.RI [ passphrase-regex ]
+.SH DESCRIPTION
+.B rxe38
+recovers the passphrase of a BIP38-encrypted (no-EC-multiply) Bitcoin
+private key by trying every passphrase in a regex-described keyspace.
+It enumerates the set with librxe's enumerator \(em the same walk
+.BR rxenum (1)
+uses \(em and, for each candidate, runs the full BIP38 decryption and
+verifies the result against the key's own address hash. On a hit it prints
+the passphrase, the recovered key in WIF, and the candidate's index.
+.PP
+With no regex, rxe38 only parses the key and dumps its fields (compressed
+flag, address hash, and the two encrypted halves). Only no-EC-multiply keys
+are handled \(em those beginning
+.B 6PR
+or
+.BR 6PY ,
+base58 prefix
+.BR 0x0142 .
+EC-multiply keys
+.RB ( 6Pf / 6Pg ,
+prefix
+.BR 0x0143 )
+are rejected.
+.PP
+BIP38 is deliberately expensive: each candidate runs
+.B scrypt(N=16384, r=8, p=8)
+\(em memory-hard, ~16\ MB of working set \(em and then a secp256k1 point
+multiply to derive the address. Throughput is therefore measured in
+.I candidates per second,
+not hashes per second, and the value of rxe38 is the
+.I structured keyspace:
+you can only crack BIP38 with a constrained guess space, such as a
+half-remembered passphrase, which is exactly what a regex expresses.
+.SH OPTIONS
+.TP
+.BI \-j " jobs"
+Number of CPU worker threads (default 1). Shards the enumeration like
+.BR rxejit (1)'s
+sinks. Ignored under
+.B \-G
+(the GPU path shards internally).
+.TP
+.B \-G
+Run scrypt on the GPU (OpenCL) and finish the verify on the host. This is
+the fast path; see
+.B THE GPU BACKEND
+below.
+.TP
+.BI \-\-backend " name"
+Select the GPU backend:
+.B opencl
+(the default, portable, the champion \(em also the only backend that runs on
+non-NVIDIA GPUs) or
+.B cuda
+(reserved for a future NVIDIA-only fast path; not built in by default).
+May also be set with the
+.B RXE38_BACKEND
+environment variable.
+.TP
+.BI \-b " lanes"
+GPU batch size, in lanes (candidates resident on the device at once). Each
+lane needs about 16\ MB of scratchpad, so this is bounded by device memory.
+0 or omitted auto-fills a fraction of VRAM.
+.TP
+.BI \-c " count"
+Try at most
+.I count
+candidates, then stop (0 = no limit).
+.TP
+.B \-p
+Print a progress line (rate and ETA) while cracking.
+.SH THE BIP38 PIPELINE
+For a no-EC-multiply key, rxe38 performs, per candidate:
+.PP
+.RS
+.nf
+base58check-decode -> [0x0142] flag addrhash(4) enc1(16) enc2(16)
+d   = scrypt(passphrase, salt=addrhash, 16384, 8, 8, 64)
+dh1 = d[0:32];  dh2 = d[32:64]
+priv = AES256_ECB_dec(enc1, dh2) XOR dh1[0:16]
+     || AES256_ECB_dec(enc2, dh2) XOR dh1[16:32]
+VERIFY: SHA256d(base58_address(priv, compressed))[0:4] == addrhash
+.fi
+.RE
+.PP
+"No EC multiply" describes how the key was
+.I encrypted;
+it does
+.B not
+mean the address check is skipped. The 4-byte address hash is the only
+verifier in the key, so deriving the address \(em which requires the
+secp256k1 multiply \(em is mandatory. Without it every passphrase would
+appear to "succeed".
+.PP
+Every component (base58check, scrypt, AES-256, secp256k1, RIPEMD-160) is
+verified byte-exact against
+.B rxe38/oracle.py
+and the RFC 7914 / FIPS-197 test vectors; see
+.BR "SELF-TESTS" .
+.SH THE GPU BACKEND
+Under
+.BR \-G ,
+scrypt \(em about 99.99% of the per-candidate cost \(em runs on the GPU
+while the host finishes AES, secp256k1, and the address verify (threaded,
+overlapped with the next GPU batch). The OpenCL kernel lives in
+.B rxe38/scrypt.cl
+and is embedded into the binary at build time.
+.PP
+The scrypt block/scratchpad is laid out
+.I lane-interleaved
+(word
+.I w
+of lane
+.I g
+at index
+.IR w*NLANES+g )
+so a warp's reads coalesce, and the working block is handled as
+.B uint4
+vectors to cut load/store traffic. Two kernels are provided: a
+.I phased
+kernel that runs ROMix in short, watchdog-safe launches (the default, so
+rxe38 works on a GPU that also drives a display), and a single-launch
+.I monolithic
+kernel that is faster but must run on a headless card
+.RB ( RXE38_GPU_MONO=1 ).
+.PP
+Two knobs matter most for throughput, both environment variables:
+.B RXE38_GPU_GAP
+(the scrypt time-memory trade-off \(em store V every
+.IR g -th
+block and recompute the rest, fitting ~\c
+.IR g x
+more lanes; \fIg\fR=3 was fastest on a 32\ GB card) and
+.B RXE38_GPU_WG
+(the work-group size; 32 = one warp is best here). Hit recording across the
+overlapped batches is lowest-global-index-wins, so a reported hit is the
+true first match in enumeration order regardless of which batch finishes
+verifying first.
+.SH PERFORMANCE
+scrypt(16384, 8) mandates a 1\ KB working block that BlockMix must churn
+2\fIN\fR times per pass. It spills out of registers into local memory, and
+that local-memory bandwidth is the binding constraint \(em not compute, not
+global-memory latency. On an RTX 4080 SUPER the OpenCL backend reaches
+about
+.B 525 candidates/second
+(headless,
+.BR "RXE38_GPU_MONO=1 RXE38_GPU_GAP=3" ),
+roughly 20x a 22-thread CPU. This is at or near the card's practical
+ceiling: three alternative kernel structures (warp-cooperative,
+candidate-interleaved, all-shared) were each measured slower, and moving the
+block to on-chip shared memory bought only ~9%.
+.PP
+For calibration:
+.BR hashcat (1)
+mode 8900 (generic scrypt) benchmarks about 4251\ H/s at
+.IR N =16384
+on a 4080 \(em but that is
+.IR p =1.
+BIP38 is
+.IR p =8,
+eight times the work per candidate, so the comparable figure is ~530
+candidates/second: rxe38 is at parity with hashcat's scrypt kernel. The
+gap to hashcat's headline number is entirely the
+.IR p =8
+work factor, not kernel efficiency. More throughput comes from more or
+larger GPUs (the ceiling scales with memory bandwidth), not from a cleverer
+kernel.
+.SH ENVIRONMENT
+.TP
+.B RXE38_BACKEND
+GPU backend, same as
+.BR \-\-backend .
+.TP
+.B RXE38_GPU_GAP
+scrypt TMTO ratio: store V every
+.IR g -th
+block, recompute misses. \fIg\fR=1 is plain ROMix (byte-identical);
+\fIg\fR=3 was fastest on a 4080.
+.TP
+.B RXE38_GPU_WG
+OpenCL work-group size (default 32; 0 = driver's choice).
+.TP
+.B RXE38_GPU_MONO
+If set, use the single-launch monolithic kernel (fastest, headless only \(em
+no watchdog chunking).
+.TP
+.B RXE38_GPU_CHUNK
+ROMix iterations per launch for the phased kernel. Larger amortizes the
+working-block load/store; raise it on a headless card.
+.TP
+.B RXE38_GPU_DBLBUF
+Set to 0 to disable double-buffering (overlap of a batch's verify with the
+next batch's GPU run). Default on.
+.TP
+.B RXE38_VERIFY_THREADS
+Host-side verify workers (default min(cores, 16)).
+.TP
+.B RXE38_GPU_N
+Override scrypt
+.I N
+(for testing at a smaller, watchdog-safe or faster parameter).
+.SH SELF-TESTS
+.B rxe38
+built without the GPU backend accepts three self-test modes that check the
+CPU implementation against known-answer vectors:
+.BR \-\-test\-scrypt
+(RFC 7914 plus a BIP38 spec vector),
+.BR \-\-test\-priv
+(FIPS-197 AES-256 plus the recovered private keys), and
+.BR \-\-test\-verify
+(the full end-to-end pipeline on all four BIP38 spec vectors, plus a
+wrong-passphrase negative). The GPU build adds
+.BR \-\-gpu\-scrypt\-test ,
+.BR \-\-gpu\-phase\-test ,
+and
+.B \-\-coop\-test
+which diff the device kernels byte-exact against the CPU reference.
+Run them with
+.BR "make rxe38\-test" .
+.SH EXIT STATUS
+.TP
+.B 0
+The passphrase was found (or a self-test / parse-only run succeeded).
+.TP
+.B 1
+Not found, or a bad key.
+.TP
+.B 2
+Usage error.
+.SH EXAMPLES
+Dump a key's fields:
+.PP
+.RS
+.nf
+rxe38 6PRVWUbkzzsbcVac2qwfssoUJAN1Xhrg6bNk8J7Nzm5H7kxEbn2Nh2ZoGg
+.fi
+.RE
+.PP
+Crack on the CPU across a small keyspace, 8 threads:
+.PP
+.RS
+.nf
+rxe38 -j8 6PRNFFkZ...  '(Alice|Bob|Satoshi|Carol)'
+.fi
+.RE
+.PP
+Crack on the GPU with progress, a half-remembered passphrase:
+.PP
+.RS
+.nf
+rxe38 -G -p 6PRVWUbk...  'S[a4]toshi20[0-2][0-9]'
+.fi
+.RE
+.PP
+Fastest on a headless card:
+.PP
+.RS
+.nf
+RXE38_GPU_MONO=1 RXE38_GPU_GAP=3 rxe38 -G 6PRVWUbk...  '<regex>'
+.fi
+.RE
+.SH SEE ALSO
+.BR rxenum (1),
+.BR rxejit (1),
+.BR hashcat (1).
+.PP
+BIP 38 (Passphrase-protected private key); RFC 7914 (scrypt); FIPS-197
+(AES).
+.SH AUTHOR
+Marco "Kiko" Carnut <kiko at postcogito dot org>.
