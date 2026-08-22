@@ -22,3 +22,4 @@ rxe38/scrypt_cl_embed.h
 # internal working docs -- never publish
 *-NOTES.md
 rxe38/*-NOTES.md
+rxe38/scrypt_cuda_embed.h

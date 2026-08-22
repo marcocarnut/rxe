@@ -76,6 +76,12 @@ rxe38/scrypt_cl_embed.h: rxe38/scrypt.cl
 	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
 	@printf ';\n' >> $@
 
+# CUDA backend kernel, embedded as a C string for NVRTC runtime compilation.
+rxe38/scrypt_cuda_embed.h: rxe38/scrypt_cuda.cu
+	@printf 'static const char SCRYPT_CUDA[] =\n' > $@
+	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
+	@printf ';\n' >> $@
+
 # rxe38 GPU has pluggable backends selected at build time (and chosen at runtime
 # with --backend / RXE38_BACKEND when more than one is compiled in). Backend #1 =
 # OpenCL (the champion; portable, runs on the Intel Arc too). Backend #2 = CUDA
@@ -84,11 +90,18 @@ rxe38-gpu: rxe38/rxe38.c rxe38/scrypt_cl_embed.h librxe.a rxe.h rxejit_rt.h
 	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -DRXE38_GPU -DRXE38_BACKEND_OPENCL \
 	    -I. -Irxe38 rxe38/rxe38.c librxe.a -lgmp -lm -lpthread -lOpenCL -o rxe38/rxe38-gpu
 
-# Backend #2 (CUDA) -- not yet implemented. Placeholder so the build path is named;
-# will compile the CUDA fast-path (define RXE38_BACKEND_CUDA) alongside OpenCL.
-rxe38-cuda:
-	@echo "rxe38: CUDA backend (#2) not implemented yet -- use 'make rxe38-gpu' (OpenCL)."
-	@false
+# Backend #2 (CUDA) -- compiles BOTH backends into one binary; --backend selects
+# at runtime (opencl default, cuda opt-in). CUDA path NVRTC-compiles scrypt_cuda.cu
+# and does romix on the GPU with PBKDF2/verify on the host (the ~22% faster sm_120
+# codegen path). Needs libnvrtc + libcuda (the CUDA toolkit + driver).
+CUDA_HOME ?= /usr/local/cuda
+rxe38-cuda: rxe38/rxe38.c rxe38/cuda_backend.inc.h rxe38/cuda_crack.inc.h \
+            rxe38/scrypt_cl_embed.h rxe38/scrypt_cuda_embed.h librxe.a rxe.h rxejit_rt.h
+	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 \
+	    -DRXE38_GPU -DRXE38_BACKEND_OPENCL -DRXE38_BACKEND_CUDA \
+	    -I. -Irxe38 -I$(CUDA_HOME)/include rxe38/rxe38.c librxe.a \
+	    -L$(CUDA_HOME)/lib64 -lgmp -lm -lpthread -lOpenCL -lnvrtc -lcuda \
+	    -o rxe38/rxe38-cuda
 
 rxe38-gpu-test: rxe38-gpu
 	./rxe38/rxe38-gpu --gpu-scrypt-test
@@ -193,7 +206,6 @@ install: rxenum rxejit librxe.a
 	install -m 644 rxe.h     $(DESTDIR)$(PREFIX)/include
 	install -m 644 rxenum.1  $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 644 rxejit.1  $(DESTDIR)$(PREFIX)/share/man/man1
-	install -m 644 rxe38/rxe38.1 $(DESTDIR)$(PREFIX)/share/man/man1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/rxenum
@@ -202,7 +214,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/include/rxe.h
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxenum.1
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxejit.1
-	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/rxe38.1
 
 .PHONY: all test test-asan bench clean install uninstall rxe38 rxe38-test rxe38-gpu rxe38-gpu-test
 

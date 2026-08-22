@@ -1589,6 +1589,10 @@ static int romix_test(cl_uint N, cl_uint gap)
     return ok ? 0 : 1;
 }
 
+#ifdef RXE38_BACKEND_CUDA
+#include "cuda_backend.inc.h"
+#endif
+
 /* Batched GPU crack: enumerate the regex on the host, fill a batch of
  * passphrases, run scrypt on the device, finish + verify on the host.
  *
@@ -1864,6 +1868,10 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
     rxe_free(rxe);
     return rc;
 }
+
+#ifdef RXE38_BACKEND_CUDA
+#include "cuda_crack.inc.h"
+#endif
 #endif /* RXE38_GPU */
 
 int main(int argc, char **argv)
@@ -1885,6 +1893,11 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--romix-test") == 0)
         return romix_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512,
                           argc >= 4 ? (cl_uint)strtoul(argv[3], 0, 0) : 1);
+#ifdef RXE38_BACKEND_CUDA
+    if (argc >= 2 && strcmp(argv[1], "--cuda-romix-test") == 0)
+        return cuda_romix_test(argc >= 3 ? (unsigned)strtoul(argv[2], 0, 0) : 512,
+                               argc >= 4 ? (unsigned)strtoul(argv[3], 0, 0) : 1);
+#endif
 #endif
 
     int jobs = 1, progress = 0, use_gpu = 0;
@@ -1962,7 +1975,11 @@ int main(int argc, char **argv)
         }
         if (want_cuda) {
 #ifdef RXE38_BACKEND_CUDA
-            /* crack_gpu_cuda(...) -- backend #2, not wired yet */
+            fprintf(stderr, "rxe38 gpu: backend = cuda\n");
+            size_t bt = batch > 0 ? (size_t)batch : 0;   /* 0 = auto-size to card */
+            const char *ns = getenv("RXE38_GPU_N");
+            cl_uint N = ns ? (cl_uint)strtoul(ns, 0, 0) : GPU_N;
+            return crack_gpu_cuda(&b, pattern, bt, N, progress, cap);
 #else
             fprintf(stderr,
                 "rxe38: CUDA backend (#2) is not built into this binary.\n"
