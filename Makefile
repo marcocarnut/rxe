@@ -76,9 +76,19 @@ rxe38/scrypt_cl_embed.h: rxe38/scrypt.cl
 	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
 	@printf ';\n' >> $@
 
+# rxe38 GPU has pluggable backends selected at build time (and chosen at runtime
+# with --backend / RXE38_BACKEND when more than one is compiled in). Backend #1 =
+# OpenCL (the champion; portable, runs on the Intel Arc too). Backend #2 = CUDA
+# (in progress; the only route to __shfl_sync, needed to beat the OpenCL ceiling).
 rxe38-gpu: rxe38/rxe38.c rxe38/scrypt_cl_embed.h librxe.a rxe.h rxejit_rt.h
-	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -DRXE38_GPU -I. -Irxe38 \
-	    rxe38/rxe38.c librxe.a -lgmp -lm -lpthread -lOpenCL -o rxe38/rxe38-gpu
+	$(CC) $(WARNFLAGS) -Wno-unused-function -O2 -DRXE38_GPU -DRXE38_BACKEND_OPENCL \
+	    -I. -Irxe38 rxe38/rxe38.c librxe.a -lgmp -lm -lpthread -lOpenCL -o rxe38/rxe38-gpu
+
+# Backend #2 (CUDA) -- not yet implemented. Placeholder so the build path is named;
+# will compile the CUDA fast-path (define RXE38_BACKEND_CUDA) alongside OpenCL.
+rxe38-cuda:
+	@echo "rxe38: CUDA backend (#2) not implemented yet -- use 'make rxe38-gpu' (OpenCL)."
+	@false
 
 rxe38-gpu-test: rxe38-gpu
 	./rxe38/rxe38-gpu --gpu-scrypt-test

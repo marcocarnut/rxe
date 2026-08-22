@@ -360,3 +360,100 @@ __kernel void scrypt_phase(
         pbkdf2_final(istate, ostate, gB, out + (size_t)gid * 64, NL, gid);
     }
 }
+
+/* ==================================================================== *
+ * WARP-COOPERATIVE ROMix prototype (T=4 threads/candidate, gap=1).
+ *
+ * 4 consecutive work-items form one candidate-group; thread lt(0..3) owns
+ * block words {4q+lt : q=0..COOPW-1}. Salsa20/8 uses the 4x4 thread=column
+ * mapping: columnrounds are thread-local, rowrounds transpose through __local
+ * (NVIDIA OpenCL exposes no subgroup shuffle, so __local+barrier is the only
+ * cross-lane path). WG MUST be 32 (8 groups); NLC (candidate count) MUST be a
+ * multiple of 8 so every work-group is uniformly active (no barrier divergence).
+ * No TMTO (gap=1): all groups run identical BlockMix counts, so every barrier
+ * is reached by all 32 threads. Byte-exact vs the scalar romix (CPU-modelled
+ * first in /tmp/coop_romix.c, gated here by --coop-test vs rxe38.c's romix).
+ * ==================================================================== */
+#define COOPW (BWORDS/4u)          /* words each of the 4 threads owns (64) */
+
+static inline void cqr(uint w[4], uint st)          /* quarterround, cyclic start st */
+{
+    uint a=w[st&3u], b=w[(st+1u)&3u], c=w[(st+2u)&3u], d=w[(st+3u)&3u];
+    b ^= R32(a+d,7); c ^= R32(b+a,9); d ^= R32(c+b,13); a ^= R32(d+c,18);
+    w[st&3u]=a; w[(st+1u)&3u]=b; w[(st+2u)&3u]=c; w[(st+3u)&3u]=d;
+}
+
+/* cooperative salsa20/8 on Xc (thread lt holds column lt = 4 words). Salsa20 is
+ * out = in + core(in) -- the final feedforward add is element-wise, so it stays
+ * thread-local (no exchange). Omitting it is a silent bug that still matches any
+ * other feedforward-less model; only the oracle-gated scalar romix catches it. */
+static inline void salsa_coop(uint Xc[4], __local uint *xg, uint lg, uint lt)
+{
+    uint base = lg*16u, in0=Xc[0], in1=Xc[1], in2=Xc[2], in3=Xc[3];
+    for (int dr = 0; dr < 4; dr++) {
+        cqr(Xc, lt);                                          /* column round  */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int r = 0; r < 4; r++) xg[base + r*4 + lt] = Xc[r];   /* -> local  */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        uint row[4];
+        for (int c = 0; c < 4; c++) row[c] = xg[base + lt*4 + c];  /* my row    */
+        cqr(row, lt);                                         /* row round     */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int c = 0; c < 4; c++) xg[base + lt*4 + c] = row[c];  /* -> local  */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int r = 0; r < 4; r++) Xc[r] = xg[base + r*4 + lt];   /* my column */
+    }
+    Xc[0]+=in0; Xc[1]+=in1; Xc[2]+=in2; Xc[3]+=in3;      /* Salsa20 feedforward */
+}
+
+static inline void blockmix_coop(uint *bl, __local uint *xg, uint lg, uint lt)
+{
+    uint Xc[4], Yc[COOPW];
+    for (int r = 0; r < 4; r++) Xc[r] = bl[(2*SR-1)*4 + r];        /* subblock 2r-1 */
+    for (uint i = 0; i < 2*SR; i++) {
+        for (int r = 0; r < 4; r++) Xc[r] ^= bl[i*4 + r];
+        salsa_coop(Xc, xg, lg, lt);
+        for (int r = 0; r < 4; r++) Yc[i*4 + r] = Xc[r];
+    }
+    for (uint m = 0; m < SR; m++) for (int r=0;r<4;r++) bl[m*4 + r]      = Yc[(2*m)*4 + r];
+    for (uint m = 0; m < SR; m++) for (int r=0;r<4;r++) bl[(SR+m)*4 + r] = Yc[(2*m+1)*4 + r];
+}
+
+/* ONE ROMix pass per launch (the host loops passes 0..PP-1). An in-kernel pass
+ * loop wrapping the barrier-containing ROMix miscompiles on NVIDIA's ptxas
+ * (barrier reconvergence in a nested loop corrupts __local for every group
+ * except base 0) -- verified in isolation. One pass/launch sidesteps it, mirrors
+ * the phased kernel, and needs no cross-launch state (passes are independent). */
+__kernel void scrypt_romix_coop(
+    __global const uint *gIn, __global uint *gV, __global uint *gOut,
+    const uint N, const uint NLC, const uint PP, const uint pass)
+{
+    __local uint xg[8*16];                        /* 8 groups * 16 words       */
+    uint gid = get_global_id(0), cand = gid>>2, lt = gid&3u, lg = get_local_id(0)>>2;
+    /* NO early-return guard: a conditional return before the mix-loop barriers
+     * is control flow the compiler cannot prove uniform, and it miscompiles the
+     * barrier reconvergence (silent per-group corruption) even when no thread
+     * actually returns. The host guarantees global == NLC*4 with NLC%8==0, so
+     * every work-item is a valid candidate lane -- no guard is needed. */
+    (void)NLC;
+    uint bl[COOPW];
+    size_t vbase = (size_t)cand * N * BWORDS;
+    size_t ibase = ((size_t)cand*PP + pass) * BWORDS;
+    for (uint q = 0; q < COOPW; q++) bl[q] = gIn[ibase + 4*q + lt];
+    for (uint i = 0; i < N; i++) {                            /* ROMix fill    */
+        size_t vb = vbase + (size_t)i*BWORDS;
+        for (uint q = 0; q < COOPW; q++) gV[vb + 4*q + lt] = bl[q];
+        blockmix_coop(bl, xg, lg, lt);
+    }
+    for (uint i = 0; i < N; i++) {                            /* ROMix mix     */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lt == 0) xg[lg*16u] = bl[(2*SR-1)*4];             /* word 240 -> j  */
+        barrier(CLK_LOCAL_MEM_FENCE);
+        uint j = xg[lg*16u] & (N-1u);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        size_t vb = vbase + (size_t)j*BWORDS;
+        for (uint q = 0; q < COOPW; q++) bl[q] ^= gV[vb + 4*q + lt];
+        blockmix_coop(bl, xg, lg, lt);
+    }
+    for (uint q = 0; q < COOPW; q++) gOut[ibase + 4*q + lt] = bl[q];
+}

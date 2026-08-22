@@ -1111,6 +1111,7 @@ struct gpu {
     cl_command_queue q;
     cl_kernel        k;               /* scrypt_kdf, monolithic (the test) */
     cl_kernel        kph;             /* scrypt_phase, chunked (the cracker) */
+    cl_kernel        kco;             /* scrypt_romix_coop (cooperative prototype) */
     cl_mem           mpw, mlen, mout, mV, mB, mY, mT;
     size_t           cap;             /* lanes the buffers are sized for */
     cl_uint          gap;             /* TMTO lookup-gap (1 = store every block) */
@@ -1162,6 +1163,7 @@ static int gpu_setup(struct gpu *g, size_t cap)
     }
     g->k   = clCreateKernel(pr, "scrypt_kdf", &e); CKG(e);
     g->kph = clCreateKernel(pr, "scrypt_phase", &e); CKG(e);
+    g->kco = clCreateKernel(pr, "scrypt_romix_coop", &e); CKG(e);
     clReleaseProgram(pr);
 
     /* cap == 0 -> auto-size the batch to fill the card. The scratchpad is the
@@ -1296,7 +1298,7 @@ static void gpu_teardown(struct gpu *g)
     clReleaseMemObject(g->mpw); clReleaseMemObject(g->mlen);
     clReleaseMemObject(g->mout); clReleaseMemObject(g->mV);
     clReleaseMemObject(g->mB); clReleaseMemObject(g->mY); clReleaseMemObject(g->mT);
-    clReleaseKernel(g->k); clReleaseKernel(g->kph);
+    clReleaseKernel(g->k); clReleaseKernel(g->kph); clReleaseKernel(g->kco);
     clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
 }
 
@@ -1415,6 +1417,83 @@ static int gpu_phase_test(cl_uint tn, cl_uint chunk)
     }
     gpu_teardown(&g);
     printf("%s\n", ok ? "gpu phased scrypt: ALL PASS" : "gpu phased scrypt: FAILED");
+    return ok ? 0 : 1;
+}
+
+/* --coop-test [N]: run the warp-cooperative ROMix (T=4, WG=32, gap=1) over a
+ * batch of candidate slots (each doing PP=GPU_P ROMix passes, so throughput is
+ * candidate-EQUIVALENT, directly comparable to the full-scrypt cand/s baseline),
+ * byte-exact-check the first slots against rxe38.c's scalar romix (the oracle-
+ * gated reference), and time it. */
+static int coop_test(cl_uint N)
+{
+    struct gpu g;
+    if (gpu_setup(&g, 8) != 0) return 1;
+    const cl_uint PP = GPU_P, W = GPU_BLK / 4;             /* 256 words/block */
+
+    cl_ulong gmem = 0;
+    clGetDeviceInfo(g.dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof gmem, &gmem, NULL);
+    size_t vbytes = (size_t)N * W * 4;                     /* V per candidate */
+    size_t ncand = (size_t)((double)gmem * 0.75 / vbytes);
+    if (ncand > 20000) ncand = 20000;
+    if (getenv("RXE38_COOP_NC")) ncand = strtoul(getenv("RXE38_COOP_NC"),0,0);
+    ncand &= ~(size_t)7;                                   /* multiple of 8   */
+    if (ncand < 8) ncand = 8;
+    printf("rxe38 coop: device=%s  N=%u  candidates=%zu (%.1f GB V)  T=4 WG=32 PP=%u\n",
+           g.devname, N, ncand, ncand * (double)vbytes / 1e9, PP);
+
+    size_t iowords = ncand * PP * W;
+    uint32_t *hin = malloc(iowords * 4), *hout = malloc(iowords * 4);
+    uint32_t seed = 0x1234567u;
+    for (size_t i = 0; i < iowords; i++) { seed = seed*1664525u+1013904223u; hin[i] = seed; }
+
+    cl_int e;
+    cl_mem bin = clCreateBuffer(g.ctx, CL_MEM_READ_ONLY,  iowords*4, NULL, &e); CKG(e);
+    cl_mem bV  = clCreateBuffer(g.ctx, CL_MEM_READ_WRITE, ncand*vbytes, NULL, &e); CKG(e);
+    cl_mem bout= clCreateBuffer(g.ctx, CL_MEM_WRITE_ONLY, iowords*4, NULL, &e); CKG(e);
+    CKG(clEnqueueWriteBuffer(g.q, bin, CL_TRUE, 0, iowords*4, hin, 0, NULL, NULL));
+    cl_uint nlc = (cl_uint)ncand;
+    CKG(clSetKernelArg(g.kco,0,sizeof(cl_mem),&bin));
+    CKG(clSetKernelArg(g.kco,1,sizeof(cl_mem),&bV));
+    CKG(clSetKernelArg(g.kco,2,sizeof(cl_mem),&bout));
+    CKG(clSetKernelArg(g.kco,3,sizeof(cl_uint),&N));
+    CKG(clSetKernelArg(g.kco,4,sizeof(cl_uint),&nlc));
+    CKG(clSetKernelArg(g.kco,5,sizeof(cl_uint),&PP));
+    size_t global = ncand*4, local = 32;
+    double t0 = now_sec();
+    for (cl_uint pass = 0; pass < PP; pass++) {           /* one pass per launch */
+        CKG(clSetKernelArg(g.kco,6,sizeof(cl_uint),&pass));
+        CKG(clEnqueueNDRangeKernel(g.q, g.kco, 1, NULL, &global, &local, 0, NULL, NULL));
+    }
+    CKG(clFinish(g.q));
+    double dt = now_sec() - t0;
+    CKG(clEnqueueReadBuffer(g.q, bout, CL_TRUE, 0, iowords*4, hout, 0, NULL, NULL));
+
+    /* byte-exact vs rxe38.c scalar romix, first CHK candidates */
+    size_t CHK = ncand < 8 ? ncand : 8;
+    uint32_t *V = malloc((size_t)N*W*4), *Y = malloc(W*4), B[256];
+    int ok = 1;
+    for (size_t c = 0; c < CHK && ok; c++)
+        for (cl_uint pass = 0; pass < PP; pass++) {
+            memcpy(B, hin + (c*PP+pass)*W, W*4);
+            romix(B, GPU_R, N, V, Y);
+            if (memcmp(B, hout + (c*PP+pass)*W, W*4)) {
+                uint32_t *go = hout + (c*PP+pass)*W;
+                int ndiff = 0; for (cl_uint w=0; w<W; w++) if (B[w]!=go[w]) ndiff++;
+                printf("[FAIL] cand %zu pass %u: %d/%u words differ\n", c, pass, ndiff, W);
+                printf("   cpu[0..5]: %08x %08x %08x %08x %08x %08x\n", B[0],B[1],B[2],B[3],B[4],B[5]);
+                printf("   gpu[0..5]: %08x %08x %08x %08x %08x %08x\n", go[0],go[1],go[2],go[3],go[4],go[5]);
+                ok = 0; break;
+            }
+        }
+    free(V); free(Y); free(hin); free(hout);
+    clReleaseMemObject(bin); clReleaseMemObject(bV); clReleaseMemObject(bout);
+    gpu_teardown(&g);
+
+    double passes = (double)ncand * PP;
+    printf("coop ROMix: %s | %.2fs | %.1f passes/s | %.1f cand-equiv/s (/%u) | baseline full-scrypt ~525 cand/s\n",
+           ok ? "BYTE-EXACT vs scalar romix" : "FAILED", dt,
+           passes/dt, (double)ncand/dt, PP);
     return ok ? 0 : 1;
 }
 
@@ -1654,12 +1733,21 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--gpu-phase-test") == 0)
         return gpu_phase_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512,
                               argc >= 4 ? (cl_uint)strtoul(argv[3], 0, 0) : 0);
+    if (argc >= 2 && strcmp(argv[1], "--coop-test") == 0)
+        return coop_test(argc >= 3 ? (cl_uint)strtoul(argv[2], 0, 0) : 512);
 #endif
 
     int jobs = 1, progress = 0, use_gpu = 0;
     long cap = 0, batch = 0;
+    const char *backend = getenv("RXE38_BACKEND");       /* GPU backend selector */
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (strcmp(argv[i], "--backend") == 0) {         /* --backend <name>   */
+            backend = (i + 1 < argc) ? argv[++i] : ""; continue;
+        }
+        if (strncmp(argv[i], "--backend=", 10) == 0) {   /* --backend=<name>   */
+            backend = argv[i] + 10; continue;
+        }
         char c = argv[i][1];
         if (c == 'p') { progress = 1; continue; }        /* takes no value */
         if (c == 'G') { use_gpu = 1; continue; }         /* takes no value */
@@ -1676,11 +1764,14 @@ int main(int argc, char **argv)
 
     if (i >= argc) {
         fprintf(stderr,
-            "usage: %s [-j jobs] [-G] [-b batch] [-p] [-c count] <6P...key> [<regex>]\n"
+            "usage: %s [-j jobs] [-G] [--backend opencl|cuda] [-b batch] [-p]\n"
+            "          [-c count] <6P...key> [<regex>]\n"
             "  With a regex, tries each passphrase in the set until the key\n"
             "  decrypts (verified against its address hash). Without one, just\n"
             "  parses and dumps the key. no-EC-multiply keys (6PR.../6PY...) only.\n"
-            "  -G uses the OpenCL GPU backend (scrypt on device, verify on host);\n"
+            "  -G runs scrypt on the GPU (verify on host). --backend picks the GPU\n"
+            "    backend (RXE38_BACKEND env too): opencl = default, portable, the\n"
+            "    champion (also the Intel Arc path); cuda = backend #2, in progress.\n"
             "  -b sets the GPU batch size in lanes (0/omitted = auto-fill VRAM).\n"
             "  GPU env: RXE38_GPU_GAP=g stores V every g-th block (TMTO) so ~g x\n"
             "    more lanes fit (g~3 was fastest on a 32 GB 4080; g=1 = plain\n"
@@ -1710,13 +1801,35 @@ int main(int argc, char **argv)
     }
 
     if (use_gpu) {
-#ifdef RXE38_GPU
+        /* Backend selection. Backend #1 = OpenCL (champion; also the Arc path).
+         * Backend #2 = CUDA (in progress). Default to OpenCL. */
+        if (!backend || !*backend) backend = "opencl";
+        int want_opencl = strcmp(backend, "opencl") == 0;
+        int want_cuda   = strcmp(backend, "cuda")   == 0;
+        if (!want_opencl && !want_cuda) {
+            fprintf(stderr, "rxe38: unknown --backend '%s' (opencl|cuda)\n", backend);
+            return 2;
+        }
+        if (want_cuda) {
+#ifdef RXE38_BACKEND_CUDA
+            /* crack_gpu_cuda(...) -- backend #2, not wired yet */
+#else
+            fprintf(stderr,
+                "rxe38: CUDA backend (#2) is not built into this binary.\n"
+                "  It is in progress -- the OpenCL backend is the default for now.\n"
+                "  Build the CUDA fast-path with `make rxe38-cuda` once available,\n"
+                "  or run with --backend opencl (or no --backend).\n");
+            return 2;
+#endif
+        }
+#ifdef RXE38_BACKEND_OPENCL
+        fprintf(stderr, "rxe38 gpu: backend = opencl\n");
         size_t bt = batch > 0 ? (size_t)batch : 0;       /* 0 = auto-size to card */
         const char *ns = getenv("RXE38_GPU_N");          /* override N for testing */
         cl_uint N = ns ? (cl_uint)strtoul(ns, 0, 0) : GPU_N;
         return crack_gpu(&b, pattern, bt, N, progress, cap);
 #else
-        fprintf(stderr, "rxe38: -G needs the GPU build (make rxe38-gpu)\n");
+        fprintf(stderr, "rxe38: OpenCL backend not built (make rxe38-gpu)\n");
         return 2;
 #endif
     }
