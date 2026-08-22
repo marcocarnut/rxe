@@ -25,6 +25,8 @@
 
 #define BLK    (128u * SR)       /* bytes in one scrypt block (1024 for r=8) */
 #define BWORDS (32u * SR)        /* uint words in one block (256 for r=8)     */
+#define BWORDS4 (8u * SR)        /* uint4 quartets in one block (64 for r=8)  */
+#define YO4     (4u * SR)        /* uint4 for BlockMix's odd-output scratch    */
 
 /* ---- SHA-256 (streaming, private buffers) ------------------------------ */
 
@@ -184,41 +186,81 @@ static void salsa20_8(uint B[16])
     for (int i = 0; i < 16; i++) B[i] += x[i];
 }
 
-/* BlockMix on pass `pass`'s block (2r sub-blocks of 16 words), scratch gY. */
-static void blockmix(__global uint *gB, __global uint *gY,
-                     uint pass, uint NL, uint gid)
+/* ---- private (L1-backed), uint4-vectorized working-block variants ------- *
+ *
+ * The old __global blockmix/romix round-tripped the 256-word working block and
+ * the Y scratch through __global on every BlockMix -- most of that is NOT the
+ * fundamental V traffic, it lengthens each lane's dependent chain, and it is why
+ * we stalled at ~4-16% of memory bandwidth.
+ *
+ * These variants keep the block, the Y scratch and the TMTO walk block in
+ * PRIVATE arrays (per-thread "local memory", L1/L2-backed -- NOT the 48 KB
+ * __shared__ pool, which one warp's blocks would blow) for the whole ROMix
+ * pass, so BlockMix/Salsa/the walk run at cache speed. They are stored as
+ * `uint4` quartets: the block's dominant traffic is the private load/store of
+ * b/y in BlockMix, so 128-bit accesses cut the LSU/local-memory transaction
+ * count ~4x, and the V fill/read is one coalesced uint4 per quartet. __global
+ * is touched only for the fundamental V fill-writes/mix-reads (lane-interleaved
+ * uint4) plus one load/store of the pass block at the PBKDF2 (uint) boundary.
+ * Byte-identical results; validated via --gpu-scrypt-test / --gpu-phase-test. */
+/* BlockMix without a full Y scratch. Output B' = (Y0,Y2,..,Y2r-2, Y1,Y3,..).
+ * The X chain carries Y_{i-1} in registers, so Y is needed only to reorder: the
+ * EVEN outputs Y_{2m} land in the low half at sub-block m = i/2 <= i, a slot
+ * already consumed, so we write them straight into b in place; only the ODD
+ * outputs (high half) would clobber a not-yet-read sub-block, so just those are
+ * buffered (r sub-blocks = half the old Y) and copied up at the end. Cuts the
+ * per-BlockMix local traffic ~25% (1024 -> 768 word-accesses). yo has YO4 uint4. */
+static void blockmix_p(uint4 *b, uint4 *yo)
 {
-    uint pbase = pass * BWORDS;
     uint X[16];
-    for (int k = 0; k < 16; k++) X[k] = gB[(pbase + (2*SR-1)*16 + k)*NL + gid];
-    for (uint i = 0; i < 2*SR; i++) {
-        for (int k = 0; k < 16; k++) X[k] ^= gB[(pbase + i*16 + k)*NL + gid];
-        salsa20_8(X);
-        for (int k = 0; k < 16; k++) gY[(i*16 + k)*NL + gid] = X[k];
+    {
+        uint4 q0=b[4*(2*SR-1)], q1=b[4*(2*SR-1)+1], q2=b[4*(2*SR-1)+2], q3=b[4*(2*SR-1)+3];
+        X[0]=q0.x;X[1]=q0.y;X[2]=q0.z;X[3]=q0.w; X[4]=q1.x;X[5]=q1.y;X[6]=q1.z;X[7]=q1.w;
+        X[8]=q2.x;X[9]=q2.y;X[10]=q2.z;X[11]=q2.w; X[12]=q3.x;X[13]=q3.y;X[14]=q3.z;X[15]=q3.w;
     }
-    for (uint i = 0; i < SR; i++)
-        for (int k = 0; k < 16; k++)
-            gB[(pbase + i*16 + k)*NL + gid] = gY[((2*i)*16 + k)*NL + gid];
-    for (uint i = 0; i < SR; i++)
-        for (int k = 0; k < 16; k++)
-            gB[(pbase + (SR+i)*16 + k)*NL + gid] = gY[((2*i+1)*16 + k)*NL + gid];
+    for (uint i = 0; i < 2*SR; i++) {
+        uint4 q0=b[4*i], q1=b[4*i+1], q2=b[4*i+2], q3=b[4*i+3];
+        X[0]^=q0.x;X[1]^=q0.y;X[2]^=q0.z;X[3]^=q0.w; X[4]^=q1.x;X[5]^=q1.y;X[6]^=q1.z;X[7]^=q1.w;
+        X[8]^=q2.x;X[9]^=q2.y;X[10]^=q2.z;X[11]^=q2.w; X[12]^=q3.x;X[13]^=q3.y;X[14]^=q3.z;X[15]^=q3.w;
+        salsa20_8(X);
+        uint4 o0=(uint4)(X[0],X[1],X[2],X[3]),   o1=(uint4)(X[4],X[5],X[6],X[7]),
+              o2=(uint4)(X[8],X[9],X[10],X[11]), o3=(uint4)(X[12],X[13],X[14],X[15]);
+        uint m = i >> 1;
+        if ((i & 1) == 0) { b[4*m]=o0;  b[4*m+1]=o1;  b[4*m+2]=o2;  b[4*m+3]=o3;  }
+        else              { yo[4*m]=o0; yo[4*m+1]=o1; yo[4*m+2]=o2; yo[4*m+3]=o3; }
+    }
+    for (uint m = 0; m < SR; m++) {           /* buffered odd outputs -> high half */
+        b[4*(SR+m)]=yo[4*m]; b[4*(SR+m)+1]=yo[4*m+1];
+        b[4*(SR+m)+2]=yo[4*m+2]; b[4*(SR+m)+3]=yo[4*m+3];
+    }
 }
 
-/* ROMix pass `pass` in place (used by the monolithic kernel). */
-static void romix(__global uint *gB, __global uint *gV, __global uint *gY,
-                  uint pass, uint N, uint NL, uint gid)
+static void romix_p(__global uint *gB, __global uint4 *gV,
+                    uint pass, uint N, uint gap, uint NL, uint gid)
 {
     uint pbase = pass * BWORDS;
+    uint4 b[BWORDS4], yo[YO4], t[BWORDS4];
+    for (uint q = 0; q < BWORDS4; q++)        /* load pass block (uint gB -> uint4) */
+        b[q] = (uint4)(gB[(pbase+4*q  )*NL+gid], gB[(pbase+4*q+1)*NL+gid],
+                       gB[(pbase+4*q+2)*NL+gid], gB[(pbase+4*q+3)*NL+gid]);
     for (uint i = 0; i < N; i++) {
-        for (uint w = 0; w < BWORDS; w++)
-            gV[(i*BWORDS + w)*NL + gid] = gB[(pbase + w)*NL + gid];
-        blockmix(gB, gY, pass, NL, gid);
+        if (i % gap == 0) {
+            uint s = i / gap;
+            for (uint q = 0; q < BWORDS4; q++) gV[(s*BWORDS4 + q)*NL + gid] = b[q];
+        }
+        blockmix_p(b, yo);
     }
     for (uint i = 0; i < N; i++) {
-        uint j = gB[(pbase + (2*SR-1)*16)*NL + gid] & (N - 1);
-        for (uint w = 0; w < BWORDS; w++)
-            gB[(pbase + w)*NL + gid] ^= gV[(j*BWORDS + w)*NL + gid];
-        blockmix(gB, gY, pass, NL, gid);
+        uint j = b[4*(2*SR-1)].x & (N - 1);
+        uint s = j / gap, steps = j - s * gap;
+        for (uint q = 0; q < BWORDS4; q++) t[q] = gV[(s*BWORDS4 + q)*NL + gid];
+        for (uint st = 0; st < steps; st++) blockmix_p(t, yo);
+        for (uint q = 0; q < BWORDS4; q++) b[q] ^= t[q];
+        blockmix_p(b, yo);
+    }
+    for (uint q = 0; q < BWORDS4; q++) {      /* store pass block (uint4 -> uint gB) */
+        gB[(pbase+4*q  )*NL+gid] = b[q].x; gB[(pbase+4*q+1)*NL+gid] = b[q].y;
+        gB[(pbase+4*q+2)*NL+gid] = b[q].z; gB[(pbase+4*q+3)*NL+gid] = b[q].w;
     }
 }
 
@@ -226,8 +268,8 @@ static void romix(__global uint *gB, __global uint *gV, __global uint *gY,
 
 __kernel void scrypt_kdf(
     __global const uchar *pw, __global const uint *pwlen, const uint saltw,
-    __global uchar *out, __global uint *gV, __global uint *gB, __global uint *gY,
-    const uint N, const uint NL)
+    __global uchar *out, __global uint4 *gV, __global uint *gB, __global uint *gY,
+    __global uint *gT, const uint N, const uint gap, const uint NL)
 {
     uint gid = get_global_id(0);
     if (gid >= NL) return;
@@ -242,36 +284,64 @@ __kernel void scrypt_kdf(
     uchar salt[4] = { (uchar)saltw, (uchar)(saltw>>8), (uchar)(saltw>>16), (uchar)(saltw>>24) };
     pbkdf2_first(istate, ostate, salt, gB, NL, gid);
     for (uint pass = 0; pass < SP; pass++)
-        romix(gB, gV, gY, pass, N, NL, gid);
+        romix_p(gB, gV, pass, N, gap, NL, gid);   /* private (L1) working block */
     pbkdf2_final(istate, ostate, gB, out + (size_t)gid * 64, NL, gid);
+    (void)gY; (void)gT;                            /* unused by the private path */
 }
 
 /* ---- phased kernel: watchdog-safe scrypt across many short launches ----- */
 
 __kernel void scrypt_phase(
     __global const uchar *pw, __global const uint *pwlen, const uint saltw,
-    __global uchar *out, __global uint *gV, __global uint *gB, __global uint *gY,
-    const uint phase, const uint N, const uint passIdx,
-    const uint iStart, const uint iEnd, const uint NL)
+    __global uchar *out, __global uint4 *gV, __global uint *gB, __global uint *gY,
+    __global uint *gT, const uint phase, const uint N, const uint gap,
+    const uint passIdx, const uint iStart, const uint iEnd, const uint NL)
 {
     uint gid = get_global_id(0);
     if (gid >= NL) return;
     uint pbase = passIdx * BWORDS;
 
-    if (phase == 1) {                    /* ROMix fill chunk */
+    /* Same TMTO lookup-gap as romix_p(), but each fill/mix chunk covers only
+     * [iStart,iEnd) so a launch stays short (watchdog-safe). The working block
+     * is loaded into a PRIVATE (L1-backed) array for the chunk and stored back
+     * at the end -- the load/store amortizes over the chunk, and BlockMix/Salsa/
+     * the recompute walk run at cache speed instead of round-tripping __global
+     * (the whole point of this pass). The walk is self-contained within one mix
+     * iteration, so chunking needs no cross-launch state. gap==1 == plain ROMix. */
+    if (phase == 1) {                    /* ROMix fill chunk (store every gap-th) */
+        uint4 b[BWORDS4], yo[YO4];
+        for (uint q = 0; q < BWORDS4; q++)
+            b[q] = (uint4)(gB[(pbase+4*q  )*NL+gid], gB[(pbase+4*q+1)*NL+gid],
+                           gB[(pbase+4*q+2)*NL+gid], gB[(pbase+4*q+3)*NL+gid]);
         for (uint i = iStart; i < iEnd; i++) {
-            for (uint w = 0; w < BWORDS; w++)
-                gV[(i*BWORDS + w)*NL + gid] = gB[(pbase + w)*NL + gid];
-            blockmix(gB, gY, passIdx, NL, gid);
+            if (i % gap == 0) {
+                uint s = i / gap;
+                for (uint q = 0; q < BWORDS4; q++) gV[(s*BWORDS4 + q)*NL + gid] = b[q];
+            }
+            blockmix_p(b, yo);
+        }
+        for (uint q = 0; q < BWORDS4; q++) {
+            gB[(pbase+4*q  )*NL+gid] = b[q].x; gB[(pbase+4*q+1)*NL+gid] = b[q].y;
+            gB[(pbase+4*q+2)*NL+gid] = b[q].z; gB[(pbase+4*q+3)*NL+gid] = b[q].w;
         }
         return;
     }
-    if (phase == 2) {                    /* ROMix mix chunk */
+    if (phase == 2) {                    /* ROMix mix chunk (recompute misses) */
+        uint4 b[BWORDS4], yo[YO4], t[BWORDS4];
+        for (uint q = 0; q < BWORDS4; q++)
+            b[q] = (uint4)(gB[(pbase+4*q  )*NL+gid], gB[(pbase+4*q+1)*NL+gid],
+                           gB[(pbase+4*q+2)*NL+gid], gB[(pbase+4*q+3)*NL+gid]);
         for (uint i = iStart; i < iEnd; i++) {
-            uint j = gB[(pbase + (2*SR-1)*16)*NL + gid] & (N - 1);
-            for (uint w = 0; w < BWORDS; w++)
-                gB[(pbase + w)*NL + gid] ^= gV[(j*BWORDS + w)*NL + gid];
-            blockmix(gB, gY, passIdx, NL, gid);
+            uint j = b[4*(2*SR-1)].x & (N - 1);
+            uint s = j / gap, steps = j - s * gap;
+            for (uint q = 0; q < BWORDS4; q++) t[q] = gV[(s*BWORDS4 + q)*NL + gid];
+            for (uint st = 0; st < steps; st++) blockmix_p(t, yo);
+            for (uint q = 0; q < BWORDS4; q++) b[q] ^= t[q];
+            blockmix_p(b, yo);
+        }
+        for (uint q = 0; q < BWORDS4; q++) {
+            gB[(pbase+4*q  )*NL+gid] = b[q].x; gB[(pbase+4*q+1)*NL+gid] = b[q].y;
+            gB[(pbase+4*q+2)*NL+gid] = b[q].z; gB[(pbase+4*q+3)*NL+gid] = b[q].w;
         }
         return;
     }

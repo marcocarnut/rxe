@@ -17,12 +17,17 @@
  *          (C) 2026 Marco "Kiko" Carnut <kiko at postcogito dot org>, GPLv2.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE              /* sched_getaffinity / CPU_COUNT */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sched.h>
 #include <gmp.h>
 
 #include "rxe.h"                 /* the librxe enumerator */
@@ -1106,10 +1111,15 @@ struct gpu {
     cl_command_queue q;
     cl_kernel        k;               /* scrypt_kdf, monolithic (the test) */
     cl_kernel        kph;             /* scrypt_phase, chunked (the cracker) */
-    cl_mem           mpw, mlen, mout, mV, mB, mY;
+    cl_mem           mpw, mlen, mout, mV, mB, mY, mT;
     size_t           cap;             /* lanes the buffers are sized for */
+    cl_uint          gap;             /* TMTO lookup-gap (1 = store every block) */
+    int              mono;            /* use the monolithic (private-block) kernel */
     char             devname[128];
 };
+
+/* V blocks actually stored per lane under a lookup-gap of `gap` (ceil). */
+#define VBLOCKS(gap) (((size_t)GPU_N + (gap) - 1) / (gap))
 
 #define CKG(e) do { cl_int _e = (e); if (_e != CL_SUCCESS) { \
     fprintf(stderr, "rxe38 gpu: OpenCL error %d at %s:%d\n", _e, __FILE__, __LINE__); \
@@ -1154,13 +1164,47 @@ static int gpu_setup(struct gpu *g, size_t cap)
     g->kph = clCreateKernel(pr, "scrypt_phase", &e); CKG(e);
     clReleaseProgram(pr);
 
+    /* cap == 0 -> auto-size the batch to fill the card. The scratchpad is the
+     * limit: ~16 MB/lane for V plus a little for B/Y/pw/out. scrypt here is
+     * latency-bound, so throughput scales with lanes-in-flight until memory
+     * runs out -- we target ~80% of global memory (leaving headroom for the
+     * context + framebuffer) and round down to a warp multiple. Empirically on
+     * a 32 GB 4080 SUPER this lands at ~1536 lanes (~46 cand/s vs ~19 at 512). */
+    /* TMTO lookup-gap: V stores every g-th block (ceil(N/g) blocks), so the
+     * scratchpad shrinks ~g x and ~g x more lanes fit -- the mix loop recomputes
+     * a missed block by walking from the nearest checkpoint. gap=1 = plain
+     * ROMix (byte-identical). Tunable via RXE38_GPU_GAP; the phased kernel path
+     * only supports gap=1 (the cracker uses the monolithic kernel when gap>1). */
+    const char *gs = getenv("RXE38_GPU_GAP");
+    g->gap = gs ? (cl_uint)strtoul(gs, 0, 0) : 1;
+    if (g->gap < 1) g->gap = 1;
+    g->mono = getenv("RXE38_GPU_MONO") != NULL;   /* private-block mono kernel */
+    size_t vblk = VBLOCKS(g->gap);
+
+    if (cap == 0) {
+        cl_ulong gmem = 0;
+        clGetDeviceInfo(g->dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof gmem, &gmem, NULL);
+        size_t perlane = (size_t)GPU_BLK * vblk        /* V scratchpad (~16MB/gap) */
+                       + (size_t)GPU_BLK * GPU_P        /* B working blocks     */
+                       + (size_t)GPU_BLK                /* Y scratch            */
+                       + (size_t)GPU_BLK                /* T recompute scratch  */
+                       + GPU_MAXPW + sizeof(cl_uint) + 64;
+        size_t lanes = gmem ? (size_t)((double)gmem * 0.80 / perlane) : 512;
+        lanes &= ~(size_t)31;                          /* warp multiple */
+        if (lanes < 32) lanes = 32;
+        cap = lanes;
+        fprintf(stderr, "rxe38 gpu: auto batch = %zu lanes (%.1f of %.1f GB global, gap=%u)\n",
+                cap, cap * (double)perlane / 1e9, (double)gmem / 1e9, g->gap);
+    }
+
     g->cap = cap;
     g->mpw  = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY,  cap * GPU_MAXPW, NULL, &e); CKG(e);
     g->mlen = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY,  cap * sizeof(cl_uint), NULL, &e); CKG(e);
     g->mout = clCreateBuffer(g->ctx, CL_MEM_WRITE_ONLY, cap * 64, NULL, &e); CKG(e);
-    g->mV   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK * GPU_N, NULL, &e); CKG(e);
+    g->mV   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK * vblk, NULL, &e); CKG(e);
     g->mB   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK * GPU_P, NULL, &e); CKG(e);
     g->mY   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK, NULL, &e); CKG(e);
+    g->mT   = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE, cap * (size_t)GPU_BLK, NULL, &e); CKG(e);
     return 0;
 }
 
@@ -1179,11 +1223,18 @@ static int gpu_run(struct gpu *g, const unsigned char *pw, const cl_uint *pwlen,
     CKG(clSetKernelArg(g->k, 4, sizeof(cl_mem), &g->mV));
     CKG(clSetKernelArg(g->k, 5, sizeof(cl_mem), &g->mB));
     CKG(clSetKernelArg(g->k, 6, sizeof(cl_mem), &g->mY));
-    CKG(clSetKernelArg(g->k, 7, sizeof(cl_uint), &N));
+    CKG(clSetKernelArg(g->k, 7, sizeof(cl_mem), &g->mT));
+    CKG(clSetKernelArg(g->k, 8, sizeof(cl_uint), &N));
+    CKG(clSetKernelArg(g->k, 9, sizeof(cl_uint), &g->gap));
     cl_uint NL = (cl_uint)n;
-    CKG(clSetKernelArg(g->k, 8, sizeof(cl_uint), &NL));
-    size_t global = n;
-    CKG(clEnqueueNDRangeKernel(g->q, g->k, 1, NULL, &global, NULL, 0, NULL, NULL));
+    CKG(clSetKernelArg(g->k, 10, sizeof(cl_uint), &NL));
+    /* RXE38_GPU_WG pins the local work-group size; round global up to a multiple
+     * (the kernel's `gid >= NL` guard drops the overflow lanes). 0 = driver picks. */
+    size_t local = 0;
+    const char *wgs = getenv("RXE38_GPU_WG");
+    local = wgs ? (size_t)strtoul(wgs, 0, 0) : 32;   /* one warp = best here; 0 = driver */
+    size_t global = local ? ((n + local - 1) / local) * local : n;
+    CKG(clEnqueueNDRangeKernel(g->q, g->k, 1, NULL, &global, local ? &local : NULL, 0, NULL, NULL));
     CKG(clEnqueueReadBuffer(g->q, g->mout, CL_TRUE, 0, n * 64, out, 0, NULL, NULL));
     return 0;
 }
@@ -1207,18 +1258,23 @@ static int gpu_run_phased(struct gpu *g, const unsigned char *pw, const cl_uint 
     CKG(clSetKernelArg(g->kph, 4, sizeof(cl_mem), &g->mV));
     CKG(clSetKernelArg(g->kph, 5, sizeof(cl_mem), &g->mB));
     CKG(clSetKernelArg(g->kph, 6, sizeof(cl_mem), &g->mY));
-    CKG(clSetKernelArg(g->kph, 8, sizeof(cl_uint), &N));
+    CKG(clSetKernelArg(g->kph, 7, sizeof(cl_mem), &g->mT));
+    CKG(clSetKernelArg(g->kph, 9, sizeof(cl_uint), &N));
+    CKG(clSetKernelArg(g->kph, 10, sizeof(cl_uint), &g->gap));
     cl_uint NL = (cl_uint)n;
-    CKG(clSetKernelArg(g->kph, 12, sizeof(cl_uint), &NL));
-    size_t global = n;
+    CKG(clSetKernelArg(g->kph, 14, sizeof(cl_uint), &NL));
+    size_t local = 0;
+    const char *wgs = getenv("RXE38_GPU_WG");
+    local = wgs ? (size_t)strtoul(wgs, 0, 0) : 32;   /* one warp = best here; 0 = driver */
+    size_t global = local ? ((n + local - 1) / local) * local : n;
 
     #define LAUNCH(PHASE, PASS, I0, I1) do { \
         cl_uint _ph=(PHASE),_ps=(PASS),_i0=(I0),_i1=(I1); \
-        CKG(clSetKernelArg(g->kph, 7, sizeof(cl_uint), &_ph)); \
-        CKG(clSetKernelArg(g->kph, 9, sizeof(cl_uint), &_ps)); \
-        CKG(clSetKernelArg(g->kph,10, sizeof(cl_uint), &_i0)); \
-        CKG(clSetKernelArg(g->kph,11, sizeof(cl_uint), &_i1)); \
-        CKG(clEnqueueNDRangeKernel(g->q, g->kph, 1, NULL, &global, NULL, 0, NULL, NULL)); \
+        CKG(clSetKernelArg(g->kph, 8, sizeof(cl_uint), &_ph)); \
+        CKG(clSetKernelArg(g->kph,11, sizeof(cl_uint), &_ps)); \
+        CKG(clSetKernelArg(g->kph,12, sizeof(cl_uint), &_i0)); \
+        CKG(clSetKernelArg(g->kph,13, sizeof(cl_uint), &_i1)); \
+        CKG(clEnqueueNDRangeKernel(g->q, g->kph, 1, NULL, &global, local ? &local : NULL, 0, NULL, NULL)); \
     } while (0)
 
     LAUNCH(0, 0, 0, 0);                              /* PBKDF2-1 -> gB */
@@ -1239,7 +1295,7 @@ static void gpu_teardown(struct gpu *g)
 {
     clReleaseMemObject(g->mpw); clReleaseMemObject(g->mlen);
     clReleaseMemObject(g->mout); clReleaseMemObject(g->mV);
-    clReleaseMemObject(g->mB); clReleaseMemObject(g->mY);
+    clReleaseMemObject(g->mB); clReleaseMemObject(g->mY); clReleaseMemObject(g->mT);
     clReleaseKernel(g->k); clReleaseKernel(g->kph);
     clReleaseCommandQueue(g->q); clReleaseContext(g->ctx);
 }
@@ -1378,11 +1434,45 @@ struct gpu_crack {
     unsigned long       tried;
     unsigned long       toolong;     /* skipped: passphrase > GPU_MAXPW */
     int                 found;
+    size_t              hitlane;     /* lane of the recorded hit (lowest wins) */
+    int                 vthreads;    /* host verify worker threads */
+    pthread_mutex_t     vmtx;
     char                pass[512];
     char                wif[64];
     mpz_t               hitidx;
     double              t_gpu;       /* seconds spent in gpu_run */
+    double              t_verify;    /* seconds spent in host verify */
 };
+
+/* One host verify worker: BIP38-finish + address-verify lanes [lo,hi). On a
+ * match it records the hit (lowest lane wins) under the mutex. The whole verify
+ * path (AES, secp256k1 on gmp, hashes, base58) is thread-safe once secp_init()
+ * has run on the main thread -- SP/SGX/SGY are read-only after that and every
+ * temporary is stack-local. */
+struct vjob { struct gpu_crack *c; size_t lo, hi; };
+
+static void *verify_worker(void *arg)
+{
+    struct vjob *j = arg;
+    struct gpu_crack *c = j->c;
+    for (size_t l = j->lo; l < j->hi; l++) {
+        if (c->found && l > c->hitlane) break;         /* cheap early-out */
+        unsigned char priv[32];
+        bip38_finish(c->key, c->gout + l * 64, priv);
+        if (address_matches(priv, c->key->compressed, c->key->addrhash)) {
+            pthread_mutex_lock(&c->vmtx);
+            if (!c->found || l < c->hitlane) {
+                c->found = 1; c->hitlane = l;
+                size_t n = c->lens[l] < sizeof c->pass - 1 ? c->lens[l] : sizeof c->pass - 1;
+                memcpy(c->pass, c->pwbuf + l * GPU_MAXPW, n); c->pass[n] = '\0';
+                privkey_to_wif(priv, c->key->compressed, c->wif);
+                mpz_set(c->hitidx, c->idxs[l]);
+            }
+            pthread_mutex_unlock(&c->vmtx);
+        }
+    }
+    return NULL;
+}
 
 /* Run the current batch through the GPU and verify each lane. Returns 1 if a
  * hit was recorded (caller should stop). */
@@ -1390,26 +1480,48 @@ static int gpu_flush(struct gpu_crack *c)
 {
     if (c->count == 0) return 0;
     double t0 = now_sec();
-    if (gpu_run_phased(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash,
-                       c->N, c->chunk, c->gout) != 0)
-        return 0;
+    /* Default: the chunked/phased path (watchdog-safe, implements the gap too).
+     * RXE38_GPU_MONO forces the monolithic private-block kernel -- one launch
+     * per batch, headless-only, but the working block stays in L1 the whole
+     * ROMix pass instead of round-tripping __global. */
+    int rc = c->g->mono
+        ? gpu_run(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash, c->N, c->gout)
+        : gpu_run_phased(c->g, c->pwbuf, c->lens, c->count, c->key->addrhash,
+                         c->N, c->chunk, c->gout);
+    if (rc != 0) return 0;
     c->t_gpu += now_sec() - t0;
     c->tried += c->count;
-    for (size_t l = 0; l < c->count; l++) {
-        unsigned char priv[32];
-        bip38_finish(c->key, c->gout + l * 64, priv);
-        if (address_matches(priv, c->key->compressed, c->key->addrhash)) {
-            size_t n = c->lens[l] < sizeof c->pass - 1 ? c->lens[l] : sizeof c->pass - 1;
-            memcpy(c->pass, c->pwbuf + l * GPU_MAXPW, n); c->pass[n] = '\0';
-            privkey_to_wif(priv, c->key->compressed, c->wif);
-            mpz_set(c->hitidx, c->idxs[l]);
-            c->found = 1;
-            c->count = 0;
-            return 1;
+
+    /* Host-side finish + verify, fanned out across vthreads workers. At the GPU
+     * rates the private/uint4 kernel now hits, a single-threaded secp256k1 pass
+     * per batch is a real serial tax (GPU idle meanwhile); splitting the lanes
+     * keeps the host ahead of the device. */
+    double tv = now_sec();
+    int T = c->vthreads;
+    if (T > (int)c->count) T = (int)c->count ? (int)c->count : 1;
+    if (T <= 1) {
+        struct vjob j = { c, 0, c->count };
+        verify_worker(&j);
+    } else {
+        if (T > 64) T = 64;
+        pthread_t tid[64]; struct vjob jobs[64];
+        size_t per = (c->count + T - 1) / T;
+        int spun = 0;
+        for (int t = 0; t < T; t++) {
+            size_t lo = (size_t)t * per, hi = lo + per;
+            if (lo >= c->count) break;
+            if (hi > c->count) hi = c->count;
+            jobs[spun].c = c; jobs[spun].lo = lo; jobs[spun].hi = hi;
+            if (pthread_create(&tid[spun], NULL, verify_worker, &jobs[spun]) == 0)
+                spun++;
+            else { struct vjob j = { c, lo, hi }; verify_worker(&j); }  /* inline */
         }
+        for (int t = 0; t < spun; t++) pthread_join(tid[t], NULL);
     }
+    c->t_verify += now_sec() - tv;
+
     c->count = 0;
-    return 0;
+    return c->found ? 1 : 0;
 }
 
 static int gpu_crack_sink(const char *str, size_t len, const mpz_t index, void *v)
@@ -1426,7 +1538,7 @@ static int gpu_crack_sink(const char *str, size_t len, const mpz_t index, void *
 }
 
 static int crack_gpu(const struct bip38 *key, const char *pattern,
-                     size_t batch, cl_uint N, int progress)
+                     size_t batch, cl_uint N, int progress, long count)
 {
     struct rxe *rxe = rxe_parse(pattern, 0);
     if (!rxe || rxe_error(rxe)) {
@@ -1438,6 +1550,7 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
 
     struct gpu g;
     if (gpu_setup(&g, batch) != 0) { rxe_free(rxe); return 1; }
+    batch = g.cap;                                   /* gpu_setup may auto-size */
     fprintf(stderr, "rxe38 gpu: device = %s, batch = %zu lanes (%.1f GB scratchpad), N = %u\n",
             g.devname, batch, batch * (double)GPU_BLK * GPU_N / 1e9, N);
     if (N == GPU_N)
@@ -1452,9 +1565,11 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
     else {
         /* Bound work per launch to stay well under a display watchdog. The Arc
          * hangs at ~2^18 blockmixes/launch (~12 s), so target 2^15 (~1.5 s) for
-         * margin. On a headless card raise RXE38_GPU_CHUNK for fewer launches. */
+         * margin. A mix-phase iteration under a gap of g does up to g BlockMixes
+         * (the recompute walk), so divide by g to keep the bound. On a headless
+         * card raise RXE38_GPU_CHUNK for fewer launches. */
         cl_ulong target = 1u << 15;
-        chunk = (cl_uint)(target / (batch ? batch : 1));
+        chunk = (cl_uint)(target / ((batch ? batch : 1) * (g.gap ? g.gap : 1)));
         if (chunk < 1) chunk = 1;
         if (chunk > N) chunk = N;
     }
@@ -1470,9 +1585,28 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
     c.idxs  = calloc(batch, sizeof *c.idxs);
     for (size_t i = 0; i < batch; i++) mpz_init(c.idxs[i]);
     mpz_init(c.hitidx);
+    pthread_mutex_init(&c.vmtx, NULL);
+
+    /* Host verify worker count. Prefer the CPUs this process is actually allowed
+     * (sched_getaffinity respects cgroup/affinity limits; sysconf can report the
+     * whole host), capped at 16 -- the per-batch verify is hidden behind GPU
+     * compute well before that. RXE38_VERIFY_THREADS overrides. Init secp256k1's
+     * read-only constants ONCE here, before any worker spawns (no lazy race). */
+    const char *vt = getenv("RXE38_VERIFY_THREADS");
+    int usable = 0;
+#ifdef CPU_COUNT
+    cpu_set_t aff;
+    if (sched_getaffinity(0, sizeof aff, &aff) == 0) usable = CPU_COUNT(&aff);
+#endif
+    if (usable <= 0) { long n = sysconf(_SC_NPROCESSORS_ONLN); usable = n > 0 ? (int)n : 1; }
+    c.vthreads = vt ? atoi(vt) : (usable < 16 ? usable : 16);
+    if (c.vthreads < 1) c.vthreads = 1;
+    secp_init();
+    fprintf(stderr, "rxe38 gpu: host verify = %d thread(s)\n", c.vthreads);
 
     double t0 = now_sec();
-    mpz_t from, cnt; mpz_init_set_ui(from, 0); mpz_init_set_ui(cnt, 0);  /* whole set */
+    mpz_t from, cnt; mpz_init_set_ui(from, 0);
+    mpz_init_set_ui(cnt, count > 0 ? (unsigned long)count : 0);  /* 0 = whole set */
     rxe_foreach(rxe, from, cnt, GPU_MAXPW + 1, gpu_crack_sink, &c);
     if (!c.found) gpu_flush(&c);                        /* trailing partial batch */
     double dt = now_sec() - t0;
@@ -1486,8 +1620,10 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
                    c.hitidx, c.tried, dt, c.t_gpu, dt > 0 ? c.tried / dt : 0);
         rc = 0;
     } else {
-        fprintf(stderr, "rxe38: not found (%lu tried, %.1fs, %.1f cand/s)\n",
-                c.tried, dt, dt > 0 ? c.tried / dt : 0);
+        fprintf(stderr, "rxe38: not found (%lu tried, %.1fs wall, %.1fs gpu, "
+                "%.1fs verify, %.1f cand/s wall, %.1f cand/s gpu)\n",
+                c.tried, dt, c.t_gpu, c.t_verify, dt > 0 ? c.tried / dt : 0,
+                c.t_gpu > 0 ? c.tried / c.t_gpu : 0);
         rc = 1;
     }
     if (c.toolong)
@@ -1496,6 +1632,7 @@ static int crack_gpu(const struct bip38 *key, const char *pattern,
 
     for (size_t i = 0; i < batch; i++) mpz_clear(c.idxs[i]);
     mpz_clear(c.hitidx);
+    pthread_mutex_destroy(&c.vmtx);
     free(c.pwbuf); free(c.lens); free(c.gout); free(c.idxs);
     gpu_teardown(&g);
     rxe_free(rxe);
@@ -1544,7 +1681,17 @@ int main(int argc, char **argv)
             "  decrypts (verified against its address hash). Without one, just\n"
             "  parses and dumps the key. no-EC-multiply keys (6PR.../6PY...) only.\n"
             "  -G uses the OpenCL GPU backend (scrypt on device, verify on host);\n"
-            "  -b sets the GPU batch size in lanes (each lane needs ~16 MB).\n",
+            "  -b sets the GPU batch size in lanes (0/omitted = auto-fill VRAM).\n"
+            "  GPU env: RXE38_GPU_GAP=g stores V every g-th block (TMTO) so ~g x\n"
+            "    more lanes fit (g~3 was fastest on a 32 GB 4080; g=1 = plain\n"
+            "    ROMix, the default); RXE38_GPU_CHUNK sets ROMix iters/launch\n"
+            "    (raise it on a headless card -- big chunks amortize the working-\n"
+            "    block load/store); RXE38_GPU_MONO=1 uses the single-launch kernel\n"
+            "    (fastest, headless only -- no watchdog chunking); RXE38_GPU_N\n"
+            "    overrides scrypt N; RXE38_VERIFY_THREADS sets host verify workers\n"
+            "    (default = min(cores,16)); RXE38_GPU_WG sets the OpenCL work-group\n"
+            "    size (default 32 = one warp, best here; 0 = driver's choice).\n"
+            "    Headless best: RXE38_GPU_MONO=1 GAP=3 (~525 cand/s on a 4080).\n",
             argv[0]);
         return 2;
     }
@@ -1564,10 +1711,10 @@ int main(int argc, char **argv)
 
     if (use_gpu) {
 #ifdef RXE38_GPU
-        size_t bt = batch > 0 ? (size_t)batch : 64;      /* default 64 lanes */
+        size_t bt = batch > 0 ? (size_t)batch : 0;       /* 0 = auto-size to card */
         const char *ns = getenv("RXE38_GPU_N");          /* override N for testing */
         cl_uint N = ns ? (cl_uint)strtoul(ns, 0, 0) : GPU_N;
-        return crack_gpu(&b, pattern, bt, N, progress);
+        return crack_gpu(&b, pattern, bt, N, progress, cap);
 #else
         fprintf(stderr, "rxe38: -G needs the GPU build (make rxe38-gpu)\n");
         return 2;
